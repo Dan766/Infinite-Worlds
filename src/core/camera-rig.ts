@@ -30,10 +30,18 @@ export interface CameraRigOptions {
   lookSensitivity: number;
 }
 
+/**
+ * `far` must clear the streamer's view distance or the quadtree's outermost
+ * ring is generated and then clipped away, which costs everything and shows
+ * nothing. 8 km is the default 4 km view distance with room for the panel to
+ * turn it up, and 0.5 m near keeps the depth ratio at 16,000:1 -- tight enough
+ * that two overlapping nodes at 4 km do not z-fight during a level transition.
+ * The Phase 0 0.1 m near would have made that ratio 80,000:1.
+ */
 const DEFAULTS: CameraRigOptions = {
   fov: 60,
-  near: 0.1,
-  far: 4000,
+  near: 0.5,
+  far: 8000,
   speed: 6,
   sprintMultiplier: 6,
   lookSensitivity: 0.0022,
@@ -81,6 +89,18 @@ export class CameraRig {
   /** Place the camera directly. Used by the autopilot, which owns the X axis. */
   setPosition(x: number, y: number, z: number): void {
     this.camera.position.set(x, y, z);
+  }
+
+  /**
+   * Aim the camera directly, in degrees. Used by `npm run soak`, which flies
+   * one leg at a steep pitch and one near the horizon: the geometry budgets
+   * mean nothing measured looking straight down, where frustum culling throws
+   * away almost the entire world.
+   */
+  setLook(yawDegrees: number, pitchDegrees: number): void {
+    this.yaw = yawDegrees * DEG_TO_RAD;
+    this.pitch = clampPitch(pitchDegrees * DEG_TO_RAD);
+    this.applyRotation();
   }
 
   setEnabled(enabled: boolean): void {

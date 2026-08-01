@@ -188,10 +188,30 @@ export class App {
       chunkTriangles: chunks.triangles,
       chunkVertices: chunks.vertices,
       workers: chunks.workers,
+      // Phase 2b. The quadtree's whole job is bounding these two.
+      selectedNodes: chunks.selected,
+      rootLod: chunks.rootLod,
+      viewDistance: chunks.viewDistance,
       cameraX: camera.x,
+      cameraY: camera.y,
       cameraZ: camera.z,
+      cameraPitch: this.rig.look.pitch,
       settled: chunks.settled,
     };
+  }
+
+  /** Selected nodes per quadtree level, index = lod. For the soak's report. */
+  lodCounts(): number[] {
+    return this.streamer.stats().lodCounts;
+  }
+
+  /**
+   * Aim the camera, in degrees. The soak uses this to fly one leg near the
+   * horizon: draw calls and triangle counts measured from a near-nadir view are
+   * a measurement of frustum culling, not of the world.
+   */
+  setLook(yaw: number, pitch: number): void {
+    this.rig.setLook(yaw, pitch);
   }
 
   /** Start a fresh worst-frame window, so warm-up hitches do not skew a soak run. */

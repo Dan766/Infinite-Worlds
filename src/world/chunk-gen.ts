@@ -74,17 +74,64 @@ export function chunkColor(coord: ChunkCoord, worldSeed: number): [number, numbe
 // ---------------------------------------------------------------------------
 
 /**
- * Cells per node edge. 32 cells is 2 m resolution at lod 0: 1089 vertices and
- * 2048 triangles per chunk.
+ * Cells per node edge. 32 cells is 2 m resolution at lod 0.
  *
  * Every level of the Phase 2b quadtree uses the same segment count, which is
  * what makes a coarse node cheaper to draw than the four fine nodes it
  * replaces. Do not make this depend on lod.
+ *
+ * It also stays 32 because the Phase 2a profile on real hardware said so: 1.46
+ * ms median GPU render for the whole scene at 1080p is ~11x headroom, while
+ * draw calls and heap were the things over budget. Lowering `SEGMENTS` would be
+ * optimising against the dev container's software rasteriser, which is a
+ * measurement artifact and not a machine anyone runs this on.
  */
 export const SEGMENTS = 32;
 
 /** Vertices along one node edge. */
 export const VERTS_PER_EDGE = SEGMENTS + 1;
+
+/** Vertices in the terrain surface grid itself, before the skirt. */
+export const SURFACE_VERTEX_COUNT = VERTS_PER_EDGE * VERTS_PER_EDGE;
+
+/** Triangles in the terrain surface grid itself, before the skirt. */
+export const SURFACE_TRIANGLE_COUNT = SEGMENTS * SEGMENTS * 2;
+
+/**
+ * Vertices in the skirt apron: one duplicate of each border vertex, per edge.
+ * Corners are duplicated once per edge they belong to, which is what closes the
+ * apron at the corners without any special case.
+ */
+export const SKIRT_VERTEX_COUNT = 4 * VERTS_PER_EDGE;
+
+/**
+ * Triangles in the skirt apron: two per cell along each of the four edges, and
+ * then the same two again wound the other way.
+ *
+ * THE DUPLICATE WINDING IS NOT WASTE, IT IS THE FIX FOR A VISIBLE BUG. A crack
+ * at a level boundary is a vertical slot, and you can see into it from BOTH
+ * sides -- from above the low node looking at the high one, and from above the
+ * high node looking down at the low one. So the apron has to be opaque from
+ * both, and there are only two ways to get that:
+ *
+ *  - a double-sided material, which Three.js implements by flipping the normal
+ *    on back faces. The apron copies the surface normal, so the flipped copy
+ *    points into the ground and shades almost black. Worse, two same-level
+ *    neighbours put IDENTICAL aprons in the same plane, so a lit front face and
+ *    a black back face z-fight along every node boundary in the world. That is
+ *    not theoretical: it was the first thing visible in the Phase 2b screenshots.
+ *  - emitting both windings and keeping the material single-sided, which is
+ *    this. Whichever copy faces the camera is drawn with the surface's own
+ *    normal, the other is culled before rasterising, and the coincident aprons
+ *    of two same-level neighbours are then bit-identical -- so the z-fight
+ *    between them is invisible by construction.
+ *
+ * It costs 256 triangles a node, about 11%, against a seam on every edge.
+ */
+export const SKIRT_TRIANGLE_COUNT = 4 * SEGMENTS * 4;
+
+export const VERTEX_COUNT = SURFACE_VERTEX_COUNT + SKIRT_VERTEX_COUNT;
+export const TRIANGLE_COUNT = SURFACE_TRIANGLE_COUNT + SKIRT_TRIANGLE_COUNT;
 
 /**
  * World-space X of the vertex at column `col`.
@@ -115,7 +162,8 @@ export function vertexWorldZ(coord: ChunkCoord, row: number): number {
  * This is the exact call `generateChunk` makes, exported so the parity test can
  * compare it against `sampleHeight` at independently derived world coordinates.
  * `col` and `row` may be -1 or `SEGMENTS + 1`: the generator samples a one-cell
- * skirt around the node to compute seamless normals.
+ * MARGIN around the node to compute seamless normals. That margin is unrelated
+ * to the Phase 2b skirt below -- it is sampling, not geometry.
  */
 export function vertexHeight(coord: ChunkCoord, col: number, row: number, worldSeed: number): number {
   return sampleHeight(vertexWorldX(coord, col), vertexWorldZ(coord, row), worldSeed);
@@ -216,6 +264,93 @@ const TINT_FREQUENCY = 1 / 47;
 const TINT_SALT = 0x54_69_6e_74;
 
 // ---------------------------------------------------------------------------
+// Skirts
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY SKIRTS AND NOT STITCHED EDGES.
+ *
+ * Two neighbouring quadtree nodes at different levels sample the shared edge at
+ * different rates: the coarse one draws a straight line between samples 2n
+ * metres apart while the fine one follows the terrain, so a thin crack opens
+ * between them and you see sky through the ground.
+ *
+ * The textbook fix is to stitch -- degenerate the fine node's edge down to the
+ * coarse node's sample rate. It is rejected here for two concrete reasons, not
+ * on taste:
+ *
+ *  1. It makes a node's index buffer a function of its NEIGHBOURS' levels. That
+ *     breaks RULE 2 outright: the soak asserts a node regenerates byte-identical
+ *     after an unload, and a stitched node would come back different depending
+ *     on who happened to be next to it.
+ *  2. It forces a mesh rebuild every time any neighbour changes level, which is
+ *     constantly, on the main thread, for the node count this phase is trying
+ *     to bound.
+ *
+ * A skirt is an apron of geometry hanging straight down from every border
+ * vertex. It depends on nothing but `(seed, coord)`, it is built once in the
+ * worker, and it plugs the crack from whichever side is short. It costs 132
+ * vertices and 256 triangles per node -- about 12% -- which is a bargain
+ * compared to giving up deterministic regeneration.
+ */
+
+/** Minimum apron depth in metres, so a perfectly flat node still has one. */
+export const MIN_SKIRT_DEPTH = 1;
+
+/**
+ * Multiple of the largest step between adjacent border vertices.
+ *
+ * The gap to close is the coarse neighbour's linear-interpolation error across
+ * one of ITS cells, which spans two of this node's cells. Bounding that by the
+ * largest single-cell step and tripling it is comfortably conservative while
+ * staying proportional to the local terrain -- a flat plain gets a 1 m apron and
+ * a cliff edge gets one deep enough to matter. A fixed fraction of the node's
+ * total relief was the obvious alternative and is far worse: it hangs a 200 m
+ * curtain off every node in a mountain range, most of which sits in mid-air at
+ * the outer edge of the view distance.
+ */
+export const SKIRT_DEPTH_FACTOR = 3;
+
+/**
+ * How far the apron hangs below the surface, read back out of a payload.
+ *
+ * The depth is a function of the terrain, so it cannot be recomputed on the
+ * main thread without a second copy of the rule. Reading it from the buffer
+ * that was actually uploaded keeps one source of truth: skirt vertex 0 is the
+ * duplicate of surface vertex 0, so their Y difference IS the depth.
+ * `chunk-mesh.ts` uses this to extend the bounding box, which frustum culling
+ * needs or the apron gets clipped away exactly when it is doing its job.
+ */
+export function skirtDepthOf(positions: Float32Array): number {
+  const top = positions[SKIRT_ANCHOR_INDEX * 3 + 1] as number;
+  const bottom = positions[SURFACE_VERTEX_COUNT * 3 + 1] as number;
+  return top - bottom;
+}
+
+/**
+ * The four borders, each as an ordered walk plus the direction that is "out of
+ * the node".
+ *
+ * The walk direction is not arbitrary: winding the apron quads consistently
+ * needs `walk = (outward.z, -outward.x)`, which is what makes the generated
+ * triangle normals point away from the node rather than into it.
+ */
+const SKIRT_EDGES = [
+  { outX: 0, outZ: -1, startCol: SEGMENTS, startRow: 0, stepCol: -1, stepRow: 0 },
+  { outX: 0, outZ: 1, startCol: 0, startRow: SEGMENTS, stepCol: 1, stepRow: 0 },
+  { outX: -1, outZ: 0, startCol: 0, startRow: 0, stepCol: 0, stepRow: 1 },
+  { outX: 1, outZ: 0, startCol: SEGMENTS, startRow: SEGMENTS, stepCol: 0, stepRow: -1 },
+] as const;
+
+/**
+ * The surface vertex that skirt vertex 0 hangs from -- the start of the first
+ * edge's walk, which is NOT surface vertex 0. Derived from the table rather
+ * than written out, so reordering `SKIRT_EDGES` cannot silently make
+ * `skirtDepthOf` read an unrelated pair of vertices.
+ */
+const SKIRT_ANCHOR_INDEX = SKIRT_EDGES[0].startRow * VERTS_PER_EDGE + SKIRT_EDGES[0].startCol;
+
+// ---------------------------------------------------------------------------
 // Generation
 // ---------------------------------------------------------------------------
 
@@ -244,10 +379,10 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   const size = chunkSizeAt(coord.lod);
   const step = size / SEGMENTS;
 
-  const positions = new Float32Array(side * side * 3);
-  const normals = new Float32Array(side * side * 3);
-  const colors = new Float32Array(side * side * 3);
-  const indices = new Uint32Array(SEGMENTS * SEGMENTS * 6);
+  const positions = new Float32Array(VERTEX_COUNT * 3);
+  const normals = new Float32Array(VERTEX_COUNT * 3);
+  const colors = new Float32Array(VERTEX_COUNT * 3);
+  const indices = new Uint32Array(TRIANGLE_COUNT * 3);
 
   // Heights on a grid padded by one cell, so every interior normal has both
   // neighbours available and border normals match the adjacent chunk exactly.
@@ -322,6 +457,74 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
       indices[write++] = b;
       indices[write++] = c;
       indices[write++] = d;
+    }
+  }
+
+  // -- skirt ---------------------------------------------------------------
+  //
+  // One apron vertex per border vertex, hanging straight down. Position X and Z
+  // are copied exactly from the top vertex rather than recomputed, so the apron
+  // can never be a hair off the edge it is sealing. Normals and colours are
+  // copied too: the apron is only ever seen edge-on through a crack, and giving
+  // it the surface's own shading is what makes it read as the ground continuing
+  // rather than as a dark band.
+
+  let depth = MIN_SKIRT_DEPTH;
+  for (const edge of SKIRT_EDGES) {
+    let col = edge.startCol;
+    let row = edge.startRow;
+    let previous = positions[(row * side + col) * 3 + 1] as number;
+    for (let i = 1; i < side; i++) {
+      col += edge.stepCol;
+      row += edge.stepRow;
+      const y = positions[(row * side + col) * 3 + 1] as number;
+      const delta = Math.abs(y - previous) * SKIRT_DEPTH_FACTOR;
+      if (delta > depth) depth = delta;
+      previous = y;
+    }
+  }
+
+  let vertex = SURFACE_VERTEX_COUNT;
+  for (const edge of SKIRT_EDGES) {
+    let col = edge.startCol;
+    let row = edge.startRow;
+    for (let i = 0; i < side; i++) {
+      const from = (row * side + col) * 3;
+      const to = vertex * 3;
+      positions[to] = positions[from] as number;
+      positions[to + 1] = (positions[from + 1] as number) - depth;
+      positions[to + 2] = positions[from + 2] as number;
+      normals[to] = normals[from] as number;
+      normals[to + 1] = normals[from + 1] as number;
+      normals[to + 2] = normals[from + 2] as number;
+      colors[to] = colors[from] as number;
+      colors[to + 1] = colors[from + 1] as number;
+      colors[to + 2] = colors[from + 2] as number;
+
+      if (i > 0) {
+        const topPrevious = (row - edge.stepRow) * side + (col - edge.stepCol);
+        const top = row * side + col;
+        const bottomPrevious = vertex - 1;
+        const bottom = vertex;
+        // Outward-facing, per the walk direction in SKIRT_EDGES...
+        indices[write++] = topPrevious;
+        indices[write++] = bottomPrevious;
+        indices[write++] = bottom;
+        indices[write++] = topPrevious;
+        indices[write++] = bottom;
+        indices[write++] = top;
+        // ...and the same two triangles facing back into the node.
+        indices[write++] = bottom;
+        indices[write++] = bottomPrevious;
+        indices[write++] = topPrevious;
+        indices[write++] = top;
+        indices[write++] = bottom;
+        indices[write++] = topPrevious;
+      }
+
+      vertex++;
+      col += edge.stepCol;
+      row += edge.stepRow;
     }
   }
 

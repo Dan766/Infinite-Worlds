@@ -49,6 +49,9 @@ No game engine, no React, no state library.
    with a coarser node over the same square, and the symptom would be a
    corrupted cache rather than a compile error. Throughout Phase 2a `lod` is
    always 0. This is not a precedent — RULE 4 still stands.
+
+   **Phase 2b, which is what actually varies `lod`, changed nothing here.**
+   That was the point of doing it early, and it worked.
 5. **Budgets are hard limits**, checked every phase against the perf HUD:
    60fps at 1080p on integrated graphics; <=1200 draw calls; <=400MB JS heap
    after 5 minutes of continuous movement; <=16ms main-thread frame time with no
@@ -76,8 +79,9 @@ src/
     worker-pool.ts      pool, priority queue, cancellation; is a ChunkProvider
     priority-queue.ts   keyed binary min-heap with in-place re-ranking
     lru-cache.ts        entry-capped LRU with an eviction hook
+    quadtree.ts         node selection: pure arithmetic, no state, no Three
     chunk-mesh.ts       the only file in world/ that imports Three.js
-    chunk-streamer.ts   load/unload by radius; owns the HUD lines and toggles
+    chunk-streamer.ts   quadtree residency; owns the HUD lines and toggles
   render/
     renderer.ts         the ONLY module that touches THREE.WebGLRenderer
   scene/
@@ -181,9 +185,81 @@ Two consequences worth keeping:
 - **Normals come from the height field, not from the triangles.** Triangle
   normals are discontinuous at every chunk border, and the seam would be a
   lighting crease along every 64 m boundary in the world. `chunk-gen.ts`
-  samples a one-cell skirt beyond the node and takes central differences, so
+  samples a one-cell MARGIN beyond the node and takes central differences, so
   two neighbouring chunks compute the same normal at a shared vertex because
   they evaluate the same function at the same world position.
+
+### The quadtree bounds NODE COUNT, not triangle count
+
+Phase 2b's design follows from a profile of Phase 2a on real hardware (Intel
+Arc 140V, 1080p): **1.46 ms median GPU render for the entire scene**, about 11x
+headroom, while a 3 km flat-LOD radius cost **1,834 draw calls and 504 MB of
+heap**. Frame time was never the problem. Draw calls and memory were.
+
+`SEGMENTS` is therefore fixed at 32 for every level, so **a node costs the same
+74,676 bytes and 2,560 triangles whatever area it covers**. That is the whole
+trick: it makes node count the only quantity worth bounding, and a quadtree
+bounds it to about 300 for 4 km of terrain where a flat lod-0 disc would need
+12,000.
+
+Do not lower `SEGMENTS` because the dev container renders slowly. The container
+has no GPU; its numbers come from SwiftShader and are a measurement artifact.
+
+Three properties hold this together:
+
+- **Selection is a pure function of camera position.** `selectQuadtree` takes
+  `(cameraX, cameraZ, viewDistance, splitFactor)` and nothing else -- not call
+  history, not what is resident, not the direction of approach. Split while
+  `distance(camera, nodeCentre) < splitFactor * nodeSize`; keep any node whose
+  square comes within `viewDistance`.
+- **The split test has no hysteresis, deliberately.** A hysteretic split test
+  makes the resident SET depend on the route taken to a position. Per-node
+  content stays deterministic either way, but a settled screenshot and the
+  soak's round trip would both go path-dependent, and no byte comparison can
+  tell that apart from a real regression.
+- **Unload hysteresis is conditioned on residency, not distance.** A node that
+  stops being selected survives until whatever replaced it is in the scene --
+  a parent until its four children are up, four children until their parent is.
+  Retire on deselection instead and a hole flashes through the ground for every
+  frame a split takes to stream; use a distance margin instead (the obvious
+  design, and Phase 1's) and a ring of stale nodes lingers whose contents depend
+  on where the camera has been. Conditioning on residency gives a margin that is
+  transient by construction: **once nothing is streaming, live == selected,
+  exactly.** The LRU cache is what makes that affordable.
+
+Horizontal distance, not 3D: using the camera's height would push the ground
+under your own feet to lod 2 while standing on a 300 m peak, and it bounds node
+count no better.
+
+### Cracks are closed with skirts, never with stitched edges
+
+Two nodes at different levels sample their shared edge at different rates, so a
+crack opens between the coarse node's straight line and the fine node's terrain.
+The textbook fix -- stitching the fine edge down to the coarse sample rate --
+is rejected here for two concrete reasons:
+
+1. It makes a node's index buffer a function of its **neighbours' levels**, so
+   the same node comes back with different bytes depending on what was next to
+   it. That is a direct RULE 2 violation and the soak would catch it.
+2. It forces a main-thread mesh rebuild every time any neighbour changes level.
+
+Instead every node carries an apron hanging straight down from its border, built
+in the worker, depending on nothing but `(seed, coord)`. Its depth is three
+times the largest step between adjacent border vertices -- proportional to the
+local terrain, so a plain gets 1 m and a 1 km mountain node gets ~20 m, rather
+than a fixed fraction of relief that would hang a 200 m curtain off every node.
+
+The apron carries **both windings** and the material stays single-sided. A
+double-sided material is the obvious alternative and is wrong: Three.js flips
+the normal on back faces, the apron copies the surface normal, and the flipped
+copy shades near-black -- so two same-level neighbours, whose aprons are
+coincident, z-fight a lit face against a black one along every node boundary in
+the world. That was visible in the first Phase 2b capture. With both windings
+present, whichever copy faces the camera is drawn with the surface's own normal
+and the coincident aprons are bit-identical, so their z-fight is invisible.
+
+Popping is handled by threshold tuning alone -- no geomorphing, no custom
+shader, so Phase 11 is free to replace the material outright.
 
 ### Surface colour is baked in the worker, not in a shader
 
@@ -206,9 +282,19 @@ drawn wins. `chunk-mesh.ts` therefore sets `renderOrder` from the chunk
 coordinate. Without it, `shots:check` fails intermittently on the wireframe
 views.
 
+Since Phase 2b the order folds in `lod` too: a node and its parent share
+`(x, z)` for one of the four children, and both are resident while a split
+streams in, so `(x, z)` alone would let them collide and fall back to material
+id -- i.e. to worker completion order -- which is precisely the flake this
+exists to remove.
+
 ### `window.__worldReady` waits for the world, not just for a frame
 
 Since Phase 1 it means "two frames rendered AND every chunk in range resident".
+Since Phase 2b that is the stronger statement "every SELECTED node is in the
+scene", not merely "nothing is outstanding" -- with several levels arriving
+asynchronously, the weaker form would let a capture fire while a coarse node was
+still standing in for four fine ones.
 A screenshot harness that fired on the first frame would catch a half-streamed
 world and the byte comparison would go permanently flaky.
 
@@ -307,6 +393,16 @@ the chunks where the flight started come back **byte-identical** afterwards.
 Heap samples are taken after a forced `HeapProfiler.collectGarbage` over CDP, or
 the reading would measure uncollected garbage rather than a leak.
 
+**Two legs, two camera pitches, since Phase 2b.** The outbound leg keeps Phase
+2a's angle; at the turn-around the camera drops to 3 degrees below the horizon
+and the return leg is where every geometry budget is judged. This is not
+decoration. Phase 2a's budgets were set from a steeply pitched flight, where
+frustum culling throws most of the world away, so the draw-call budget read 105
+against a limit of 1200 and **could not have failed however bad things got**.
+The run now also fails if the shallow leg produced fewer than 3 samples or
+peaked under 55 draw calls, so a canary pointed at nothing is a failure rather
+than a pass.
+
 The round-trip check hashes each chunk's uploaded **position buffer**. Phase 1
 compared flat colours, which could only ever prove the coordinate hash was pure.
 Hashing the vertex bits proves the thing that is actually expensive to
@@ -320,17 +416,32 @@ trip, or on any page error.
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit    | Phase 2a measured |
-| ----------------------------- | -------- | ----------------- |
-| live triangles                | 900,000  | 505,856 peak      |
-| live vertices                 | 500,000  | 268,983 peak      |
-| draw calls                    | 1,200    | 105 peak          |
-| chunk payload bytes           | 96 MB    | 38.4 MB peak      |
+| Budget                        | Limit     | Phase 2b measured (shallow leg) |
+| ----------------------------- | --------- | ------------------------------- |
+| live triangles                | 1,300,000 | 724,480 peak                    |
+| live vertices                 | 620,000   | 345,543 peak                    |
+| draw calls                    | 200       | 106 peak                        |
+| chunk payload bytes           | 76 MB     | 56.6 MB peak                    |
 
-Those limits are the measured Phase 2a peaks with roughly 1.8x headroom, for a
-uniform disc of 32x32-segment chunks at load radius 8 / unload radius 10.
-**Phase 2b should reduce them**, because reducing them is what a quadtree is
-for. fps and frame time are deliberately NOT failures: see below.
+Those limits are the Phase 2b peaks with roughly 1.8x headroom, measured on the
+shallow-pitch leg at a 4 km view distance. They are deliberately far tighter
+than the project ceiling of 1200 draw calls: the ceiling says what the hardware
+can take, these say what the world costs today, so a regression fails instead of
+quietly consuming slack.
+
+The triangle and vertex limits went UP against Phase 2a, which looks like the
+wrong direction until you see what changed underneath: the view distance went
+from 512 m to 4096 m -- 64x the area -- for 1.43x the triangles and the SAME
+draw calls, and each node now carries a skirt on top of that. Per square
+kilometre of world, triangles fell about 45x and draw calls about 64x.
+
+`chunk payload bytes` is structurally capped rather than free to drift: the LRU
+cap is 512 nodes over a resident set of ~300, so at 74,676 bytes a node the
+ceiling is about 61 MB. Phase 2a's 96 MB was therefore unreachable and could
+never have fired; 76 MB sits above the worst plausible transient and below
+anything a per-node size regression would produce.
+
+fps and frame time are deliberately NOT failures: see below.
 
 Like `shots:check`, it guards against passing while nothing happened: a soak run
 over an empty world would show a beautifully flat heap. It fails if fewer than

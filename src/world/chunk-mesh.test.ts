@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import { createChunkMesh, disposeChunkMesh, hashPositions } from './chunk-mesh';
-import { generateChunk } from './chunk-gen';
+import { generateChunk, skirtDepthOf } from './chunk-gen';
 import { CHUNK_SIZE, createTierContext, type ChunkCoord } from './contracts';
 
 const build = (coord: ChunkCoord = { x: 0, z: 0, lod: 0 }): ReturnType<typeof createChunkMesh> =>
@@ -86,11 +86,41 @@ describe('createChunkMesh', () => {
 
   it('reports its own triangle, vertex and byte counts', () => {
     const entry = build();
-    expect(entry.triangles).toBe(2048);
-    expect(entry.vertices).toBe(1089);
+    // 2048 surface triangles plus the apron's 512 (two windings), and 1089 surface
+    // vertices plus its 132. Every node costs this at EVERY level -- which is
+    // what makes node count, not triangle count, the thing the quadtree bounds.
+    expect(entry.triangles).toBe(2560);
+    expect(entry.vertices).toBe(1221);
     // positions + normals + colors (3 floats each) + indices (uint32).
-    expect(entry.bytes).toBe(1089 * 3 * 4 * 3 + 2048 * 3 * 4);
+    expect(entry.bytes).toBe(1221 * 3 * 4 * 3 + 2560 * 3 * 4);
+    expect(entry.bytes).toBe(74676);
     disposeChunkMesh(entry);
+  });
+
+  it('extends the bounding box down to the bottom of the skirt', () => {
+    // Frustum culling reads this box. Leave the apron out of it and the node is
+    // culled exactly when its skirt is the only thing on screen -- at a level
+    // boundary running off the bottom of the view.
+    const entry = build({ x: 11, z: 7, lod: 3 });
+    const box = entry.geometry.boundingBox as THREE.Box3;
+    const data = generateChunk({ x: 11, z: 7, lod: 3 }, createTierContext(99, 'chunk'));
+    expect(skirtDepthOf(data.positions)).toBeGreaterThan(0);
+    expect(box.min.y).toBeCloseTo(data.minY - skirtDepthOf(data.positions), 3);
+    disposeChunkMesh(entry);
+  });
+
+  it('gives nodes at different levels over the same square distinct draw orders', () => {
+    // Both can be resident at once while a split or a merge streams in. If they
+    // share a renderOrder the tie falls back to material id -- i.e. to whichever
+    // worker finished first -- and the wireframe screenshots go flaky again.
+    const orders = new Set<number>();
+    for (let lod = 0; lod < 6; lod++) {
+      const entry = build({ x: 0, z: 0, lod });
+      expect(Number.isSafeInteger(entry.mesh.renderOrder)).toBe(true);
+      orders.add(entry.mesh.renderOrder);
+      disposeChunkMesh(entry);
+    }
+    expect(orders.size).toBe(6);
   });
 });
 

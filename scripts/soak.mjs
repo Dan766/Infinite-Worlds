@@ -19,6 +19,13 @@
  * Nothing here drives the camera from Node, because a 10Hz poke from outside is
  * not a flight, it is a slideshow.
  *
+ * TWO LEGS, TWO PITCHES, added in Phase 2b. The outbound leg keeps Phase 2a's
+ * camera angle. At the turn-around the camera drops to the horizon, and the
+ * return leg is where every geometry budget is judged -- because a budget
+ * measured from a steeply pitched camera is a measurement of frustum culling
+ * and cannot fail however bad the world gets. The pitch change does not touch
+ * the flight path, so the round-trip determinism check is unaffected.
+ *
  * A CAUTION LEARNED IN PHASE 0: a byte-comparison harness once reported five
  * green screenshots while the app rendered nothing at all. The same trap
  * applies here -- a soak run over an empty world would show a beautifully flat
@@ -61,24 +68,58 @@ const MAX_HEAP_MB = 400;
 const MIN_CHUNKS_STREAMED = 50;
 
 /**
- * GPU-INDEPENDENT BUDGETS, added in Phase 2a.
+ * GPU-INDEPENDENT BUDGETS.
  *
  * fps and frame time cannot be judged in a container with no GPU -- see the
  * note at the bottom of this file. Geometry volume can: triangle count, vertex
  * count, draw calls and payload bytes are the same number on a workstation, in
- * CI, and on a phone. Phase 2a multiplied triangles by about a thousand, so
- * these become hard failures now rather than after Phase 2b's quadtree has
- * quietly doubled them.
+ * CI, and on a phone.
  *
- * The thresholds are the measured Phase 2a peaks with headroom, not aspirations:
- * a uniform disc of 32x32-segment chunks at load radius 8 / unload radius 10.
- * Phase 2b should REDUCE these, because that is what an LOD quadtree is for.
+ * RE-DERIVED IN PHASE 2b, AND THE OLD NUMBERS WERE WORSE THAN WRONG. The Phase
+ * 2a limits (900k triangles / 500k vertices / 96 MB / 1200 draw calls) were the
+ * peaks of a flight whose camera pitch made frustum culling throw away most of
+ * the world, so the draw-call budget in particular could not have fired however
+ * bad things got. A budget that cannot fail is not a budget. This run now flies
+ * a SHALLOW-PITCH leg specifically so these are measured where they are near
+ * their limits, and the thresholds below are the peaks measured on that leg
+ * with roughly 1.5x headroom.
+ *
+ * They are deliberately TIGHTER than the project-level ceiling of 1200 draw
+ * calls. The project ceiling says what the hardware can take; these say what
+ * this world costs today, so a regression shows up as a failure rather than as
+ * 1100 draw calls of silently accumulated slack.
  */
-const MAX_LIVE_TRIANGLES = 900_000;
-const MAX_LIVE_VERTICES = 500_000;
-const MAX_DRAW_CALLS = 1200;
-/** Live plus cached payload bytes held by the streamer. */
-const MAX_CHUNK_BYTES = 96 * 1024 * 1024;
+const MAX_LIVE_TRIANGLES = 1_300_000; // measured 724,480 peak -- 1.79x
+const MAX_LIVE_VERTICES = 620_000; //   measured 345,543 peak -- 1.79x
+const MAX_DRAW_CALLS = 200; //          measured     106 peak -- 1.89x
+/**
+ * Live plus cached payload bytes held by the streamer. Measured 56.6 MB peak.
+ *
+ * Note this one is structurally bounded rather than free to drift: the LRU cap
+ * is 512 nodes and the resident set is around 300, so at 74,676 bytes a node
+ * the ceiling is roughly 61 MB. The Phase 2a value of 96 MB was therefore
+ * unreachable and could never have fired. 76 MB sits above the worst plausible
+ * transient and below anything a per-node size regression would produce.
+ */
+const MAX_CHUNK_BYTES = 76 * 1024 * 1024;
+
+/**
+ * Pitch in degrees for the two legs of the flight.
+ *
+ * The outbound leg keeps Phase 2a's angle so the two runs stay comparable; the
+ * return leg drops to the horizon, which is where the quadtree's outer rings
+ * enter the frustum and where every geometry budget above is actually decided.
+ */
+const OUTBOUND_PITCH = -18;
+const SHALLOW_PITCH = -3;
+
+/**
+ * Below this many draw calls on the shallow leg, the canary is not looking at
+ * the world and its budgets prove nothing. This is the anti-vacuity guard for
+ * the whole geometry section: Phase 2a's canary passed at 105 draw calls
+ * against a limit of 1200 and would have passed at 105 forever.
+ */
+const MIN_SHALLOW_DRAW_CALLS = 55;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -155,7 +196,7 @@ const url =
   `${server.url}?seed=${encodeURIComponent(SEED)}&panel=0&hud=1` +
   // yaw -90 faces +X, which is the direction the autopilot travels, so chunks
   // stream in ahead of the camera rather than behind it.
-  `&fly=${SPEED}&flyleg=${legSeconds}&pos=0,90,0&look=-90,-18`;
+  `&fly=${SPEED}&flyleg=${legSeconds}&pos=0,90,0&look=-90,${OUTBOUND_PITCH}`;
 
 let exitCode = 0;
 const failures = [];
@@ -203,6 +244,7 @@ try {
   const samples = [];
   const startedAt = Date.now();
   let nextSampleAt = startedAt;
+  let shallow = false;
 
   while (Date.now() - startedAt < SECONDS * 1000) {
     const wait = nextSampleAt - Date.now();
@@ -210,8 +252,19 @@ try {
     if (Date.now() < nextSampleAt) continue;
     nextSampleAt += INTERVAL * 1000;
 
+    // Halfway through -- exactly where the autopilot turns around -- drop the
+    // camera to the horizon for the return leg. Draw calls and triangle counts
+    // read off a steeply pitched view measure frustum culling, not the world,
+    // and a budget measured there can never fail.
+    if (!shallow && Date.now() - startedAt >= (SECONDS * 1000) / 2) {
+      await page.evaluate((pitch) => window.__app.setLook(-90, pitch), SHALLOW_PITCH);
+      shallow = true;
+      console.log(`  --- pitch to ${SHALLOW_PITCH} deg: shallow leg begins ---`);
+    }
+
     const snapshot = await sample(page, cdp);
     snapshot.t = (Date.now() - startedAt) / 1000;
+    snapshot.shallow = shallow;
     samples.push(snapshot);
 
     const line =
@@ -224,14 +277,15 @@ try {
       `evict ${String(snapshot.evictedChunks).padStart(6)}  ` +
       `draws ${String(snapshot.drawCalls).padStart(4)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
-      `x ${Math.round(snapshot.cameraX)}`;
+      `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
   }
 
   // The flight ends where it started, but the chunks around the origin have to
   // stream back in before their geometry can be compared.
-  const returned = await waitForSettled(page, 30000);
+  const returned = await waitForSettled(page, 60000);
   const finalSnapshot = await sample(page, cdp);
+  const finalLod = await page.evaluate(() => window.__app.lodCounts());
   const geometryAfter = await page.evaluate(
     (x) => window.__app.sampleChunkGeometry(x, 0, 2),
     originX,
@@ -249,6 +303,11 @@ try {
   const liveTris = samples.map((s) => s.chunkTriangles);
   const liveVerts = samples.map((s) => s.chunkVertices);
   const chunkBytes = samples.map((s) => s.chunkBytes);
+  // The shallow leg is where the geometry budgets are actually decided; the
+  // steep one is kept only so the two halves can be compared in the report.
+  const shallowSamples = samples.filter((s) => s.shallow === true);
+  const shallowDraws = shallowSamples.map((s) => s.drawCalls);
+  const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
   // The heap ramps while the LRU cache fills toward its cap, and that fill takes
@@ -291,6 +350,8 @@ try {
   console.log('');
   console.log('chunks');
   console.log(`  live min/mean/max ${min(lives)} / ${mean(lives).toFixed(1)} / ${max(lives)}`);
+  console.log(`  selected at end   ${finalSnapshot.selectedNodes} nodes, lod [${finalLod.join(' ')}]`);
+  console.log(`  view distance     ${finalSnapshot.viewDistance} m (root lod ${finalSnapshot.rootLod})`);
   console.log(`  cached at end     ${finalSnapshot.cachedChunks}`);
   console.log(`  generated total   ${finalSnapshot.generatedChunks}`);
   console.log(`  cancelled total   ${finalSnapshot.cancelledChunkRequests}`);
@@ -307,6 +368,13 @@ try {
   console.log(`  draw calls        ${max(draws)} peak (budget ${MAX_DRAW_CALLS})`);
   console.log(
     `  bytes per chunk   ${Math.round(finalSnapshot.chunkBytes / Math.max(1, finalSnapshot.liveChunks + finalSnapshot.cachedChunks))}`,
+  );
+  console.log(
+    `  steep leg peak    ${steepDraws.length === 0 ? 'n/a' : max(steepDraws)} draw calls at ${OUTBOUND_PITCH} deg`,
+  );
+  console.log(
+    `  SHALLOW leg peak  ${shallowDraws.length === 0 ? 'n/a' : max(shallowDraws)} draw calls at ${SHALLOW_PITCH} deg` +
+      ` (${shallowSamples.length} samples, floor ${MIN_SHALLOW_DRAW_CALLS})`,
   );
 
   console.log('');
@@ -392,6 +460,21 @@ try {
     failures.push(
       `only ${max(liveTris)} triangles / ${max(liveVerts)} vertices were ever live; ` +
         'the terrain never streamed, so the geometry budgets proved nothing',
+    );
+  }
+  // ...and against passing while pointed at nothing. Phase 2a's canary read 105
+  // draw calls against a 1200 limit from a near-nadir view: green forever,
+  // whatever the world did. These two make that impossible to repeat.
+  if (shallowSamples.length < 3) {
+    failures.push(
+      `only ${shallowSamples.length} samples were taken on the shallow-pitch leg; ` +
+        'the geometry budgets were never measured where they are near their limits',
+    );
+  } else if (max(shallowDraws) < MIN_SHALLOW_DRAW_CALLS) {
+    failures.push(
+      `the shallow leg peaked at ${max(shallowDraws)} draw calls, under the ` +
+        `${MIN_SHALLOW_DRAW_CALLS} floor. The camera was not looking at the world, ` +
+        'so the draw-call budget proved nothing.',
     );
   }
 

@@ -12,6 +12,7 @@
 
 import * as THREE from 'three';
 import { hashCombine } from '../core/hash';
+import { skirtDepthOf } from './chunk-gen';
 import { chunkDataBytes, chunkOrigin, chunkSizeAt, type ChunkCoord, type ChunkData } from './contracts';
 
 /**
@@ -28,15 +29,20 @@ import { chunkDataBytes, chunkOrigin, chunkSizeAt, type ChunkCoord, type ChunkDa
  * intermittently on the wireframe views, which is precisely the kind of flake
  * that destroys trust in a screenshot harness.
  *
- * `z * 2^26 + x` is exactly representable as a double for |x|,|z| < 2^26, i.e.
- * out to about 4 billion metres, so distinct chunks can never collide.
+ * PHASE 2b FOLDS `lod` IN. A quadtree node and its parent share `(x, z)` for
+ * the child at the parent's minimum corner, and both can be resident at once
+ * while a split or a merge is still streaming. Without `lod` in the key those
+ * two collide and the tie falls back to material id, i.e. to worker completion
+ * order, which is exactly the flake this function exists to remove.
  *
- * Phase 2a keeps this even though the terrain is no longer coplanar: the
- * wireframe views still draw shared chunk edges at identical depth, and a
- * non-deterministic draw order is exactly what made `shots:check` flaky before.
+ * `(z * 2^22 + x) * 8 + lod` is injective for |x|,|z| < 2^21 (about 134,000 km
+ * at lod 0) and lod < 8, and its largest magnitude is 2^46 -- comfortably
+ * inside the exactly-representable integers, so distinct nodes never collide.
+ * Multiplying by 8 and adding a constant preserves the Phase 2a ordering
+ * exactly for a lod-0-only scene.
  */
 function chunkRenderOrder(coord: ChunkCoord): number {
-  return coord.z * 67108864 + coord.x;
+  return (coord.z * 4194304 + coord.x) * 8 + coord.lod;
 }
 
 /**
@@ -55,6 +61,10 @@ function chunkRenderOrder(coord: ChunkCoord): number {
  * program across identical materials anyway, so the cost is a JS object.
  */
 function createChunkMaterial(): THREE.MeshLambertMaterial {
+  // Single-sided, deliberately. The skirt needs to be opaque from both sides
+  // and gets there by carrying both windings in its index buffer -- see
+  // `SKIRT_TRIANGLE_COUNT` in `chunk-gen.ts` for why a double-sided material is
+  // the wrong tool for it.
   return new THREE.MeshLambertMaterial({ vertexColors: true });
 }
 
@@ -69,12 +79,17 @@ function createChunkGeometry(data: ChunkData): THREE.BufferGeometry {
   // horizontal extents are known analytically and the vertical extents came
   // back with the payload. Frustum culling is what keeps draw calls
   // proportional to what is on screen rather than to what is resident.
+  //
+  // `minY` is the SURFACE minimum; the skirt hangs below it. The bounds must
+  // include the apron or frustum culling drops it exactly when it is doing its
+  // job -- at a level boundary running off the bottom of the screen.
   const size = chunkSizeAt(data.coord.lod);
   const half = size / 2;
-  const midY = (data.minY + data.maxY) / 2;
-  const halfY = (data.maxY - data.minY) / 2;
+  const floorY = data.minY - skirtDepthOf(data.positions);
+  const midY = (floorY + data.maxY) / 2;
+  const halfY = (data.maxY - floorY) / 2;
   geometry.boundingBox = new THREE.Box3(
-    new THREE.Vector3(0, data.minY, 0),
+    new THREE.Vector3(0, floorY, 0),
     new THREE.Vector3(size, data.maxY, size),
   );
   geometry.boundingSphere = new THREE.Sphere(

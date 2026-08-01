@@ -40,7 +40,7 @@
     {
       "name": "chunks-radius-edge",
       "params": "?time=3&pos=-260,180,260&look=45,-32",
-      "expect": "Phase 1. The edge of the streaming radius against the sky. Shows how far chunks stream and catches an off-by-one in the load disc."
+      "expect": "Phase 1, repurposed by Phase 2b. It used to frame the edge of the 512m streaming disc against the sky; with a 4km quadtree there is no such edge to see, so what it now tests is a mid-pitch view over several level boundaries at once. Its params are deliberately unchanged -- editing a canonical viewpoint destroys the only history the harness has."
     },
     {
       "name": "chunks-wireframe",
@@ -61,6 +61,21 @@
       "name": "terrain-wireframe-relief",
       "params": "?time=3&pos=-3300,175,420&look=120,-8&wireframe=1",
       "expect": "Phase 2a. The same viewpoint in wireframe: the 32x32 (2m) triangle grid draped over real relief. Catches a change to SEGMENTS, a broken vertex grid, or a chunk that failed to build, none of which are obvious in the shaded view. Also re-tests the coordinate-derived renderOrder now that neighbouring chunks are no longer coplanar."
+    },
+    {
+      "name": "lod-horizon",
+      "params": "?time=3&pos=-1400,300,420&look=90,-5",
+      "expect": "Phase 2b. THE SHALLOW-PITCH VIEW, and the reason it exists: every earlier canonical view is pitched down far enough that frustum culling throws most of the world away, so none of them can show what a 4 km quadtree actually costs or what its level boundaries look like. Here the camera is 5 degrees below the horizon with the snow-capped range 2-4 km out, so all five levels in play are on screen at once. Any crack at a level boundary shows as a sliver of clear colour through the ground; the skirts are what stop that. ~97 draw calls at 1080p against a budget of 1200."
+    },
+    {
+      "name": "lod-ground-horizon",
+      "params": "?time=3&pos=-1400,88,420&look=90,-1",
+      "expect": "Phase 2b. The same terrain from 8 m above the ground, looking 1 degree below the horizon. This is where the lod-0/lod-1 boundary lands closest to the camera (about 320 m) and therefore where a crack would be widest in screen space. It also exercises the near-plane end of the depth range against 4 km of terrain, which is what the camera's near/far change was for."
+    },
+    {
+      "name": "lod-rings-wireframe",
+      "params": "?time=3&pos=-1400,2600,420&look=0,-88&wireframe=1",
+      "expect": "Phase 2b. Straight down from 2.6 km, in wireframe: the quadtree's structure itself. The bright centre is lod 0, whose 2 m cells are sub-pixel at this scale and so read as solid fill; each step outward doubles the node size and halves the apparent line density. The stepped boundaries are the quadtree staircase. If the selection ever collapses to a single level, inverts, or stops tiling, this is the view that says so instantly -- and nothing else in the harness would."
     }
   ]
 }

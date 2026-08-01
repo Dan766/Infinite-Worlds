@@ -8,11 +8,19 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  MIN_SKIRT_DEPTH,
   SEGMENTS,
+  SKIRT_TRIANGLE_COUNT,
+  SKIRT_VERTEX_COUNT,
+  SURFACE_TRIANGLE_COUNT,
+  SURFACE_VERTEX_COUNT,
+  TRIANGLE_COUNT,
+  VERTEX_COUNT,
   VERTS_PER_EDGE,
   chunkColor,
   generateChunk,
   hslToRgb,
+  skirtDepthOf,
   surfaceColor,
   vertexHeight,
   vertexWorldX,
@@ -316,11 +324,14 @@ describe('generateChunk', () => {
     expect(data.coord).toEqual(coord);
   });
 
-  it('reports a real vertical extent that contains every vertex', () => {
+  it('reports a real vertical extent that contains every surface vertex', () => {
     const data = generateChunk({ x: 5, z: -2, lod: 0 }, context());
     let lo = Infinity;
     let hi = -Infinity;
-    for (let i = 1; i < data.positions.length; i += 3) {
+    // Surface vertices only: `minY`/`maxY` describe the terrain, and the skirt
+    // deliberately hangs below it. `chunk-mesh.ts` is what widens the bounding
+    // box to include the apron.
+    for (let i = 1; i < SURFACE_VERTEX_COUNT * 3; i += 3) {
       const y = data.positions[i] as number;
       lo = Math.min(lo, y);
       hi = Math.max(hi, y);
@@ -395,12 +406,21 @@ describe('generateChunk', () => {
     );
   });
 
-  it('has the grid size Phase 2a specifies', () => {
+  it('has the grid size Phase 2a specifies, plus the Phase 2b skirt', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
+    // `SEGMENTS` stays 32 at every level. That is what makes a coarse node
+    // cheaper than the four fine ones it replaces, and it is what makes node
+    // count -- not triangle count -- the thing the quadtree has to bound.
     expect(SEGMENTS).toBe(32);
-    expect(data.positions.length / 3).toBe(VERTS_PER_EDGE * VERTS_PER_EDGE);
-    expect(data.positions.length / 3).toBe(1089);
-    expect(data.indices.length / 3).toBe(2048);
+    expect(SURFACE_VERTEX_COUNT).toBe(1089);
+    expect(SURFACE_TRIANGLE_COUNT).toBe(2048);
+    expect(SKIRT_VERTEX_COUNT).toBe(132);
+    expect(SKIRT_TRIANGLE_COUNT).toBe(512);
+    expect(data.positions.length / 3).toBe(VERTEX_COUNT);
+    expect(data.positions.length / 3).toBe(1221);
+    expect(data.indices.length / 3).toBe(TRIANGLE_COUNT);
+    expect(data.indices.length / 3).toBe(2560);
+    expect(VERTS_PER_EDGE).toBe(33);
   });
 
   it('changes with the seed', () => {
@@ -413,5 +433,181 @@ describe('generateChunk', () => {
     expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, createTierContext(1, 'sector'))).toThrow(
       /tier/i,
     );
+  });
+});
+
+/**
+ * Skirts, and the crack they exist to close.
+ *
+ * A level boundary is the one place a quadtree can show you the sky through the
+ * ground: the coarse side draws a straight line between samples that the fine
+ * side follows the terrain between. These tests measure that gap directly and
+ * assert the apron is deep enough to plug it, rather than trusting a screenshot
+ * to notice a two-pixel sliver.
+ */
+describe('skirts', () => {
+  const SIDE = VERTS_PER_EDGE;
+  const surfaceY = (data: { positions: Float32Array }, col: number, row: number): number =>
+    data.positions[(row * SIDE + col) * 3 + 1] as number;
+
+  it('hangs one apron vertex directly below every border vertex', () => {
+    const data = generateChunk({ x: 3, z: -4, lod: 2 }, context());
+    const depth = skirtDepthOf(data.positions);
+    expect(depth).toBeGreaterThanOrEqual(MIN_SKIRT_DEPTH);
+
+    // Every apron vertex must sit at the same depth under SOME border vertex,
+    // sharing its exact x and z. A shifted apron leaves a gap of its own.
+    const border = new Map<string, number>();
+    for (let i = 0; i < SURFACE_VERTEX_COUNT; i++) {
+      const row = Math.floor(i / SIDE);
+      const col = i % SIDE;
+      if (row !== 0 && row !== SEGMENTS && col !== 0 && col !== SEGMENTS) continue;
+      const at = i * 3;
+      border.set(`${data.positions[at]},${data.positions[at + 2]}`, data.positions[at + 1] as number);
+    }
+
+    let matched = 0;
+    for (let i = SURFACE_VERTEX_COUNT; i < VERTEX_COUNT; i++) {
+      const at = i * 3;
+      const top = border.get(`${data.positions[at]},${data.positions[at + 2]}`);
+      expect(top).toBeTypeOf('number');
+      expect((top as number) - (data.positions[at + 1] as number)).toBeCloseTo(depth, 2);
+      matched++;
+    }
+    expect(matched).toBe(SKIRT_VERTEX_COUNT);
+  });
+
+  it('copies the surface normal and colour, so the apron is not a dark band', () => {
+    const data = generateChunk({ x: 1, z: 1, lod: 0 }, context());
+    // Skirt vertex 0 mirrors the start of the first edge's walk.
+    const top = (0 * SIDE + SEGMENTS) * 3;
+    const bottom = SURFACE_VERTEX_COUNT * 3;
+    for (let c = 0; c < 3; c++) {
+      expect(data.normals[bottom + c]).toBe(data.normals[top + c]);
+      expect(data.colors[bottom + c]).toBe(data.colors[top + c]);
+    }
+  });
+
+  it('gets deeper where the terrain is rougher', () => {
+    // A lod-4 node spans 1024 m and samples every 32 m, so adjacent border
+    // vertices differ by far more than a lod-0 node's do over 2 m. If the depth
+    // were a constant, a 1 km node would show cracks a screenshot could not miss.
+    const fine = generateChunk({ x: 0, z: 0, lod: 0 }, context());
+    const coarse = generateChunk({ x: 0, z: 0, lod: 4 }, context());
+    expect(skirtDepthOf(coarse.positions)).toBeGreaterThan(skirtDepthOf(fine.positions));
+  });
+
+  it('closes the crack at a lod-0 / lod-1 boundary from whichever side is short', () => {
+    // Geometry: the coarse node covers [0,128] and the fine one [128,192], so
+    // they share the line x = 128 for z in [0, 64]. The coarse node samples that
+    // line every 4 m and the fine one every 2 m, and the crack is the difference
+    // between the coarse node's straight line and the terrain in between.
+    const coarse = generateChunk({ x: 0, z: 0, lod: 1 }, context());
+    const fine = generateChunk({ x: 2, z: 0, lod: 0 }, context());
+    const coarseDepth = skirtDepthOf(coarse.positions);
+    const fineDepth = skirtDepthOf(fine.positions);
+
+    let worstGap = 0;
+    let compared = 0;
+    for (let fineRow = 0; fineRow <= SEGMENTS; fineRow++) {
+      // The fine node's z step is 2 m, the coarse node's is 4 m.
+      const coarseRow = fineRow / 2;
+      const lo = Math.floor(coarseRow);
+      const t = coarseRow - lo;
+      const a = surfaceY(coarse, SEGMENTS, lo);
+      const b = surfaceY(coarse, SEGMENTS, Math.min(lo + 1, SEGMENTS));
+      const coarseY = a + (b - a) * t;
+      const fineY = surfaceY(fine, 0, fineRow);
+
+      const gap = fineY - coarseY;
+      worstGap = Math.max(worstGap, Math.abs(gap));
+      if (gap > 0) {
+        // Fine side is higher: its apron must reach down past the coarse surface.
+        expect(fineY - fineDepth).toBeLessThanOrEqual(coarseY);
+      } else if (gap < 0) {
+        // Coarse side is higher: its apron must reach down past the fine surface.
+        expect(coarseY - coarseDepth).toBeLessThanOrEqual(fineY);
+      }
+      compared++;
+    }
+
+    expect(compared).toBe(SEGMENTS + 1);
+    // Anti-vacuity: if the two edges agreed everywhere there would be no crack
+    // to close and the assertions above would pass on any apron at all,
+    // including one of zero depth.
+    expect(worstGap).toBeGreaterThan(0.01);
+    expect(fineDepth).toBeGreaterThan(worstGap);
+  });
+
+  it('closes the crack on the perpendicular boundary too', () => {
+    // The same check across z = 128, so a skirt that only covers two of the
+    // four edges cannot pass.
+    const coarse = generateChunk({ x: 0, z: 1, lod: 1 }, context());
+    const fine = generateChunk({ x: 0, z: 1, lod: 0 }, context());
+    const coarseDepth = skirtDepthOf(coarse.positions);
+    const fineDepth = skirtDepthOf(fine.positions);
+
+    let worstGap = 0;
+    for (let fineCol = 0; fineCol <= SEGMENTS; fineCol++) {
+      const coarseCol = fineCol / 2;
+      const lo = Math.floor(coarseCol);
+      const t = coarseCol - lo;
+      const a = surfaceY(coarse, lo, 0);
+      const b = surfaceY(coarse, Math.min(lo + 1, SEGMENTS), 0);
+      const coarseY = a + (b - a) * t;
+      // The fine node lies on the -Z side of the seam, so its shared edge is
+      // its LAST row, not its first.
+      const fineY = surfaceY(fine, fineCol, SEGMENTS);
+      const gap = fineY - coarseY;
+      worstGap = Math.max(worstGap, Math.abs(gap));
+      if (gap > 0) expect(fineY - fineDepth).toBeLessThanOrEqual(coarseY);
+      else if (gap < 0) expect(coarseY - coarseDepth).toBeLessThanOrEqual(fineY);
+    }
+    expect(worstGap).toBeGreaterThan(0.01);
+  });
+
+  it('closes the crack at every boundary along a busy stretch of terrain', () => {
+    // One pair of nodes could get lucky. Walk a kilometre of the world and
+    // check every lod-0 / lod-1 seam along it.
+    let checked = 0;
+    let deepest = 0;
+    for (let i = -8; i < 8; i++) {
+      const coarse = generateChunk({ x: i, z: 3, lod: 1 }, context());
+      const fine = generateChunk({ x: i * 2 + 2, z: 6, lod: 0 }, context());
+      const coarseDepth = skirtDepthOf(coarse.positions);
+      const fineDepth = skirtDepthOf(fine.positions);
+      deepest = Math.max(deepest, coarseDepth, fineDepth);
+      for (let fineRow = 0; fineRow <= SEGMENTS; fineRow++) {
+        const coarseRow = fineRow / 2;
+        const lo = Math.floor(coarseRow);
+        const a = surfaceY(coarse, SEGMENTS, lo);
+        const b = surfaceY(coarse, SEGMENTS, Math.min(lo + 1, SEGMENTS));
+        const coarseY = a + (b - a) * (coarseRow - lo);
+        const fineY = surfaceY(fine, 0, fineRow);
+        if (fineY > coarseY) expect(fineY - fineDepth).toBeLessThanOrEqual(coarseY);
+        else expect(coarseY - coarseDepth).toBeLessThanOrEqual(fineY);
+        checked++;
+      }
+    }
+    expect(checked).toBe(16 * (SEGMENTS + 1));
+    // Aprons stay proportional to the terrain rather than growing without
+    // bound: a lod-1 node is 128 m across and its apron should be metres, not
+    // hundreds of metres, or it becomes a visible curtain at the world's edge.
+    expect(deepest).toBeLessThan(64);
+  });
+
+  it('does not depend on the neighbours, which is the whole reason it is a skirt', () => {
+    // A stitched edge would need to know the adjacent nodes' levels, and the
+    // same node would then come back with different bytes depending on who was
+    // next to it -- a direct RULE 2 violation. Generating the same node twice,
+    // with entirely different neighbours generated in between, must be
+    // bit-identical including the apron.
+    const first = generateChunk({ x: 4, z: -7, lod: 1 }, context());
+    generateChunk({ x: 8, z: -14, lod: 0 }, context());
+    generateChunk({ x: 2, z: -4, lod: 2 }, context());
+    generateChunk({ x: 1, z: -2, lod: 3 }, context());
+    const again = generateChunk({ x: 4, z: -7, lod: 1 }, context());
+    expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
+    expect(Array.from(again.indices)).toEqual(Array.from(first.indices));
   });
 });

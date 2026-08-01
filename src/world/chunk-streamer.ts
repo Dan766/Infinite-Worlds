@@ -1,19 +1,46 @@
 /**
- * Chunk streaming: what is resident, what is queued, and what gets destroyed.
+ * Chunk streaming: what is resident, at what level, and what gets destroyed.
  *
- * The shape of the thing:
+ * The shape of the thing since Phase 2b:
  *
- *   camera position -> centre chunk -> desired disc of chunks
+ *   camera position -> quadtree descent -> the LEAF set that should be resident
  *     resident already?           -> nothing to do
  *     in the LRU cache?           -> re-add to the scene, no worker needed
  *     otherwise                   -> request from the provider, priority = distance
  *
- *   chunks past the unload radius leave the scene and enter the LRU cache
- *   the cache's hard entry cap destroys the rest
+ *   a node that is no longer a leaf leaves the scene as soon as whatever
+ *   replaced it is resident; a node that nothing replaced -- because it left
+ *   the view distance -- leaves immediately. Retired nodes enter the LRU cache,
+ *   whose hard entry cap destroys the rest.
  *
- * Two radii rather than one. With a single radius a camera sitting exactly on a
- * chunk boundary would load and unload the same ring every frame; the gap
- * between `loadRadius` and `unloadRadius` is the hysteresis that stops that.
+ * WHY A QUADTREE, AND WHAT IT IS ACTUALLY FOR. Phase 2a's flat disc was
+ * profiled on real hardware: at a 3 km radius it cost 1,834 draw calls and
+ * 504 MB of heap while the GPU rendered the whole scene in 1.46 ms. Frame time
+ * was never the problem. `SEGMENTS` is constant across levels, so every node
+ * costs the same bytes and the same triangles whatever area it covers -- which
+ * makes NODE COUNT the single quantity worth bounding, and bounding node count
+ * is all this quadtree does. See `quadtree.ts`.
+ *
+ * WHERE HYSTERESIS LIVES, AND WHY IT IS THE SHAPE IT IS. The selection in
+ * `quadtree.ts` is a pure function of camera position: no memory, no direction
+ * of travel, no dependence on what is already loaded. All the hysteresis is on
+ * this side, applies to UNLOADING only, and is conditioned on RESIDENCY rather
+ * than on distance: a node that stopped being selected survives exactly until
+ * whatever replaced it is in the scene.
+ *
+ * That last detail is what makes the settled resident set path-INDEPENDENT.
+ * A distance-based unload margin -- the obvious design, and the one Phase 1 and
+ * 2a used -- leaves nodes lingering in a ring whose contents depend on where
+ * the camera has been, so two cameras that arrive at the same place from
+ * different directions render different worlds. Per-node content stays
+ * deterministic either way; it is the resident SET that drifts, and a
+ * screenshot harness cannot tell the difference. Conditioning on residency
+ * instead gives a margin that is transient by construction: once nothing is
+ * streaming, live == selected, exactly.
+ *
+ * The LRU cache is what makes that affordable. A node that crosses a level
+ * boundary and immediately comes back is a map lookup, not a worker round trip,
+ * so there is nothing left for a distance margin to buy.
  *
  * Nothing here is world state in the sense of RULE 2. Every entry can be thrown
  * away and rebuilt from `(worldSeed, coord)`, which is exactly what the LRU cap
@@ -24,7 +51,6 @@ import * as THREE from 'three';
 import { HudOrder, type Hud } from '../debug/hud';
 import type { DebugPanel } from '../debug/panel';
 import {
-  CHUNK_SIZE,
   chunkKey,
   parseChunkKey,
   worldToChunk,
@@ -34,16 +60,25 @@ import {
 } from './contracts';
 import { createChunkMesh, disposeChunkMesh, type ChunkMesh } from './chunk-mesh';
 import { LruCache } from './lru-cache';
+import {
+  DEFAULT_SPLIT_FACTOR,
+  DEFAULT_VIEW_DISTANCE,
+  isDescendantOrSelf,
+  lodHistogram,
+  nodeParent,
+  selectQuadtree,
+  type QuadtreeSelection,
+} from './quadtree';
 import { WorkerPool } from './worker-pool';
 
 export interface ChunkStreamerOptions {
   /** uint32 world seed. */
   worldSeed: number;
-  /** Radius in chunks of the disc kept resident around the camera. */
-  loadRadius: number;
-  /** Radius in chunks at which a resident chunk is retired. Must exceed `loadRadius`. */
-  unloadRadius: number;
-  /** Hard cap on retired-but-retained chunks. */
+  /** Metres of terrain kept resident around the camera. */
+  viewDistance: number;
+  /** A node splits while the camera is within `splitFactor * nodeSize` of its centre. */
+  splitFactor: number;
+  /** Hard cap on retired-but-retained nodes. */
   maxCachedChunks: number;
   /**
    * Meshes built per frame. Uploading a hundred geometries in one frame is a
@@ -57,18 +92,17 @@ export interface ChunkStreamerOptions {
 }
 
 const DEFAULTS = {
-  loadRadius: 8,
-  unloadRadius: 10,
-  maxCachedChunks: 384,
+  viewDistance: DEFAULT_VIEW_DISTANCE,
+  splitFactor: DEFAULT_SPLIT_FACTOR,
+  /**
+   * Comfortably above the ~300 nodes a 4 km selection holds, so a node that
+   * crosses a level boundary and comes straight back is an LRU hit rather than
+   * a worker round trip. That cache is what makes distance hysteresis
+   * unnecessary -- see the header.
+   */
+  maxCachedChunks: 512,
   maxBuildsPerFrame: 12,
 } as const;
-
-interface Offset {
-  dx: number;
-  dz: number;
-  /** Distance from the centre chunk, in chunks. */
-  distance: number;
-}
 
 export interface ChunkStreamerStats {
   live: number;
@@ -79,12 +113,20 @@ export interface ChunkStreamerStats {
   cancelledRequests: number;
   evicted: number;
   workers: number;
-  /** Vertex bytes held by live plus cached chunks. */
+  /** Vertex bytes held by live plus cached nodes. */
   bytes: number;
-  /** Triangles in the live (in-scene) chunks. GPU-independent, so it is budgetable. */
+  /** Triangles in the live (in-scene) nodes. GPU-independent, so it is budgetable. */
   triangles: number;
-  /** Vertices in the live (in-scene) chunks. */
+  /** Vertices in the live (in-scene) nodes. */
   vertices: number;
+  /** Nodes the quadtree currently wants resident. */
+  selected: number;
+  /** Selected nodes per level, index = lod. */
+  lodCounts: number[];
+  viewDistance: number;
+  splitFactor: number;
+  /** Coarsest level in play. */
+  rootLod: number;
   centre: ChunkCoord;
   settled: boolean;
 }
@@ -102,15 +144,29 @@ export class ChunkStreamer {
   /** Payloads that arrived but have not been turned into meshes yet. */
   private readonly arrived: ChunkData[] = [];
   /**
-   * Keys in `arrived`. Without this, a chunk that has been delivered but not
+   * Keys in `arrived`. Without this, a node that has been delivered but not
    * yet meshed looks absent to `scan()` -- neither live, nor cached, nor
    * requested -- and gets generated a second time.
    */
   private readonly arrivedKeys = new Set<string>();
 
-  private loadOffsets: Offset[] = [];
-  private loadRadius: number;
-  private unloadRadius: number;
+  /** The current leaf set, keyed. Value is metres to the node's nearest point. */
+  private readonly desired = new Map<string, number>();
+  /**
+   * For every node the descent SPLIT: is its whole subtree resident yet?
+   *
+   * This is what lets a parent survive exactly as long as it is needed. Drop it
+   * the instant it stops being a leaf and a hole opens in the ground until four
+   * children arrive; keep it on a distance margin instead and it z-fights with
+   * its own children for as long as the camera stays put.
+   */
+  private readonly subtreeReady = new Map<string, boolean>();
+
+  private selection: QuadtreeSelection = { leaves: [], internal: [], rootLod: 0 };
+  private viewDistance: number;
+  private splitFactor: number;
+  private cameraX = Number.NaN;
+  private cameraZ = Number.NaN;
   private centre: ChunkCoord = { x: 0, z: 0, lod: 0 };
   private maxBuildsPerFrame: number;
   private generatedCount = 0;
@@ -121,11 +177,8 @@ export class ChunkStreamer {
 
   constructor(options: Partial<ChunkStreamerOptions> = {}) {
     const worldSeed = (options.worldSeed ?? 0) >>> 0;
-    this.loadRadius = Math.max(1, Math.floor(options.loadRadius ?? DEFAULTS.loadRadius));
-    this.unloadRadius = Math.max(
-      this.loadRadius + 1,
-      Math.floor(options.unloadRadius ?? DEFAULTS.unloadRadius),
-    );
+    this.viewDistance = Math.max(64, options.viewDistance ?? DEFAULTS.viewDistance);
+    this.splitFactor = Math.max(0.5, options.splitFactor ?? DEFAULTS.splitFactor);
     this.maxBuildsPerFrame = Math.max(1, options.maxBuildsPerFrame ?? DEFAULTS.maxBuildsPerFrame);
     this.onSceneChanged = options.onSceneChanged ?? ((): void => {});
 
@@ -138,7 +191,6 @@ export class ChunkStreamer {
     });
 
     this.root.name = 'chunks';
-    this.rebuildOffsets();
   }
 
   // -- streaming ------------------------------------------------------------
@@ -154,32 +206,55 @@ export class ChunkStreamer {
       return;
     }
 
-    const centre = worldToChunk(cameraPosition.x, cameraPosition.z);
-    const centreMoved = centre.x !== this.centre.x || centre.z !== this.centre.z;
-    this.centre = centre;
+    // Arrivals first, so a freshly built child counts as resident when the
+    // retirement pass decides whether its parent may go. Doing it the other way
+    // round leaves every split parent alive for one extra frame, overlapping
+    // its own children.
+    //
+    // Note that "was there work" is captured BEFORE the drain: the frame that
+    // builds the last outstanding mesh is precisely the frame that must then
+    // run the retirement pass, and testing `arrived.length` afterwards skips it
+    // -- leaving every superseded node resident until the camera happens to
+    // move again.
+    const hadArrivals = this.arrived.length > 0;
+    this.drainArrivals();
 
-    // In the steady state (camera inside the same chunk, nothing outstanding)
+    const moved = cameraPosition.x !== this.cameraX || cameraPosition.z !== this.cameraZ;
+    // In the steady state (camera still, nothing outstanding) the selection is
+    // by definition unchanged -- it is a pure function of the position -- so
     // there is genuinely nothing to do, and doing nothing is the cheapest way
     // to keep the frame budget and the GC quiet.
-    const needsScan = centreMoved || !this.hasUpdated || this.requested.size > 0;
-    if (needsScan) {
+    if (moved || !this.hasUpdated || hadArrivals || this.requested.size > 0) {
+      this.cameraX = cameraPosition.x;
+      this.cameraZ = cameraPosition.z;
+      this.centre = worldToChunk(cameraPosition.x, cameraPosition.z);
+      this.reselect();
       this.scan();
+      this.computeSubtreeReady();
       this.retire();
     }
 
-    this.drainArrivals();
     this.hasUpdated = true;
   }
 
-  /** Walk the desired disc, nearest first, filling it from cache or provider. */
+  /** Run the quadtree descent for the current camera position. */
+  private reselect(): void {
+    this.selection = selectQuadtree(this.cameraX, this.cameraZ, {
+      viewDistance: this.viewDistance,
+      splitFactor: this.splitFactor,
+    });
+    this.desired.clear();
+    for (const leaf of this.selection.leaves) {
+      this.desired.set(chunkKey(leaf.coord), leaf.distance);
+    }
+  }
+
+  /** Walk the selected leaves, nearest first, filling them from cache or provider. */
   private scan(): void {
     let sceneChanged = false;
 
-    for (const offset of this.loadOffsets) {
-      // Phase 2a streams a uniform disc of finest-tier nodes. Phase 2b is what
-      // makes `lod` vary; nothing else here has to change when it does.
-      const coord = { x: this.centre.x + offset.dx, z: this.centre.z + offset.dz, lod: 0 };
-      const key = chunkKey(coord);
+    for (const leaf of this.selection.leaves) {
+      const key = chunkKey(leaf.coord);
       if (this.live.has(key) || this.arrivedKeys.has(key)) continue;
 
       const cached = this.cache.delete(key);
@@ -190,12 +265,11 @@ export class ChunkStreamer {
         continue;
       }
 
-      const priority = offset.distance * CHUNK_SIZE;
       if (this.requested.has(key)) {
-        this.provider.reprioritize(coord, priority);
+        this.provider.reprioritize(leaf.coord, leaf.distance);
         continue;
       }
-      this.requestChunk(coord, key, priority);
+      this.requestChunk(leaf.coord, key, leaf.distance);
     }
 
     if (sceneChanged) this.onSceneChanged();
@@ -216,20 +290,96 @@ export class ChunkStreamer {
     });
   }
 
-  /** Cancel far-away requests and retire far-away resident chunks. */
+  /**
+   * Roll "is my whole subtree resident" up the split nodes.
+   *
+   * `selection.internal` is depth-first preorder, so walking it BACKWARDS
+   * visits every descendant before its ancestor -- which is exactly the order
+   * this roll-up needs and the reason the traversal order is part of
+   * `quadtree.ts`'s contract.
+   */
+  private computeSubtreeReady(): void {
+    this.subtreeReady.clear();
+    const internal = this.selection.internal;
+    for (let i = internal.length - 1; i >= 0; i--) {
+      const coord = internal[i] as ChunkCoord;
+      const childLod = coord.lod - 1;
+      let ready = true;
+      for (let corner = 0; corner < 4; corner++) {
+        const child = {
+          x: coord.x * 2 + (corner & 1),
+          z: coord.z * 2 + (corner >> 1),
+          lod: childLod,
+        };
+        const childKey = chunkKey(child);
+        const sub = this.subtreeReady.get(childKey);
+        if (sub !== undefined) {
+          if (!sub) ready = false;
+          continue;
+        }
+        // A selected leaf must be resident. A child the descent culled for
+        // being out of range is not something to wait for.
+        if (this.desired.has(childKey) && !this.live.has(childKey)) ready = false;
+      }
+      this.subtreeReady.set(chunkKey(coord), ready);
+    }
+  }
+
+  /**
+   * Whether whatever replaced a no-longer-selected node is resident yet.
+   *
+   * `true`  -- covered and the replacement is up; release it now.
+   * `false` -- covered but the replacement is still streaming; hold on.
+   * `null`  -- nothing replaced it, because it left the view distance entirely.
+   *            Also release: there is nothing to wait for. Distinguished from
+   *            `true` only so the reason a node was let go stays readable here.
+   */
+  private coverageReady(coord: ChunkCoord): boolean | null {
+    const key = chunkKey(coord);
+    const split = this.subtreeReady.get(key);
+    if (split !== undefined) return split;
+
+    // Merged away: some ancestor is now a leaf.
+    let ancestor = coord;
+    for (let lod = coord.lod; lod < this.selection.rootLod; lod++) {
+      ancestor = nodeParent(ancestor);
+      const ancestorKey = chunkKey(ancestor);
+      if (this.desired.has(ancestorKey)) return this.live.has(ancestorKey);
+    }
+
+    // Not under any selected leaf, but it may still CONTAIN some -- which is
+    // what happens to a stale coarse node when the view distance is turned down
+    // and the whole tree gets shallower. It must not be released until they are
+    // all resident, or the panel's slider punches a hole in the world.
+    if (coord.lod === 0) return null;
+    let contains = false;
+    let allResident = true;
+    for (const leaf of this.selection.leaves) {
+      if (!isDescendantOrSelf(leaf.coord, coord)) continue;
+      contains = true;
+      if (!this.live.has(chunkKey(leaf.coord))) allResident = false;
+    }
+    return contains ? allResident : null;
+  }
+
+  /** Cancel unwanted requests and retire nodes that are no longer selected. */
   private retire(): void {
     for (const key of [...this.requested]) {
-      const coord = parseChunkKey(key);
-      if (this.chunkDistance(coord) <= this.unloadRadius) continue;
-      // Fell out of range before a worker got to it. Dropping it here is what
-      // stops the queue growing without bound behind a fast camera.
+      if (this.desired.has(key)) continue;
+      // No longer wanted. Dropping it here is what stops the queue growing
+      // without bound behind a fast camera, and unlike Phase 2a's radius test
+      // it fires constantly, because every split and merge invalidates work.
       this.requested.delete(key);
-      this.provider.cancel(coord);
+      this.provider.cancel(parseChunkKey(key));
     }
 
     let sceneChanged = false;
     for (const [key, entry] of [...this.live]) {
-      if (this.chunkDistance(parseChunkKey(key)) <= this.unloadRadius) continue;
+      if (this.desired.has(key)) continue;
+      // `false` -- and only `false` -- means something selected is still
+      // streaming in over this node's ground. Everything else goes now.
+      if (this.coverageReady(parseChunkKey(key)) === false) continue;
+
       this.live.delete(key);
       this.root.remove(entry.mesh);
       // Retained, not destroyed: turning around should not re-run a worker.
@@ -253,8 +403,9 @@ export class ChunkStreamer {
       if (this.live.has(key) || this.cache.has(key)) continue;
 
       const entry = createChunkMesh(data);
-      if (this.chunkDistance(data.coord) > this.unloadRadius) {
-        // Arrived after the camera left. Park it rather than show it.
+      if (this.desired.size > 0 && !this.desired.has(key)) {
+        // Arrived after the camera left, or after a split invalidated it. Park
+        // it rather than show it.
         this.cache.set(key, entry);
       } else {
         this.live.set(key, entry);
@@ -268,47 +419,43 @@ export class ChunkStreamer {
     if (sceneChanged) this.onSceneChanged();
   }
 
-  private chunkDistance(coord: ChunkCoord): number {
-    const dx = coord.x - this.centre.x;
-    const dz = coord.z - this.centre.z;
-    return Math.sqrt(dx * dx + dz * dz);
-  }
-
-  /**
-   * Precompute the disc of offsets once, sorted nearest first, so the per-frame
-   * scan allocates nothing and issues the most urgent requests first.
-   */
-  private rebuildOffsets(): void {
-    const offsets: Offset[] = [];
-    const r = this.loadRadius;
-    for (let dz = -r; dz <= r; dz++) {
-      for (let dx = -r; dx <= r; dx++) {
-        const distance = Math.sqrt(dx * dx + dz * dz);
-        if (distance > r) continue;
-        offsets.push({ dx, dz, distance });
-      }
-    }
-    // Ties broken by coordinate so the request order is fully deterministic.
-    offsets.sort((a, b) => a.distance - b.distance || a.dz - b.dz || a.dx - b.dx);
-    this.loadOffsets = offsets;
-  }
-
   // -- state ----------------------------------------------------------------
 
   /**
    * True when the world around the camera is fully resident: nothing queued,
-   * nothing in flight, nothing waiting to be meshed.
+   * nothing in flight, nothing waiting to be meshed, and every selected node
+   * actually in the scene.
    *
    * `window.__worldReady` waits on this, which is what keeps canonical
-   * screenshots byte-comparable now that content arrives asynchronously.
+   * screenshots byte-comparable now that content arrives asynchronously and at
+   * several levels of detail.
    */
   get settled(): boolean {
     if (!this.enabled) return true;
-    return this.hasUpdated && this.requested.size === 0 && this.arrived.length === 0;
+    if (!this.hasUpdated || this.requested.size > 0 || this.arrived.length > 0) return false;
+    for (const key of this.desired.keys()) if (!this.live.has(key)) return false;
+    return true;
   }
 
   get liveCount(): number {
     return this.live.size;
+  }
+
+  /** Nodes the quadtree currently wants resident. */
+  get selectedCount(): number {
+    return this.desired.size;
+  }
+
+  /**
+   * Coordinates of every node currently in the scene.
+   *
+   * Exists so tests can assert the two properties a quadtree streamer has to
+   * hold at all times and which nothing else can observe: no point of ground
+   * under the camera is ever covered by zero nodes (a hole), and once settled
+   * no point is covered by more than one (an overlap).
+   */
+  liveCoords(): ChunkCoord[] {
+    return [...this.live.keys()].map(parseChunkKey);
   }
 
   get streamingEnabled(): boolean {
@@ -327,17 +474,27 @@ export class ChunkStreamer {
     this.root.visible = visible;
   }
 
-  setLoadRadius(radius: number): void {
-    const next = Math.max(1, Math.round(radius));
-    if (next === this.loadRadius) return;
-    this.loadRadius = next;
-    this.unloadRadius = next + 2;
-    this.rebuildOffsets();
+  /** Metres of terrain kept resident around the camera. */
+  get view(): number {
+    return this.viewDistance;
+  }
+
+  setViewDistance(metres: number): void {
+    const next = Math.max(64, Math.round(metres));
+    if (next === this.viewDistance) return;
+    this.viewDistance = next;
     this.hasUpdated = false;
   }
 
-  get radius(): number {
-    return this.loadRadius;
+  get split(): number {
+    return this.splitFactor;
+  }
+
+  setSplitFactor(factor: number): void {
+    const next = Math.max(0.5, factor);
+    if (next === this.splitFactor) return;
+    this.splitFactor = next;
+    this.hasUpdated = false;
   }
 
   stats(): ChunkStreamerStats {
@@ -364,14 +521,19 @@ export class ChunkStreamer {
       bytes,
       triangles,
       vertices,
+      selected: this.desired.size,
+      lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
+      viewDistance: this.viewDistance,
+      splitFactor: this.splitFactor,
+      rootLod: this.selection.rootLod,
       centre: this.centre,
       settled: this.settled,
     };
   }
 
   /**
-   * Colours of specific chunks as they are actually resident, or null where the
-   * chunk is not loaded.
+   * Colours of specific nodes as they are actually resident, or null where the
+   * node is not loaded.
    *
    * This exists for the soak test's round-trip check: fly away, fly back, and
    * assert the same coordinates came back the same colour. Reading the resident
@@ -387,8 +549,8 @@ export class ChunkStreamer {
   }
 
   /**
-   * Hashes of specific chunks' position buffers as they are actually resident,
-   * or null where the chunk is not loaded.
+   * Hashes of specific nodes' position buffers as they are actually resident,
+   * or null where the node is not loaded.
    *
    * This is the RULE 2 round-trip check the soak test runs: fly away, fly back,
    * and assert the geometry came back with the same bits. It supersedes the
@@ -404,7 +566,16 @@ export class ChunkStreamer {
     });
   }
 
-  /** Chunk coordinates in a square around a world position. For the soak test. */
+  /**
+   * lod-0 coordinates in a square around a world position. For the soak test.
+   *
+   * Deliberately lod 0 and deliberately small: with `splitFactor` 2.5 the
+   * finest level extends about 320 m from the camera, so a two-node radius is
+   * comfortably inside it and the sampled set does not flip level when the
+   * camera lands a couple of metres from where it started. A wider square would
+   * straddle the lod-0/lod-1 boundary and the round-trip comparison would go
+   * flaky for reasons that have nothing to do with determinism.
+   */
   static coordsAround(worldX: number, worldZ: number, radius: number): ChunkCoord[] {
     const centre = worldToChunk(worldX, worldZ);
     const coords: ChunkCoord[] = [];
@@ -416,7 +587,7 @@ export class ChunkStreamer {
     return coords;
   }
 
-  /** Destroy every resident and cached chunk. They regenerate identically. */
+  /** Destroy every resident and cached node. They regenerate identically. */
   reload(): void {
     for (const entry of this.live.values()) disposeChunkMesh(entry);
     this.live.clear();
@@ -440,6 +611,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.live} live / ${s.cached} cached / ${s.evicted} evicted`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'lod',
+      () => {
+        const s = this.stats();
+        return `${s.selected} nodes  [${s.lodCounts.join(' ')}]  ${s.viewDistance} m`;
       },
       HudOrder.world,
     );
@@ -485,10 +664,16 @@ export class ChunkStreamer {
       (value) => this.setVisible(value),
     );
     folder.addNumber(
-      'load radius',
-      () => this.radius,
-      (value) => this.setLoadRadius(value),
-      { min: 1, max: 16, step: 1 },
+      'view distance (m)',
+      () => this.view,
+      (value) => this.setViewDistance(value),
+      { min: 256, max: 8192, step: 128 },
+    );
+    folder.addNumber(
+      'split factor',
+      () => this.split,
+      (value) => this.setSplitFactor(value),
+      { min: 1, max: 6, step: 0.1 },
     );
     folder.addButton('reload all chunks', () => this.reload());
   }
