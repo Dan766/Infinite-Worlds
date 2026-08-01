@@ -119,6 +119,14 @@ export interface ChunkStreamerStats {
   triangles: number;
   /** Vertices in the live (in-scene) nodes. */
   vertices: number;
+  /** Live nodes carrying a water submesh. Zero everywhere inland. */
+  waterNodes: number;
+  /** Triangles of water surface in the live nodes. */
+  waterTriangles: number;
+  /** Live nodes a Phase 3b river channel carved. Zero away from any river. */
+  riverNodes: number;
+  /** Surface vertices lowered by river carving, across the live nodes. */
+  riverVertices: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -502,10 +510,22 @@ export class ChunkStreamer {
     let bytes = 0;
     let triangles = 0;
     let vertices = 0;
+    let waterNodes = 0;
+    let waterTriangles = 0;
+    let riverNodes = 0;
+    let riverVertices = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
       vertices += entry.vertices;
+      if (entry.waterTriangles > 0) {
+        waterNodes++;
+        waterTriangles += entry.waterTriangles;
+      }
+      if (entry.riverVertices > 0) {
+        riverNodes++;
+        riverVertices += entry.riverVertices;
+      }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
 
@@ -521,6 +541,10 @@ export class ChunkStreamer {
       bytes,
       triangles,
       vertices,
+      waterNodes,
+      waterTriangles,
+      riverNodes,
+      riverVertices,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -549,8 +573,9 @@ export class ChunkStreamer {
   }
 
   /**
-   * Hashes of specific nodes' position buffers as they are actually resident,
-   * or null where the node is not loaded.
+   * Hashes of specific nodes' uploaded geometry as it is actually resident, or
+   * null where the node is not loaded. Terrain vertices, water vertices and the
+   * water's depth shading, in one number -- see `hashChunkGeometry`.
    *
    * This is the RULE 2 round-trip check the soak test runs: fly away, fly back,
    * and assert the geometry came back with the same bits. It supersedes the
@@ -558,11 +583,48 @@ export class ChunkStreamer {
    * hash was pure -- geometry is the thing that is expensive to reproduce and
    * therefore the thing worth proving reproducible.
    */
-  samplePositionHashes(coords: readonly ChunkCoord[]): (number | null)[] {
+  sampleGeometryHashes(coords: readonly ChunkCoord[]): (number | null)[] {
     return coords.map((coord) => {
       const key = chunkKey(coord);
       const entry = this.live.get(key) ?? this.cache.peek(key);
-      return entry === undefined ? null : entry.positionsHash;
+      return entry === undefined ? null : entry.geometryHash;
+    });
+  }
+
+  /**
+   * Water triangles in specific nodes as they are actually resident, or null
+   * where the node is not loaded.
+   *
+   * THE ANTI-VACUITY HALF OF THE ROUND-TRIP CHECK. `sampleGeometryHashes` folds
+   * the water buffers into its hash, so it proves water regenerates identically
+   * -- but only if there was any water there to begin with. Over dry ground the
+   * water half of every hash is the hash of an empty array and the check passes
+   * while proving nothing about water at all. The soak reads this and fails if
+   * the chunks it round-tripped had no sea in them.
+   */
+  sampleWaterTriangles(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.waterTriangles;
+    });
+  }
+
+  /**
+   * River-carved vertices in specific nodes as they are actually resident, or
+   * null where the node is not loaded.
+   *
+   * The same anti-vacuity role `sampleWaterTriangles` plays for the sea. The
+   * geometry hash covers carved ground automatically -- carving moves the very
+   * vertices it hashes -- but only if the round-tripped square had a river in
+   * it, and over ordinary hillside it does not. The soak fails if none of the
+   * chunks it round-tripped were carved.
+   */
+  sampleRiverVertices(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.riverVertices;
     });
   }
 
@@ -643,6 +705,22 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.triangles} tris / ${s.vertices} verts live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'water',
+      () => {
+        const s = this.stats();
+        return `${s.waterNodes} nodes / ${s.waterTriangles} tris live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'rivers',
+      () => {
+        const s = this.stats();
+        return `${s.riverNodes} nodes / ${s.riverVertices} carved verts live`;
       },
       HudOrder.world,
     );

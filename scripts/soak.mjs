@@ -75,33 +75,44 @@ const MIN_CHUNKS_STREAMED = 50;
  * count, draw calls and payload bytes are the same number on a workstation, in
  * CI, and on a phone.
  *
- * RE-DERIVED IN PHASE 2b, AND THE OLD NUMBERS WERE WORSE THAN WRONG. The Phase
- * 2a limits (900k triangles / 500k vertices / 96 MB / 1200 draw calls) were the
- * peaks of a flight whose camera pitch made frustum culling throw away most of
- * the world, so the draw-call budget in particular could not have fired however
- * bad things got. A budget that cannot fail is not a budget. This run now flies
- * a SHALLOW-PITCH leg specifically so these are measured where they are near
- * their limits, and the thresholds below are the peaks measured on that leg
- * with roughly 1.5x headroom.
+ * RE-DERIVED IN PHASE 3a, AND THE PHASE 2b NUMBERS WERE ALL BREACHED ON
+ * PURPOSE. Water roughly doubles draw calls over open sea -- one extra mesh per
+ * submerged node -- and adds up to 55,068 bytes and 2,048 triangles to a node
+ * that is entirely at sea. Phase 2b said so in advance and said the limit
+ * firing was the intended outcome rather than a reason to raise it quietly.
  *
- * They are deliberately TIGHTER than the project-level ceiling of 1200 draw
- * calls. The project ceiling says what the hardware can take; these say what
- * this world costs today, so a regression shows up as a failure rather than as
- * 1100 draw calls of silently accumulated slack.
+ * Measured on the 300 s run over the (-7000, -3500) flight, whose shallow leg
+ * crosses 3.5 km of open water:
+ *
+ *   draw calls        292 peak  =  199 terrain-only  +  93 water
+ *   live triangles    1,229,124 peak  (428,796 of it water)
+ *   live vertices     610,917 peak
+ *   payload           92.5 MB peak, averaging 111,684 bytes a node
+ *
+ * The first three get ~1.7x headroom, matching the factor Phase 2b used. They
+ * remain far under the project ceiling of 1200 draw calls: the ceiling says
+ * what the hardware can take, these say what the world costs today.
  */
-const MAX_LIVE_TRIANGLES = 1_300_000; // measured 724,480 peak -- 1.79x
-const MAX_LIVE_VERTICES = 620_000; //   measured 345,543 peak -- 1.79x
-const MAX_DRAW_CALLS = 200; //          measured     106 peak -- 1.89x
+const MAX_LIVE_TRIANGLES = 2_100_000; // measured 1,229,124 peak -- 1.71x
+const MAX_LIVE_VERTICES = 1_040_000; //  measured   610,917 peak -- 1.70x
+const MAX_DRAW_CALLS = 500; //           measured       292 peak -- 1.71x
 /**
- * Live plus cached payload bytes held by the streamer. Measured 56.6 MB peak.
+ * Live plus cached payload bytes held by the streamer. Measured 92.5 MB peak.
  *
- * Note this one is structurally bounded rather than free to drift: the LRU cap
- * is 512 nodes and the resident set is around 300, so at 74,676 bytes a node
- * the ceiling is roughly 61 MB. The Phase 2a value of 96 MB was therefore
- * unreachable and could never have fired. 76 MB sits above the worst plausible
- * transient and below anything a per-node size regression would produce.
+ * THIS ONE CANNOT HAVE 1.7x HEADROOM, and pretending otherwise would make it
+ * unfireable -- the mistake Phase 2a made and Phase 2b caught. It is
+ * structurally capped: the LRU holds 512 nodes over a live set of ~318, and the
+ * most expensive possible node is one entirely at sea at 129,744 bytes, so the
+ * absolute ceiling is about 108 MB. Anything above that could never fire.
+ *
+ * 100 MB is 1.08x the measured peak and comfortably below 108, so a per-node
+ * size regression -- the thing this budget actually guards -- still trips it.
+ * Be aware of the cost of that tightness: a flight spending its whole length
+ * over open ocean rather than half of it would legitimately land nearer 104 MB.
+ * If this fires, check `bytes per chunk` in the report before assuming a bug;
+ * that figure is the one that isolates a real regression from a wetter route.
  */
-const MAX_CHUNK_BYTES = 76 * 1024 * 1024;
+const MAX_CHUNK_BYTES = 100 * 1024 * 1024;
 
 /**
  * Pitch in degrees for the two legs of the flight.
@@ -120,6 +131,62 @@ const SHALLOW_PITCH = -3;
  * against a limit of 1200 and would have passed at 105 forever.
  */
 const MIN_SHALLOW_DRAW_CALLS = 55;
+
+/**
+ * WHERE THE FLIGHT STARTS, AND WHY IT IS NOT THE ORIGIN ANY MORE.
+ *
+ * Phase 3a's third vacuity trap, and the sharpest one this project has hit. The
+ * autopilot flies along X from a fixed start; on seed "soak" the line z = 0 is
+ * DRY FOR ALL 6.75 km OF IT. Every water assertion in this file -- water
+ * generated, water drawn, water byte-identical after a round trip -- would have
+ * passed by never encountering any, and the phase would have shipped green
+ * having verified nothing.
+ *
+ * (-7000, -3500) is 3.5 km of open sea on that seed, with a coastline at
+ * x = -3400 and mountains beyond it, so a single flight crosses deep water,
+ * a shoreline and dry land. The 5x5 square of lod-0 chunks around the start is
+ * submerged, which is what makes the round-trip geometry check a statement
+ * about water. `MIN_WATER_*` below turn all of that from an intention into an
+ * assertion.
+ */
+const START_X = -7000;
+const START_Z = -3500;
+
+/**
+ * Water submeshes that must actually reach the rasteriser at some point, and
+ * on the shallow leg specifically.
+ *
+ * `waterNodes` alone is not enough: a run could hold three hundred nodes of sea
+ * in memory with the camera pointed at a mountain and call it a pass.
+ * `waterDrawCalls` is counted from `Object3D.onBeforeRender`, so it is a
+ * measurement of pixels-were-attempted rather than of residency.
+ */
+const MIN_WATER_DRAW_CALLS = 30; //         measured 93 peak
+const MIN_SHALLOW_WATER_DRAW_CALLS = 25; // measured 93 peak
+
+/**
+ * PHASE 3b: THE SAME GUARD FOR RIVERS, AND IT MATTERS MORE.
+ *
+ * Water is its own submesh, so "was any sea drawn" is answerable by looking at
+ * the object list. A river is not a mesh -- it is a dent in the terrain mesh
+ * every node already had. Without a counter, "the flight never went near a
+ * river" and "carving silently returns zero" produce identical evidence, and
+ * every river assertion in this file would pass on either.
+ *
+ * `riverNodes` is carved terrain that is resident; `riverDrawCalls` comes from
+ * `Object3D.onBeforeRender` on nodes whose payload reported carved vertices, so
+ * it measures carved ground that reached the rasteriser. Both are needed, and
+ * the shallow leg is checked separately because that is the leg the geometry
+ * budgets are decided on.
+ *
+ * On seed "soak" the flight from (-7000, -3500) crosses several drowned
+ * channels on the sea floor and a carved valley inland; the 5x5 square of
+ * lod-0 chunks it round-trips contains carved ground, which is what makes the
+ * byte-identical-regeneration check a statement about rivers as well.
+ */
+const MIN_RIVER_NODES = 60; //              measured 174 peak of 318 live
+const MIN_RIVER_DRAW_CALLS = 20; //         measured  64 peak
+const MIN_SHALLOW_RIVER_DRAW_CALLS = 20; // measured  61 peak
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -196,7 +263,7 @@ const url =
   `${server.url}?seed=${encodeURIComponent(SEED)}&panel=0&hud=1` +
   // yaw -90 faces +X, which is the direction the autopilot travels, so chunks
   // stream in ahead of the camera rather than behind it.
-  `&fly=${SPEED}&flyleg=${legSeconds}&pos=0,90,0&look=-90,${OUTBOUND_PITCH}`;
+  `&fly=${SPEED}&flyleg=${legSeconds}&pos=${START_X},90,${START_Z}&look=-90,${OUTBOUND_PITCH}`;
 
 let exitCode = 0;
 const failures = [];
@@ -230,12 +297,30 @@ try {
   // Anchored to the camera's real position rather than a hardcoded origin,
   // because the page takes a moment to become ready and the autopilot is
   // already moving by then.
-  const originX = (await page.evaluate(() => window.__app.perfSnapshot())).cameraX;
+  const origin = await page.evaluate(() => window.__app.perfSnapshot());
+  const originX = origin.cameraX;
+  const originZ = origin.cameraZ;
   const geometryBefore = await page.evaluate(
-    (x) => window.__app.sampleChunkGeometry(x, 0, 2),
-    originX,
+    ([x, z]) => window.__app.sampleChunkGeometry(x, z, 2),
+    [originX, originZ],
   );
   const loadedBefore = geometryBefore.filter((h) => h !== null).length;
+  // How much of the round-tripped square is sea. The geometry hash folds the
+  // water buffers in, so this is what says that hash was a claim about water
+  // and not only about the ground under it.
+  const waterBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkWater(x, z, 2),
+    [originX, originZ],
+  );
+  const waterChunksAtStart = waterBefore.filter((t) => t !== null && t > 0).length;
+  // ...and how much of it a river carved. Same role: the geometry hash covers
+  // carved ground automatically, because carving moves the very vertices it
+  // hashes -- but only if the round-tripped square had a river in it.
+  const riverBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkRivers(x, z, 2),
+    [originX, originZ],
+  );
+  const riverChunksAtStart = riverBefore.filter((v) => v !== null && v > 0).length;
 
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
@@ -276,6 +361,8 @@ try {
       `cancel ${String(snapshot.cancelledChunkRequests).padStart(5)}  ` +
       `evict ${String(snapshot.evictedChunks).padStart(6)}  ` +
       `draws ${String(snapshot.drawCalls).padStart(4)}  ` +
+      `water ${String(snapshot.waterDrawCalls).padStart(3)}/${String(snapshot.waterNodes).padStart(3)}  ` +
+      `river ${String(snapshot.riverDrawCalls).padStart(3)}/${String(snapshot.riverNodes).padStart(3)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
       `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
@@ -287,8 +374,8 @@ try {
   const finalSnapshot = await sample(page, cdp);
   const finalLod = await page.evaluate(() => window.__app.lodCounts());
   const geometryAfter = await page.evaluate(
-    (x) => window.__app.sampleChunkGeometry(x, 0, 2),
-    originX,
+    ([x, z]) => window.__app.sampleChunkGeometry(x, z, 2),
+    [originX, originZ],
   );
 
   await context.close();
@@ -307,6 +394,14 @@ try {
   // steep one is kept only so the two halves can be compared in the report.
   const shallowSamples = samples.filter((s) => s.shallow === true);
   const shallowDraws = shallowSamples.map((s) => s.drawCalls);
+  const waterDraws = samples.map((s) => s.waterDrawCalls);
+  const waterNodes = samples.map((s) => s.waterNodes);
+  const waterTris = samples.map((s) => s.waterTriangles);
+  const shallowWaterDraws = shallowSamples.map((s) => s.waterDrawCalls);
+  const riverDraws = samples.map((s) => s.riverDrawCalls);
+  const riverNodes = samples.map((s) => s.riverNodes);
+  const riverVerts = samples.map((s) => s.riverVertices);
+  const shallowRiverDraws = shallowSamples.map((s) => s.riverDrawCalls);
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -324,6 +419,35 @@ try {
   const trendSamples = samples.slice(warmupCount);
   const heapSlopeMbPerMin = slope(trendSamples.map((s) => [s.t / 60, s.heapMb]));
 
+  /**
+   * WHAT THE TREND IS FITTED ON, AND WHY IT IS NO LONGER THE RAW HEAP.
+   *
+   * Phase 3a made the resident payload depend on WHERE THE CAMERA IS. A node
+   * entirely at sea carries 129,744 bytes against an inland node's 74,676, so
+   * the heap now rises and falls by tens of megabytes purely as a function of
+   * how much sea is within the view distance. The Phase 3a flight starts over
+   * open water, crosses a coast into mountains, and comes back, which makes the
+   * raw heap a V -- and a least-squares line through a V whose warm-up window
+   * clips one arm reports a steep, entirely fictional "leak". The first run
+   * measured +13.3 MB/min this way, on a heap that ended 8 MB above where it
+   * started after covering 13.5 km.
+   *
+   * Discarding more warm-up does not fix it; nothing about the window is wrong.
+   * What is wrong is the quantity. A leak is heap that is NOT accounted for by
+   * the chunk payload the streamer is knowingly holding, so that is what gets
+   * the trend line: heap minus the streamer's own byte count. The payload
+   * itself is not unwatched -- it has its own hard budget (MAX_CHUNK_BYTES),
+   * structurally capped by the LRU, and a per-node figure in the report.
+   *
+   * This is strictly a better leak detector than the raw fit, not a weaker one.
+   * A retained mesh whose entry has already been evicted -- the exact failure
+   * disposal exists to prevent -- leaves the streamer's byte count and stays in
+   * the heap, so it shows up here and nowhere else. The raw trend is still
+   * printed, because it is what a human watching the numbers expects to see.
+   */
+  const residualOf = (s) => s.heapMb - s.chunkBytes / 1048576;
+  const residualSlopeMbPerMin = slope(trendSamples.map((s) => [s.t / 60, residualOf(s)]));
+
   // A trend fitted before the cache saturates measures the cache filling, not a
   // leak. Say so instead of accusing the code of leaking -- a check that cries
   // wolf on a short run is a check people stop reading.
@@ -339,7 +463,17 @@ try {
   console.log(`  first / last     ${heaps[0]?.toFixed(1)} MB -> ${heaps.at(-1)?.toFixed(1)} MB`);
   console.log(`  min / mean / max ${min(heaps).toFixed(1)} / ${mean(heaps).toFixed(1)} / ${max(heaps).toFixed(1)} MB`);
   console.log(`  early / late avg ${mean(firstThird).toFixed(1)} MB -> ${mean(lastThird).toFixed(1)} MB (post-warmup)`);
-  console.log(`  trend            ${heapSlopeMbPerMin >= 0 ? '+' : ''}${heapSlopeMbPerMin.toFixed(2)} MB/min (limit ${MAX_HEAP_SLOPE_MB_PER_MIN})`);
+  console.log(
+    `  raw trend        ${heapSlopeMbPerMin >= 0 ? '+' : ''}${heapSlopeMbPerMin.toFixed(2)} MB/min ` +
+      '(reported only: since Phase 3a this tracks how much sea is in view)',
+  );
+  console.log(
+    `  UNEXPLAINED      ${residualSlopeMbPerMin >= 0 ? '+' : ''}${residualSlopeMbPerMin.toFixed(2)} MB/min ` +
+      `(limit ${MAX_HEAP_SLOPE_MB_PER_MIN}) -- heap minus chunk payload; THIS is the leak check`,
+  );
+  console.log(
+    `  residual         ${residualOf(samples[0]).toFixed(1)} MB -> ${residualOf(samples.at(-1)).toFixed(1)} MB`,
+  );
   if (!trendJudgeable) {
     console.log(
       `  trend NOT judged  the chunk cache never saturated in ${SECONDS}s, so the ` +
@@ -376,6 +510,31 @@ try {
     `  SHALLOW leg peak  ${shallowDraws.length === 0 ? 'n/a' : max(shallowDraws)} draw calls at ${SHALLOW_PITCH} deg` +
       ` (${shallowSamples.length} samples, floor ${MIN_SHALLOW_DRAW_CALLS})`,
   );
+
+  console.log('');
+  console.log('water (Phase 3a)');
+  console.log(`  live water nodes  ${max(waterNodes)} peak of ${max(lives)} live nodes`);
+  console.log(`  water triangles   ${max(waterTris)} peak`);
+  console.log(`  water DRAWN       ${max(waterDraws)} peak (floor ${MIN_WATER_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowWaterDraws.length === 0 ? 'n/a' : max(shallowWaterDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_WATER_DRAW_CALLS})`,
+  );
+  console.log(
+    `  draws without it  ${max(draws.map((d, i) => d - waterDraws[i]))} peak terrain-only draw calls`,
+  );
+  console.log(`  sea at the start  ${waterChunksAtStart}/${waterBefore.length} round-tripped chunks`);
+
+  console.log('');
+  console.log('rivers (Phase 3b)');
+  console.log(`  carved nodes      ${max(riverNodes)} peak of ${max(lives)} live nodes (floor ${MIN_RIVER_NODES})`);
+  console.log(`  carved vertices   ${max(riverVerts)} peak`);
+  console.log(`  carved DRAWN      ${max(riverDraws)} peak (floor ${MIN_RIVER_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowRiverDraws.length === 0 ? 'n/a' : max(shallowRiverDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_RIVER_DRAW_CALLS})`,
+  );
+  console.log(`  river at the start ${riverChunksAtStart}/${riverBefore.length} round-tripped chunks`);
 
   console.log('');
   console.log('frames');
@@ -418,14 +577,22 @@ try {
   if (finalSnapshot.frames < SECONDS * 2) {
     failures.push(`only ${finalSnapshot.frames} frames drawn in ${SECONDS}s; rendering stalled`);
   }
-  if (max(samples.map((s) => s.cameraX)) < SPEED * SECONDS * 0.2) {
-    failures.push('the camera barely moved; the autopilot did not run');
+  // Distance TRAVELLED, not absolute X: the flight no longer starts at the
+  // origin (see START_X), and an absolute test would have failed the moment
+  // the start moved west of it -- for a run that flew perfectly.
+  const travelled = max(samples.map((s) => s.cameraX)) - min(samples.map((s) => s.cameraX));
+  if (travelled < SPEED * SECONDS * 0.2) {
+    failures.push(
+      `the camera travelled ${Math.round(travelled)} m in ${SECONDS}s; the autopilot did not run`,
+    );
   }
 
-  if (trendJudgeable && heapSlopeMbPerMin > MAX_HEAP_SLOPE_MB_PER_MIN) {
+  if (trendJudgeable && residualSlopeMbPerMin > MAX_HEAP_SLOPE_MB_PER_MIN) {
     failures.push(
-      `heap grew ${heapSlopeMbPerMin.toFixed(2)} MB/min after warm-up, over the ` +
-        `${MAX_HEAP_SLOPE_MB_PER_MIN} MB/min limit. That is a leak, not noise.`,
+      `heap not accounted for by chunk payload grew ${residualSlopeMbPerMin.toFixed(2)} MB/min ` +
+        `after warm-up, over the ${MAX_HEAP_SLOPE_MB_PER_MIN} MB/min limit. ` +
+        'That is a leak, not noise: the streamer let go of those bytes and the ' +
+        'heap did not.',
     );
   }
   if (!trendJudgeable) {
@@ -475,6 +642,76 @@ try {
       `the shallow leg peaked at ${max(shallowDraws)} draw calls, under the ` +
         `${MIN_SHALLOW_DRAW_CALLS} floor. The camera was not looking at the world, ` +
         'so the draw-call budget proved nothing.',
+    );
+  }
+
+  // ---- water, and the vacuity guards around it --------------------------
+  //
+  // Every one of these exists because "the flight never went near the sea" is
+  // indistinguishable from "water works" to any check that only looks at
+  // whether something failed.
+  if (max(waterTris) === 0) {
+    failures.push(
+      'no water geometry was generated at any point in the flight. Either the ' +
+        'water surface is broken or the flight path never crossed any sea -- ' +
+        'in which case every water check in this run passed vacuously.',
+    );
+  }
+  if (max(waterDraws) < MIN_WATER_DRAW_CALLS) {
+    failures.push(
+      `water was drawn at most ${max(waterDraws)} times in a frame (floor ` +
+        `${MIN_WATER_DRAW_CALLS}). Water existing and water RENDERING are ` +
+        'different claims; this run only made the first one.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowWaterDraws) < MIN_SHALLOW_WATER_DRAW_CALLS) {
+    failures.push(
+      `the shallow-pitch leg drew water at most ${max(shallowWaterDraws)} times ` +
+        `(floor ${MIN_SHALLOW_WATER_DRAW_CALLS}). The draw-call budget is decided ` +
+        'on that leg, so it was measured without the thing this phase added.',
+    );
+  }
+  if (waterChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks had water in them, so the ' +
+        'byte-identical-regeneration check said nothing about the sea. Move the ' +
+        'flight start (START_X / START_Z) over water.',
+    );
+  }
+
+  // ---- rivers, and the vacuity guards around them -----------------------
+  if (max(riverVerts) === 0) {
+    failures.push(
+      'no river carving was generated at any point in the flight. Either ' +
+        'carving is broken or the flight path never went near a river -- in ' +
+        'which case every river check in this run passed vacuously.',
+    );
+  }
+  if (max(riverNodes) < MIN_RIVER_NODES) {
+    failures.push(
+      `only ${max(riverNodes)} carved nodes were ever resident (floor ` +
+        `${MIN_RIVER_NODES}). The flight barely touched a river.`,
+    );
+  }
+  if (max(riverDraws) < MIN_RIVER_DRAW_CALLS) {
+    failures.push(
+      `carved terrain was drawn at most ${max(riverDraws)} times in a frame ` +
+        `(floor ${MIN_RIVER_DRAW_CALLS}). Rivers existing and rivers REACHING ` +
+        'THE SCREEN are different claims; this run only made the first one.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowRiverDraws) < MIN_SHALLOW_RIVER_DRAW_CALLS) {
+    failures.push(
+      `the shallow-pitch leg drew carved terrain at most ${max(shallowRiverDraws)} ` +
+        `times (floor ${MIN_SHALLOW_RIVER_DRAW_CALLS}). The draw-call budget is ` +
+        'decided on that leg, so it was measured without this phase in it.',
+    );
+  }
+  if (riverChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks was carved by a river, so the ' +
+        'byte-identical-regeneration check said nothing about rivers. Move the ' +
+        'flight start (START_X / START_Z) onto a channel.',
     );
   }
 

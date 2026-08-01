@@ -18,15 +18,43 @@
  */
 
 import { rngAt2i } from '../core/hash';
-import { humidity, sampleHeight, temperature } from './height-field';
+import { humidity, SEA_LEVEL, sampleHeight, temperature, worldRiverField } from './height-field';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
+import type { RegionRiverField } from './rivers';
 import {
   CHUNK_DATA_VERSION,
+  createTierContext,
   chunkSizeAt,
   type ChunkCoord,
   type ChunkData,
   type TierContext,
 } from './contracts';
+
+/**
+ * The tier context a chunk generator needs: a world seed plus the REGION-tier
+ * river network, which is what decides where rivers go.
+ *
+ * RULE 3 in one function. Rivers span hundreds of chunks, so no chunk may
+ * decide where one runs; the routing happens at the Region tier and arrives
+ * here as coarse data. `generateChunk` reads it through `coarser('region')` and
+ * throws if it is missing, rather than reaching around the tier system and
+ * calling `rivers.ts` itself -- which would work, and would quietly make the
+ * tier plumbing decorative.
+ *
+ * The region field is memoised inside `rivers.ts`, so building a context per
+ * chunk costs one object.
+ */
+export function chunkTierContext(worldSeed: number): TierContext {
+  return createTierContext(worldSeed, 'chunk', { region: worldRiverField(worldSeed) });
+}
+
+/**
+ * Metres of carving below which a vertex is not counted as "in a river".
+ *
+ * Only used for the anti-vacuity statistic on `ChunkData.riverVertices`: a
+ * quarter of a metre is far above float noise and far below a real channel.
+ */
+const RIVER_VERTEX_MIN_CUT = 0.25;
 
 /**
  * Convert HSL to RGB. Hand-rolled rather than borrowed from Three.js because
@@ -196,7 +224,7 @@ const ROCK: readonly [number, number, number] = [0.44, 0.42, 0.4];
 const SNOW: readonly [number, number, number] = [0.92, 0.93, 0.95];
 const SILT: readonly [number, number, number] = [0.33, 0.35, 0.29];
 
-/** Metres of altitude at which snow starts, before the temperature shift. */
+/** Metres ABOVE SEA LEVEL at which snow starts, before the temperature shift. */
 const SNOW_LINE = 195;
 /** Metres the snow line moves between a polar and a tropical climate. */
 const SNOW_LINE_TEMPERATURE_SWING = 70;
@@ -215,12 +243,31 @@ export interface SurfaceInputs {
 }
 
 /**
+ * Metres BELOW `SEA_LEVEL` at which the sea floor is fully silt, and metres
+ * ABOVE it at which the beach has finished turning into vegetation.
+ *
+ * These four numbers were bare literals (-14, 1, 2, 16) until Phase 3a, which
+ * is how a shoreline gets a sand band in one place and a water surface in
+ * another. They are offsets from `SEA_LEVEL` now, so moving sea level moves the
+ * beach with it.
+ */
+const SILT_DEPTH = 14;
+const SAND_TOP = 1;
+const VEGETATION_START = 2;
+const VEGETATION_FULL = 16;
+
+/**
  * The colour of the ground at one point, in sRGB.
  *
  * Kept as a pure function of five scalars so it can be unit-tested directly:
  * "a steep face is rock", "a high cold peak is snow", "a wet lowland is green".
  * That is the check that would actually fail if the height field broke, which a
  * byte-comparison of a screenshot cannot tell you.
+ *
+ * Every altitude band here is anchored to `SEA_LEVEL`, which is the same
+ * constant the water surface is built at. That shared anchor IS the shoreline:
+ * if the two ever read different zeros, the sand would sit somewhere the sea
+ * does not.
  */
 export function surfaceColor(inputs: SurfaceInputs): [number, number, number] {
   const { height, slope, variation } = inputs;
@@ -232,9 +279,9 @@ export function surfaceColor(inputs: SurfaceInputs): [number, number, number] {
     lerp(GRASS_DRY[2], GRASS_LUSH[2], inputs.humidity),
   ];
 
-  // Basin silt -> shore sand -> vegetation, by altitude.
-  const shore = smoothstep(-14, 1, height);
-  const inland = smoothstep(2, 16, height);
+  // Basin silt -> shore sand -> vegetation, by altitude above sea level.
+  const shore = smoothstep(SEA_LEVEL - SILT_DEPTH, SEA_LEVEL + SAND_TOP, height);
+  const inland = smoothstep(SEA_LEVEL + VEGETATION_START, SEA_LEVEL + VEGETATION_FULL, height);
   let r = lerp(lerp(SILT[0], SAND[0], shore), grass[0], inland);
   let g = lerp(lerp(SILT[1], SAND[1], shore), grass[1], inland);
   let b = lerp(lerp(SILT[2], SAND[2], shore), grass[2], inland);
@@ -247,7 +294,8 @@ export function surfaceColor(inputs: SurfaceInputs): [number, number, number] {
 
   // Snow above the line, but not on faces too steep to hold it. A warm climate
   // pushes the line UP; a polar one brings it down to the coast.
-  const line = SNOW_LINE + SNOW_LINE_TEMPERATURE_SWING * (inputs.temperature - 0.5) * 2;
+  const line =
+    SEA_LEVEL + SNOW_LINE + SNOW_LINE_TEMPERATURE_SWING * (inputs.temperature - 0.5) * 2;
   const snowy = smoothstep(line, line + 42, height) * (1 - smoothstep(0.55, 0.8, slope));
   r = lerp(r, SNOW[0], snowy);
   g = lerp(g, SNOW[1], snowy);
@@ -262,6 +310,104 @@ export function surfaceColor(inputs: SurfaceInputs): [number, number, number] {
 /** Frequency of the per-point colour variation, in cycles per metre. */
 const TINT_FREQUENCY = 1 / 47;
 const TINT_SALT = 0x54_69_6e_74;
+
+// ---------------------------------------------------------------------------
+// Water
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY WATER IS PER-CHUNK GEOMETRY AND NOT ONE BIG PLANE.
+ *
+ * A single quad the size of the view distance is the obvious first idea and it
+ * is wrong in three ways here: it has to be clipped to whatever the quadtree
+ * currently covers or it hangs over the edge of the world; it cannot carry
+ * per-vertex depth shading, so the sea is a flat sheet of one colour; and it is
+ * a main-thread object whose extent depends on camera position, which is the
+ * one kind of state RULE 2 keeps out of chunk content.
+ *
+ * Generating it per node in the worker gets all three for free. "Clipped to the
+ * visible region" is automatic -- water exists exactly where chunks do. Depth
+ * shading is a per-vertex colour like the terrain's. And it is a pure function
+ * of `(worldSeed, coord)` like everything else, so it regenerates
+ * byte-identically and the soak's round-trip check covers it.
+ *
+ * TWO THINGS TERRAIN NEEDS AND WATER DOES NOT:
+ *
+ *  - No skirt. The crack between two nodes exists because they sample the same
+ *    edge of a CURVED surface at different rates. The water surface is the
+ *    plane y = SEA_LEVEL at every level, so two neighbours agree on it exactly
+ *    and there is nothing to crack.
+ *  - No normals in the payload. It is flat, so a normal buffer would be the
+ *    same +Y vector repeated 1,089 times. `chunk-mesh.ts` fills the attribute
+ *    in on the main thread, which keeps the redundancy out of the one budget
+ *    this project is actually near.
+ *
+ * THE ONE DISCIPLINE THAT KEEPS THIS INSIDE BUDGET: a node with no ground below
+ * sea level emits ZERO water vertices, zero indices and no mesh at all, so it
+ * costs no draw call and no bytes. Inland is most of the world. Emitting an
+ * empty water plane everywhere would roughly double the project's draw calls
+ * for nothing.
+ */
+
+/** Opacity of water deep enough to hide the bottom. Never fully opaque. */
+export const WATER_ALPHA_MAX = 0.88;
+
+/**
+ * Depth in metres at which opacity reaches `WATER_ALPHA_MAX`.
+ *
+ * Alpha is `WATER_ALPHA_MAX * sqrt(depth / this)`, which is exactly 0 at zero
+ * depth. THAT is what stops the shoreline being a hard line: the water does not
+ * meet the sand at some minimum opacity and stop, it fades out as the sea floor
+ * rises to meet it, so the intersection is a gradient several metres wide
+ * rather than an edge. The square root is chosen over a linear or smoothstep
+ * ramp because real shallow water darkens fast in the first metre or two and
+ * then hardly at all; `Math.sqrt` is IEEE-exact, unlike `Math.exp`, so it is
+ * allowed on the path to a stored vertex (see `noise.ts`).
+ */
+export const WATER_ALPHA_FULL_DEPTH = 12;
+
+/** Depth in metres at which the colour has finished going from shallow to deep. */
+export const WATER_COLOR_FULL_DEPTH = 26;
+
+/** Palette in sRGB, like the terrain's. */
+const WATER_SHALLOW: readonly [number, number, number] = [0.32, 0.62, 0.6];
+const WATER_DEEP: readonly [number, number, number] = [0.02, 0.09, 0.21];
+
+/**
+ * The colour of water of a given depth: sRGB red, green, blue, and alpha.
+ *
+ * Pure function of one scalar, for the same reason `surfaceColor` is a pure
+ * function of five: "deeper water is darker and more opaque" and "water of zero
+ * depth is invisible" are directly assertable properties, and no screenshot
+ * comparison would tell you if they broke.
+ *
+ * `depth` is `SEA_LEVEL - groundHeight`, so it is negative on dry land; that
+ * clamps to zero, which is what makes the water grid harmless where it overlaps
+ * the beach.
+ */
+export function waterColor(depth: number): [number, number, number, number] {
+  const d = depth > 0 ? depth : 0;
+
+  const shade = smoothstep(0, WATER_COLOR_FULL_DEPTH, d);
+  const r = lerp(WATER_SHALLOW[0], WATER_DEEP[0], shade);
+  const g = lerp(WATER_SHALLOW[1], WATER_DEEP[1], shade);
+  const b = lerp(WATER_SHALLOW[2], WATER_DEEP[2], shade);
+
+  const alpha = WATER_ALPHA_MAX * Math.sqrt(clamp(d / WATER_ALPHA_FULL_DEPTH, 0, 1));
+  return [r, g, b, alpha];
+}
+
+/**
+ * Water vertices carry rgbA, not rgb. Four components is what makes Three.js
+ * define `USE_COLOR_ALPHA` and take the fragment's opacity from the attribute,
+ * which is the whole depth-fade mechanism; three components would silently
+ * ignore the alpha and give a uniformly opaque sea.
+ */
+export const WATER_COLOR_COMPONENTS = 4;
+
+/** Upper bounds, for tests and for reasoning about the payload budget. */
+export const MAX_WATER_VERTEX_COUNT = SURFACE_VERTEX_COUNT;
+export const MAX_WATER_TRIANGLE_COUNT = SURFACE_TRIANGLE_COUNT;
 
 // ---------------------------------------------------------------------------
 // Skirts
@@ -354,6 +500,144 @@ const SKIRT_ANCHOR_INDEX = SKIRT_EDGES[0].startRow * VERTS_PER_EDGE + SKIRT_EDGE
 // Generation
 // ---------------------------------------------------------------------------
 
+/** What `buildWaterSurface` returns. Empty arrays when a node has no water. */
+export interface WaterSurface {
+  positions: Float32Array;
+  colors: Float32Array;
+  indices: Uint32Array;
+}
+
+const NO_WATER: () => WaterSurface = () => ({
+  positions: new Float32Array(0),
+  colors: new Float32Array(0),
+  indices: new Uint32Array(0),
+});
+
+/**
+ * The water surface of one node: a flat submesh at `SEA_LEVEL` covering the
+ * part of the node whose ground is below it.
+ *
+ * WHY IT USES THE TERRAIN'S OWN VERTEX LATTICE. A coarser water grid is
+ * tempting -- the surface is flat, so most of the resolution buys nothing --
+ * and it was rejected because of what "covers the part below sea level" has to
+ * mean to be artefact-free. A quad is emitted when ANY of its four corners is
+ * below sea level, and because the rendered terrain inside a quad is the linear
+ * interpolation of those same four corners, that condition is exactly
+ * "rendered ground dips below the sea here". Two properties fall out and both
+ * matter:
+ *
+ *  - no holes: every square metre of ground that renders below sea level has
+ *    water over it, and
+ *  - no invisible water: a quad is only emitted when a corner is genuinely
+ *    submerged, so at least one of its vertices has non-zero depth and
+ *    therefore non-zero alpha.
+ *
+ * A grid coarser than the terrain's breaks the second one -- a wet cell whose
+ * four corners all sit on dry land shades to alpha 0 and leaves a patch of bare
+ * sea floor -- and every fix for that (a minimum depth, a minimum-over-window
+ * depth) either reintroduces a hard edge or makes a vertex's colour depend on
+ * which side of a chunk border you compute it from, which is a visible seam
+ * along every boundary in the world. Full resolution is the boring option and
+ * the only exact one.
+ *
+ * It costs about 30 kB and 2,048 triangles on a node that is entirely at sea,
+ * and nothing at all on a node that is entirely inland.
+ *
+ * Vertices are COMPACTED: only those touching an emitted quad are written, so a
+ * node with one submerged corner pays for one corner, not for 1,089 vertices.
+ */
+function buildWaterSurface(
+  heightAt: (col: number, row: number) => number,
+  step: number,
+): WaterSurface {
+  const side = VERTS_PER_EDGE;
+
+  // Which cells have water over them.
+  const cellWet = new Uint8Array(SEGMENTS * SEGMENTS);
+  let wetCells = 0;
+  for (let row = 0; row < SEGMENTS; row++) {
+    for (let col = 0; col < SEGMENTS; col++) {
+      const wet =
+        heightAt(col, row) < SEA_LEVEL ||
+        heightAt(col + 1, row) < SEA_LEVEL ||
+        heightAt(col, row + 1) < SEA_LEVEL ||
+        heightAt(col + 1, row + 1) < SEA_LEVEL;
+      if (wet) {
+        cellWet[row * SEGMENTS + col] = 1;
+        wetCells++;
+      }
+    }
+  }
+  // The whole point: an inland node returns nothing, so it builds no mesh and
+  // costs no draw call.
+  if (wetCells === 0) return NO_WATER();
+
+  // Which lattice vertices those cells actually use. -1 means "not used".
+  const waterIndexOf = new Int32Array(SURFACE_VERTEX_COUNT).fill(-1);
+  let vertexCount = 0;
+  for (let row = 0; row < side; row++) {
+    for (let col = 0; col < side; col++) {
+      let used = false;
+      for (let cellRow = row - 1; cellRow <= row && !used; cellRow++) {
+        if (cellRow < 0 || cellRow >= SEGMENTS) continue;
+        for (let cellCol = col - 1; cellCol <= col && !used; cellCol++) {
+          if (cellCol < 0 || cellCol >= SEGMENTS) continue;
+          if (cellWet[cellRow * SEGMENTS + cellCol] === 1) used = true;
+        }
+      }
+      if (used) waterIndexOf[row * side + col] = vertexCount++;
+    }
+  }
+
+  const positions = new Float32Array(vertexCount * 3);
+  const colors = new Float32Array(vertexCount * WATER_COLOR_COMPONENTS);
+  const indices = new Uint32Array(wetCells * 6);
+
+  for (let row = 0; row < side; row++) {
+    for (let col = 0; col < side; col++) {
+      const vertex = waterIndexOf[row * side + col] as number;
+      if (vertex < 0) continue;
+
+      const at = vertex * 3;
+      positions[at] = col * step;
+      // Absolutely flat, at exactly SEA_LEVEL. This is why water needs no
+      // skirt: two neighbouring nodes, at any pair of levels, put their edge
+      // vertices at the identical height, so there is no crack to plug.
+      positions[at + 1] = SEA_LEVEL;
+      positions[at + 2] = row * step;
+
+      const [r, g, b, a] = waterColor(SEA_LEVEL - heightAt(col, row));
+      const to = vertex * WATER_COLOR_COMPONENTS;
+      colors[to] = srgbToLinear(r);
+      colors[to + 1] = srgbToLinear(g);
+      colors[to + 2] = srgbToLinear(b);
+      // Alpha is a blend weight, not a colour: it must NOT go through the
+      // sRGB transfer function.
+      colors[to + 3] = a;
+    }
+  }
+
+  let write = 0;
+  for (let row = 0; row < SEGMENTS; row++) {
+    for (let col = 0; col < SEGMENTS; col++) {
+      if (cellWet[row * SEGMENTS + col] !== 1) continue;
+      const a = waterIndexOf[row * side + col] as number;
+      const b = waterIndexOf[row * side + col + 1] as number;
+      const c = waterIndexOf[(row + 1) * side + col] as number;
+      const d = waterIndexOf[(row + 1) * side + col + 1] as number;
+      // Same winding as the terrain surface: counter-clockwise from +Y.
+      indices[write++] = a;
+      indices[write++] = c;
+      indices[write++] = b;
+      indices[write++] = b;
+      indices[write++] = c;
+      indices[write++] = d;
+    }
+  }
+
+  return { positions, colors, indices };
+}
+
 /**
  * Generate one chunk.
  *
@@ -375,6 +659,23 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   }
 
   const worldSeed = context.worldSeed;
+
+  // RULE 3: the river network is Region-tier data and arrives through the tier
+  // context. Missing is a hard error rather than a silent fall-back to
+  // uncarved terrain, which would render a chunk that disagrees with its
+  // neighbours about where the ground is. Use `chunkTierContext`.
+  const rivers = context.coarser<RegionRiverField>('region');
+  if (rivers === undefined) {
+    throw new Error(
+      'generateChunk needs Region-tier river data on its TierContext. ' +
+        'Build the context with chunkTierContext(worldSeed).',
+    );
+  }
+  if (rivers.worldSeed !== worldSeed) {
+    throw new Error(
+      `Region river data is for seed ${rivers.worldSeed} but this chunk is seed ${worldSeed}`,
+    );
+  }
   const side = VERTS_PER_EDGE;
   const size = chunkSizeAt(coord.lod);
   const step = size / SEGMENTS;
@@ -386,11 +687,26 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
 
   // Heights on a grid padded by one cell, so every interior normal has both
   // neighbours available and border normals match the adjacent chunk exactly.
+  //
+  // Heights come from the Region-tier record, spelled out as
+  // `baseHeight - drop` rather than through `sampleHeight`, so the carve depth
+  // is available for the river statistic below without paying for a second
+  // `baseHeight` evaluation. It is the identical arithmetic `sampleHeight`
+  // performs -- `chunk-gen.test.ts` asserts that with `===`, which is what
+  // keeps the worker and the main thread on the same ground.
   const padded = side + 2;
   const heights = new Float64Array(padded * padded);
+  let riverVertices = 0;
   for (let row = -1; row <= SEGMENTS + 1; row++) {
+    const worldZ = vertexWorldZ(coord, row);
     for (let col = -1; col <= SEGMENTS + 1; col++) {
-      heights[(row + 1) * padded + (col + 1)] = vertexHeight(coord, col, row, worldSeed);
+      const worldX = vertexWorldX(coord, col);
+      const base = rivers.terrain.height(worldX, worldZ, worldSeed);
+      const drop = rivers.drop(worldX, worldZ, base);
+      heights[(row + 1) * padded + (col + 1)] = base - drop;
+      if (drop >= RIVER_VERTEX_MIN_CUT && col >= 0 && col <= SEGMENTS && row >= 0 && row <= SEGMENTS) {
+        riverVertices++;
+      }
     }
   }
   const heightAt = (col: number, row: number): number =>
@@ -528,6 +844,13 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     }
   }
 
+  // -- water ---------------------------------------------------------------
+  //
+  // Built from the same padded height grid, so it cannot disagree with the
+  // terrain about where the shoreline is. Empty for a node with no ground
+  // below sea level, which is most of them.
+  const water = buildWaterSurface(heightAt, step);
+
   return {
     version: CHUNK_DATA_VERSION,
     coord: { x: coord.x, z: coord.z, lod: coord.lod },
@@ -536,6 +859,10 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     indices,
     normals,
     colors,
+    waterPositions: water.positions,
+    waterColors: water.colors,
+    waterIndices: water.indices,
+    riverVertices,
     color: chunkColor(coord, worldSeed),
     minY,
     maxY,

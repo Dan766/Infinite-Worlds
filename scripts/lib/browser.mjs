@@ -70,7 +70,25 @@ export function canonicalizeUrl(baseUrl, params = '') {
  * Open a URL, wait until the app reports itself ready, and return the page plus
  * anything that went wrong while loading.
  */
-export async function openPage(browser, url, { viewport = VIEWPORT, timeout = 30000 } = {}) {
+/**
+ * How long a view gets to reach `window.__worldReady`.
+ *
+ * Raised from 30 s in Phase 3a. This is a wall-clock allowance for a software
+ * rasteriser to stream ~300 nodes, not a correctness threshold: waiting on
+ * readiness is what makes the byte comparison meaningful, so a generous limit
+ * loosens nothing. Water pushed a coastal view's payload up by around 40% and
+ * the third of three back-to-back `shots:check` runs timed out on a loaded
+ * container -- a harness that goes red under load teaches people to re-run
+ * until green, which is exactly the trust problem the byte comparison exists to
+ * avoid.
+ */
+const READY_TIMEOUT_MS = 120000;
+
+export async function openPage(
+  browser,
+  url,
+  { viewport = VIEWPORT, timeout = READY_TIMEOUT_MS } = {},
+) {
   const context = await browser.newContext({
     viewport,
     deviceScaleFactor: 1,

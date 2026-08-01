@@ -8,6 +8,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_WATER_TRIANGLE_COUNT,
+  MAX_WATER_VERTEX_COUNT,
   MIN_SKIRT_DEPTH,
   SEGMENTS,
   SKIRT_TRIANGLE_COUNT,
@@ -18,6 +20,7 @@ import {
   VERTEX_COUNT,
   VERTS_PER_EDGE,
   chunkColor,
+  chunkTierContext,
   generateChunk,
   hslToRgb,
   skirtDepthOf,
@@ -25,8 +28,11 @@ import {
   vertexHeight,
   vertexWorldX,
   vertexWorldZ,
+  WATER_ALPHA_FULL_DEPTH,
+  WATER_ALPHA_MAX,
+  waterColor,
 } from './chunk-gen';
-import { sampleHeight } from './height-field';
+import { baseHeight, SEA_LEVEL, sampleHeight, worldRiverField } from './height-field';
 import {
   CHUNK_DATA_VERSION,
   CHUNK_SIZE,
@@ -37,8 +43,24 @@ import {
 } from './contracts';
 
 const SEED = 0xc0ffee;
-const context = (seed = SEED): ReturnType<typeof createTierContext> =>
-  createTierContext(seed, 'chunk');
+/**
+ * A chunk context WITH its Region-tier river data, which is what
+ * `generateChunk` now requires (RULE 3: rivers span chunks, so they are decided
+ * at the tier that contains them and arrive as coarse data).
+ */
+const context = (seed = SEED): ReturnType<typeof createTierContext> => chunkTierContext(seed);
+
+/**
+ * Seed 99 and three nodes on it, one of each kind. They are shared with
+ * `chunk-mesh.test.ts`, which needs the same three cases at the Three.js
+ * boundary, and the first test in the water block asserts they really ARE dry,
+ * part-submerged and fully submerged -- so a later phase that retunes the
+ * height field gets one clear failure here rather than a dozen puzzling ones.
+ */
+const WATER_SEED = 99;
+const DRY_CHUNK: ChunkCoord = { x: 2, z: 5, lod: 0 };
+const SHORE_CHUNK: ChunkCoord = { x: 0, z: 3, lod: 0 };
+const SUBMERGED_CHUNK: ChunkCoord = { x: 0, z: 0, lod: 0 };
 
 const COORDS: ChunkCoord[] = [
   { x: 0, z: 0, lod: 0 },
@@ -201,6 +223,92 @@ describe('sampleHeight parity with generated vertices', () => {
     // sinks in `shots/cube-default.png`.
     const coord: ChunkCoord = { x: 0, z: 0, lod: 0 };
     expect(vertexHeight(coord, 0, 0, SEED)).toBe(sampleHeight(0, 0, SEED));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rivers (Phase 3b)
+// ---------------------------------------------------------------------------
+
+describe('rivers reach chunk generation through the tier context', () => {
+  it('refuses a chunk context with no Region-tier river data (RULE 3)', () => {
+    // The plumbing is load-bearing, not decorative: without the region record
+    // this generator would have to reach around the tier system and ask
+    // `rivers.ts` itself, and the day a chunk did that for something that is
+    // NOT globally memoised, two neighbours would disagree about the ground.
+    expect(() =>
+      generateChunk({ x: 0, z: 0, lod: 0 }, createTierContext(SEED, 'chunk')),
+    ).toThrow(/Region-tier river data/);
+  });
+
+  it('refuses region data belonging to a different seed', () => {
+    const wrong = createTierContext(SEED, 'chunk', { region: worldRiverField(SEED + 1) });
+    expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, wrong)).toThrow(/but this chunk is seed/);
+  });
+
+  it('carves some nodes and leaves others completely alone', () => {
+    // ANTI-VACUITY. Every river check in this suite, in the soak and in the
+    // screenshot harness is worthless if the world contains no rivers, and a
+    // count of zero looks exactly like "no river near this chunk". So: prove
+    // both kinds of node exist, by looking.
+    let carved = 0;
+    let untouched = 0;
+    let carvedVertices = 0;
+    for (let i = 0; i < 60; i++) {
+      const data = generateChunk({ x: 40 + i, z: 12 + i, lod: 0 }, context());
+      if (data.riverVertices > 0) {
+        carved++;
+        carvedVertices += data.riverVertices;
+      } else {
+        untouched++;
+      }
+    }
+    expect(carved).toBeGreaterThan(0);
+    expect(untouched).toBeGreaterThan(0);
+    expect(carvedVertices).toBeGreaterThan(100);
+  });
+
+  it('counts exactly the vertices baseHeight and sampleHeight disagree about', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const data = generateChunk(coord, context());
+    let expected = 0;
+    for (let row = 0; row <= SEGMENTS; row++) {
+      for (let col = 0; col <= SEGMENTS; col++) {
+        const x = vertexWorldX(coord, col);
+        const z = vertexWorldZ(coord, row);
+        if (baseHeight(x, z, SEED) - sampleHeight(x, z, SEED) >= 0.25) expected++;
+      }
+    }
+    expect(data.riverVertices).toBe(expected);
+  });
+
+  it('lowers the ground it says it carved, and only that', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const data = generateChunk(coord, context());
+    expect(data.riverVertices).toBeGreaterThan(0);
+    const side = VERTS_PER_EDGE;
+    let lowered = 0;
+    for (let row = 0; row < side; row++) {
+      for (let col = 0; col < side; col++) {
+        const stored = data.positions[(row * side + col) * 3 + 1] as number;
+        const base = baseHeight(vertexWorldX(coord, col), vertexWorldZ(coord, row), SEED);
+        expect(stored).toBeLessThanOrEqual(base + 1e-3);
+        if (base - stored > 0.25) lowered++;
+      }
+    }
+    expect(lowered).toBe(data.riverVertices);
+  });
+
+  it('regenerates a carved node byte-identically', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const first = generateChunk(coord, context());
+    // Unrelated work in between, including on another seed, which evicts the
+    // region memo -- the cache must be invisible (RULE 2).
+    generateChunk({ x: 3, z: 3, lod: 2 }, context());
+    generateChunk({ x: 54, z: 20, lod: 0 }, context(SEED + 7));
+    const again = generateChunk(coord, context());
+    expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
+    expect(again.riverVertices).toBe(first.riverVertices);
   });
 });
 
@@ -377,11 +485,14 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(2);
+    expect(CHUNK_DATA_VERSION).toBe(4);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
     expect(data.colors).toBeInstanceOf(Float32Array);
+    expect(data.waterPositions).toBeInstanceOf(Float32Array);
+    expect(data.waterColors).toBeInstanceOf(Float32Array);
+    expect(data.waterIndices).toBeInstanceOf(Uint32Array);
     expect(data.indices.length % 3).toBe(0);
     for (const index of data.indices) {
       expect(index).toBeLessThan(data.positions.length / 3);
@@ -397,13 +508,33 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.indices.buffer);
     expect(transferables).toContain(data.normals.buffer);
     expect(transferables).toContain(data.colors.buffer);
-    expect(transferables).toHaveLength(4);
+    expect(transferables).toContain(data.waterPositions.buffer);
+    expect(transferables).toContain(data.waterColors.buffer);
+    expect(transferables).toContain(data.waterIndices.buffer);
+    expect(transferables).toHaveLength(7);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
         data.normals.byteLength +
-        data.colors.byteLength,
+        data.colors.byteLength +
+        data.waterPositions.byteLength +
+        data.waterColors.byteLength +
+        data.waterIndices.byteLength,
     );
+  });
+
+  it('lists the EMPTY water buffers of an inland node as transferable too', () => {
+    // A conditional transfer list is a rule with an exception, and the
+    // exception is what a later phase forgets. Zero-length ArrayBuffers
+    // transfer fine, so there is no exception: every bulk array, always.
+    const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
+    expect(data.waterIndices).toHaveLength(0);
+    const transferables = chunkDataTransferables(data);
+    expect(transferables).toHaveLength(7);
+    expect(new Set(transferables).size).toBe(7);
+    expect(transferables).toContain(data.waterPositions.buffer);
+    // ...and an empty water surface must add exactly nothing to the payload.
+    expect(chunkDataBytes(data)).toBe(74676);
   });
 
   it('has the grid size Phase 2a specifies, plus the Phase 2b skirt', () => {
@@ -609,5 +740,303 @@ describe('skirts', () => {
     const again = generateChunk({ x: 4, z: -7, lod: 1 }, context());
     expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
     expect(Array.from(again.indices)).toEqual(Array.from(first.indices));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3a: sea level and the water surface
+// ---------------------------------------------------------------------------
+
+describe('SEA_LEVEL', () => {
+  it('anchors every altitude band in the surface palette', () => {
+    // THE POINT OF THE CONSTANT. Until Phase 3a the shore fade was the literal
+    // -14 and the vegetation fade the literal 2, while the sea was an implicit
+    // zero somewhere else entirely. Two hardcoded zeros is how a coastline ends
+    // up with the sand band and the water surface in different places.
+    //
+    // With `variation` at 0 the tint is exactly 1, so these are equalities
+    // rather than approximations: at 14 m below sea level the ground is pure
+    // silt, and at 1 m above it is pure sand.
+    const flat = { slope: 0, temperature: 0.5, humidity: 0.5, variation: 0 };
+    const silt = surfaceColor({ ...flat, height: SEA_LEVEL - 14 });
+    const sand = surfaceColor({ ...flat, height: SEA_LEVEL + 1 });
+    expect(silt).toEqual([0.33, 0.35, 0.29]);
+    expect(sand).toEqual([0.78, 0.71, 0.52]);
+    // ...and at sea level itself the ground is part way between the two, which
+    // is what makes the water's edge sit on a beach rather than on a hard band
+    // boundary.
+    const shoreline = surfaceColor({ ...flat, height: SEA_LEVEL });
+    for (let c = 0; c < 3; c++) {
+      const low = Math.min(silt[c] as number, sand[c] as number);
+      const high = Math.max(silt[c] as number, sand[c] as number);
+      expect(shoreline[c] as number).toBeGreaterThan(low);
+      expect(shoreline[c] as number).toBeLessThan(high);
+    }
+  });
+
+  it('is the same constant the water surface is built at', () => {
+    // The two halves of "shared": the palette above is anchored to SEA_LEVEL,
+    // and every water vertex in the world is at exactly SEA_LEVEL with an alpha
+    // that is exactly zero there. If either side ever read a different zero,
+    // one of these two assertions has to move.
+    expect(waterColor(0)[3]).toBe(0);
+    const data = generateChunk(SUBMERGED_CHUNK, context(WATER_SEED));
+    expect(data.waterPositions.length).toBeGreaterThan(0);
+    for (let i = 1; i < data.waterPositions.length; i += 3) {
+      expect(data.waterPositions[i]).toBe(SEA_LEVEL);
+    }
+  });
+});
+
+describe('waterColor', () => {
+  it('is a pure function of depth', () => {
+    for (const depth of [-3, 0, 0.5, 4, 12, 40]) {
+      expect(waterColor(depth)).toEqual(waterColor(depth));
+    }
+    // Order-independence, for the same reason `chunkColor` is tested for it:
+    // anything that remembered a previous call would break RULE 1.
+    const forwards = [0, 3, 9, 30].map(waterColor);
+    const backwards = [30, 9, 3, 0].map(waterColor).reverse();
+    expect(backwards).toEqual(forwards);
+  });
+
+  it('is invisible at zero depth and never quite opaque', () => {
+    // Alpha 0 exactly at the waterline is what makes the shoreline a gradient
+    // instead of an edge: the sea fades out as the floor rises to meet it, so
+    // there is no line for the eye to catch.
+    expect(waterColor(0)[3]).toBe(0);
+    expect(waterColor(-9)[3]).toBe(0);
+    expect(waterColor(1e6)[3]).toBe(WATER_ALPHA_MAX);
+    expect(WATER_ALPHA_MAX).toBeLessThan(1);
+  });
+
+  it('gets steadily more opaque and steadily darker with depth', () => {
+    let previousAlpha = -1;
+    let previousLuma = 2;
+    for (let depth = 0; depth <= 40; depth += 0.5) {
+      const [r, g, b, a] = waterColor(depth);
+      const luma = r + g + b;
+      expect(a).toBeGreaterThanOrEqual(previousAlpha);
+      expect(luma).toBeLessThanOrEqual(previousLuma + 1e-12);
+      expect(a).toBeGreaterThanOrEqual(0);
+      expect(a).toBeLessThanOrEqual(1);
+      for (const c of [r, g, b]) {
+        expect(c).toBeGreaterThanOrEqual(0);
+        expect(c).toBeLessThanOrEqual(1);
+      }
+      previousAlpha = a;
+      previousLuma = luma;
+    }
+    // ...and the two ends are genuinely different, or "steadily" would be
+    // satisfied by a constant.
+    expect(waterColor(40)[3] - waterColor(0.25)[3]).toBeGreaterThan(0.5);
+    expect(waterColor(0.25)[2] - waterColor(40)[2]).toBeGreaterThan(0.2);
+  });
+
+  it('is fully determined by the depth, not by the alpha ramp constants alone', () => {
+    // Guards the ramp against being flattened to a constant by a future edit:
+    // half of the full depth must be visibly less opaque than all of it.
+    expect(waterColor(WATER_ALPHA_FULL_DEPTH / 2)[3]).toBeLessThan(WATER_ALPHA_MAX * 0.85);
+    expect(waterColor(WATER_ALPHA_FULL_DEPTH / 2)[3]).toBeGreaterThan(WATER_ALPHA_MAX * 0.5);
+  });
+});
+
+describe('the water surface', () => {
+  const ctx = (): ReturnType<typeof createTierContext> => context(WATER_SEED);
+
+  const lowestHeight = (coord: ChunkCoord): number => {
+    let lowest = Infinity;
+    for (let row = 0; row <= SEGMENTS; row++) {
+      for (let col = 0; col <= SEGMENTS; col++) {
+        lowest = Math.min(lowest, vertexHeight(coord, col, row, WATER_SEED));
+      }
+    }
+    return lowest;
+  };
+
+  it('has one node of each kind to test against on this seed', () => {
+    // Pins the three fixtures the rest of this block -- and `chunk-mesh.test.ts`
+    // -- are written against. Retune the height field and this fails first, with
+    // an obvious reason, instead of scattering confusing failures downstream.
+    expect(generateChunk(DRY_CHUNK, ctx()).waterIndices).toHaveLength(0);
+    const shore = generateChunk(SHORE_CHUNK, ctx()).waterIndices.length / 3;
+    expect(shore).toBeGreaterThan(0);
+    expect(shore).toBeLessThan(MAX_WATER_TRIANGLE_COUNT);
+    expect(generateChunk(SUBMERGED_CHUNK, ctx()).waterIndices.length / 3).toBe(
+      MAX_WATER_TRIANGLE_COUNT,
+    );
+  });
+
+  it('exists exactly on the nodes whose ground goes below sea level', () => {
+    // Both halves matter. "Water where there is sea" is the feature; "NO water
+    // where there is none" is the entire draw-call budget of this phase, and it
+    // is the half a screenshot cannot check.
+    let withWater = 0;
+    let withoutWater = 0;
+    for (let z = -6; z <= 6; z++) {
+      for (let x = -6; x <= 6; x++) {
+        const coord = { x, z, lod: 0 };
+        const data = generateChunk(coord, ctx());
+        const wet = lowestHeight(coord) < SEA_LEVEL;
+        expect(data.waterIndices.length > 0).toBe(wet);
+        expect(data.waterPositions.length > 0).toBe(wet);
+        expect(data.waterColors.length > 0).toBe(wet);
+        if (wet) withWater++;
+        else withoutWater++;
+      }
+    }
+    // Anti-vacuity: this seed must actually contain both kinds of node, or the
+    // assertion above is being made about one case only.
+    expect(withWater).toBeGreaterThan(20);
+    expect(withoutWater).toBeGreaterThan(5);
+  });
+
+  it('covers every quad whose ground dips below sea level, and no others', () => {
+    // The rendered ground inside a quad is the linear interpolation of its four
+    // corners, so "any corner below sea level" is exactly "rendered ground dips
+    // below the sea here". Anything less leaves a hole in the sea; anything
+    // more is hidden under the beach but costs bytes.
+    const coord = SHORE_CHUNK;
+    const data = generateChunk(coord, ctx());
+    let expectedQuads = 0;
+    for (let row = 0; row < SEGMENTS; row++) {
+      for (let col = 0; col < SEGMENTS; col++) {
+        const wet =
+          vertexHeight(coord, col, row, WATER_SEED) < SEA_LEVEL ||
+          vertexHeight(coord, col + 1, row, WATER_SEED) < SEA_LEVEL ||
+          vertexHeight(coord, col, row + 1, WATER_SEED) < SEA_LEVEL ||
+          vertexHeight(coord, col + 1, row + 1, WATER_SEED) < SEA_LEVEL;
+        if (wet) expectedQuads++;
+      }
+    }
+    expect(expectedQuads).toBeGreaterThan(0);
+    expect(expectedQuads).toBeLessThan(SEGMENTS * SEGMENTS);
+    expect(data.waterIndices.length).toBe(expectedQuads * 6);
+  });
+
+  it('emits at most one visible-alpha-free quad: every quad has a submerged corner', () => {
+    // The reason the water grid is the terrain grid and not something coarser.
+    // A quad whose four corners are all dry shades to alpha 0 at every corner
+    // and renders as a hole in the sea over ground that IS below water.
+    const data = generateChunk(SHORE_CHUNK, ctx());
+    const alphaOf = (vertex: number): number => data.waterColors[vertex * 4 + 3] as number;
+    for (let i = 0; i < data.waterIndices.length; i += 6) {
+      const corners = [
+        data.waterIndices[i] as number,
+        data.waterIndices[i + 1] as number,
+        data.waterIndices[i + 2] as number,
+        data.waterIndices[i + 5] as number,
+      ];
+      expect(Math.max(...corners.map(alphaOf))).toBeGreaterThan(0);
+    }
+  });
+
+  it('compacts its vertices instead of emitting the whole lattice', () => {
+    const shore = generateChunk(SHORE_CHUNK, ctx());
+    const submerged = generateChunk(SUBMERGED_CHUNK, ctx());
+    expect(submerged.waterPositions.length / 3).toBe(MAX_WATER_VERTEX_COUNT);
+    expect(submerged.waterIndices.length / 3).toBe(MAX_WATER_TRIANGLE_COUNT);
+    expect(shore.waterPositions.length / 3).toBeLessThan(MAX_WATER_VERTEX_COUNT);
+    expect(shore.waterPositions.length / 3).toBeGreaterThan(0);
+    // Colours are rgbA, four per vertex, or Three throws the opacity away.
+    expect(shore.waterColors.length).toBe((shore.waterPositions.length / 3) * 4);
+    // Every index must point at a vertex that was actually emitted.
+    for (const index of shore.waterIndices) {
+      expect(index).toBeLessThan(shore.waterPositions.length / 3);
+    }
+  });
+
+  it('shades each vertex by the depth of the ground beneath it', () => {
+    const coord = SHORE_CHUNK;
+    const data = generateChunk(coord, ctx());
+    const side = SEGMENTS + 1;
+    // Rebuild the compaction the same way the generator does, then check every
+    // vertex against `waterColor` evaluated at an independently sampled depth.
+    let checked = 0;
+    let vertex = 0;
+    for (let row = 0; row < side; row++) {
+      for (let col = 0; col < side; col++) {
+        const x = vertexWorldX(coord, col);
+        const z = vertexWorldZ(coord, row);
+        if (
+          Math.abs((data.waterPositions[vertex * 3] as number) - (x - coord.x * CHUNK_SIZE)) > 1e-3 ||
+          Math.abs((data.waterPositions[vertex * 3 + 2] as number) - (z - coord.z * CHUNK_SIZE)) > 1e-3
+        ) {
+          continue;
+        }
+        const depth = SEA_LEVEL - sampleHeight(x, z, WATER_SEED);
+        expect(data.waterColors[vertex * 4 + 3] as number).toBeCloseTo(waterColor(depth)[3], 5);
+        vertex++;
+        checked++;
+      }
+    }
+    expect(checked).toBe(data.waterPositions.length / 3);
+    // ...and the depths on this node actually vary, or the check is vacuous.
+    const alphas = new Set<number>();
+    for (let i = 3; i < data.waterColors.length; i += 4) alphas.add(data.waterColors[i] as number);
+    expect(alphas.size).toBeGreaterThan(20);
+  });
+
+  it('regenerates byte-identically, water included (RULE 2)', () => {
+    const first = generateChunk(SHORE_CHUNK, ctx());
+    // Unrelated work in between, at other levels and other coordinates.
+    generateChunk({ x: 1, z: 1, lod: 2 }, ctx());
+    generateChunk(DRY_CHUNK, ctx());
+    generateChunk(SUBMERGED_CHUNK, context(WATER_SEED + 1));
+    const again = generateChunk(SHORE_CHUNK, ctx());
+    expect(Array.from(again.waterPositions)).toEqual(Array.from(first.waterPositions));
+    expect(Array.from(again.waterColors)).toEqual(Array.from(first.waterColors));
+    expect(Array.from(again.waterIndices)).toEqual(Array.from(first.waterIndices));
+  });
+
+  it('meets its neighbour exactly, at every level, so it can never crack', () => {
+    // Terrain needs a skirt because two nodes sample a curved surface at
+    // different rates. Water is the plane y = SEA_LEVEL at every level, so the
+    // shared edge agrees by construction -- this is the assertion that says the
+    // missing skirt is a consequence and not an omission.
+    let checked = 0;
+    for (const lod of [0, 1, 3]) {
+      for (let x = -2; x <= 2; x++) {
+        const data = generateChunk({ x, z: 0, lod }, ctx());
+        if (data.waterPositions.length === 0) continue;
+        for (let i = 1; i < data.waterPositions.length; i += 3) {
+          expect(data.waterPositions[i]).toBe(SEA_LEVEL);
+        }
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(10);
+  });
+
+  it('costs a coastal node a fraction of what the terrain costs', () => {
+    // The payload budget in `scripts/soak.mjs` is derived from these numbers.
+    const submerged = generateChunk(SUBMERGED_CHUNK, ctx());
+    const terrainBytes = 74676;
+    const waterBytes =
+      submerged.waterPositions.byteLength +
+      submerged.waterColors.byteLength +
+      submerged.waterIndices.byteLength;
+    expect(waterBytes).toBe(1089 * 3 * 4 + 1089 * 4 * 4 + 2048 * 3 * 4);
+    expect(waterBytes).toBe(55068);
+    expect(chunkDataBytes(submerged)).toBe(terrainBytes + waterBytes);
+    // Worst case, on a node entirely at sea: under 75% on top of the terrain.
+    expect(waterBytes / terrainBytes).toBeLessThan(0.75);
+  });
+
+  it('scales with the node rather than with the world, at every level', () => {
+    // Like `SEGMENTS`, the water grid is per NODE, so a lod-6 node covering
+    // 4 km of sea costs no more than a lod-0 node covering 64 m of it. That is
+    // what keeps water on the same "bound the node count" footing as terrain.
+    for (const lod of [0, 2, 4, 6]) {
+      const data = generateChunk({ x: 0, z: 0, lod }, ctx());
+      expect(data.waterIndices.length / 3).toBeLessThanOrEqual(MAX_WATER_TRIANGLE_COUNT);
+      expect(data.waterPositions.length / 3).toBeLessThanOrEqual(MAX_WATER_VERTEX_COUNT);
+      expect(data.waterIndices.length).toBeGreaterThan(0);
+    }
+    // ...and the bound is reachable, or "no more than" would be satisfied by
+    // never emitting anything.
+    const full = generateChunk(SUBMERGED_CHUNK, ctx());
+    expect(full.waterIndices.length / 3).toBe(MAX_WATER_TRIANGLE_COUNT);
+    expect(full.waterPositions.length / 3).toBe(MAX_WATER_VERTEX_COUNT);
   });
 });

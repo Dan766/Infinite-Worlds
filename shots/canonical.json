@@ -1,6 +1,9 @@
 {
   "$comment": "Canonical viewpoints captured by `npm run shots` and diffed by `npm run shots:check`. Every entry is forced to hud=0&panel=0&freeze=1, because a visible HUD shows fps and heap and could never match between runs. Add a view per phase; never remove one without saying why in PROGRESS.md.",
-  "viewport": { "width": 1280, "height": 720 },
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
   "views": [
     {
       "name": "cube-default",
@@ -76,6 +79,56 @@
       "name": "lod-rings-wireframe",
       "params": "?time=3&pos=-1400,2600,420&look=0,-88&wireframe=1",
       "expect": "Phase 2b. Straight down from 2.6 km, in wireframe: the quadtree's structure itself. The bright centre is lod 0, whose 2 m cells are sub-pixel at this scale and so read as solid fill; each step outward doubles the node size and halves the apparent line density. The stepped boundaries are the quadtree staircase. If the selection ever collapses to a single level, inverts, or stops tiling, this is the view that says so instantly -- and nothing else in the harness would."
+    },
+    {
+      "name": "water-coast",
+      "params": "?time=3&pos=3000,150,1800&look=-90,-6",
+      "expect": "Phase 3a. A coastline 900 m east of a headland on the default seed, with open sea beyond it. THE view that says the sea exists and is in the right place: sand at the waterline, turquoise shallows tracing the shore, deep navy offshore, and no hard line anywhere along the intersection. Every earlier canonical view was chosen before there was any water, and none of them frames a shoreline; without this one, a phase that stopped emitting water entirely would move a few pixels of colour and pass."
+    },
+    {
+      "name": "water-shoreline-shallow",
+      "params": "?time=3&pos=3900,5.5,1800&look=-90,-3",
+      "expect": "Phase 3a. THE SHALLOW-PITCH SHORELINE VIEW: standing on the beach 5.5 m above sea level, 3 degrees below the horizon, with the waterline a few metres away and the sea running to the horizon. This is the angle at which a hard intersection between the water plane and the ground is most visible -- a grazing view stretches a one-metre depth band across hundreds of pixels -- so it is where depth-derived alpha earns its place. If the alpha ramp is ever flattened, or given a non-zero floor, this view grows a crisp edge along the shore and says so."
+    },
+    {
+      "name": "water-bay-aerial",
+      "params": "?time=3&pos=3400,800,1800&look=-90,-30",
+      "expect": "Phase 3a. The whole bay from 800 m, where the depth shading is the subject: shallows follow the coastline as a turquoise band and the middle of the bay is nearly opaque navy. A flat, uniformly coloured sea passes `water-coast` and fails here. It also shows the water surface tracking a meandering coastline across many nodes at several levels at once -- if a node ever failed to emit water it would appear as a square hole in the sea."
+    },
+    {
+      "name": "water-bay-wireframe",
+      "params": "?time=3&pos=3400,800,1800&look=-90,-30&wireframe=1",
+      "expect": "Phase 3a. The same bay in wireframe: the structural view of which nodes carry water at all. Water triangles are only emitted over ground below sea level, so the dense water grid stops at the coastline and inland nodes show terrain wireframe alone -- that is the discipline the whole phase's draw-call budget rests on, and it is invisible in every shaded view. Also catches a change to the water grid's resolution, which is deliberately the terrain's."
+    },
+    {
+      "name": "seed-canary-inland",
+      "params": "?seed=beta&time=3&pos=4000,600,4500&look=0,-72",
+      "expect": "THE SEED CANARY, and it replaces `chunks-aerial-seed-beta` in that role. That view proved the seed reaches the chunk generator inside the worker by showing the same grid in entirely different colours -- but Phase 3a put sea level into the world, and on seed beta the origin turned out to be deep ocean, so it degraded into a nearly featureless blue field that a total seed-plumbing failure could shift by a few pixels and still pass. This position is dry on BOTH the default seed and beta, with real relief on each and height ranges that do not even overlap (default 15-120m, beta 107-232m), so terrain structure is the subject and the two seeds could never be confused. If the world seed ever stops reaching the generator, this image changes. Kept aerial at -72 degrees to mirror `chunks-aerial`'s framing."
+    },
+    {
+      "name": "river-valley",
+      "params": "?time=3&pos=928,220,5008&look=0,-16",
+      "expect": "Phase 3b. AN INLAND RIVER VALLEY on the default seed, at about 95 m elevation, 4.8 km north-east of the origin. The channel runs from the foreground into the middle distance with tributaries joining it, and the whole dendritic drainage network of the surrounding hills is visible as finer creases. This is the view that says flow accumulation is doing its job: a river network is not a wiggly line, it is a TREE, and a router that thresholded noise instead of drainage would produce disconnected scratches here. It is also the view that would go flat if `finalHeight` stopped carving -- the ground under it is ordinary hillside otherwise."
+    },
+    {
+      "name": "river-to-the-sea",
+      "params": "?time=3&pos=5024,319,6336&look=0,-16",
+      "expect": "Phase 3b. THE VIEW OF THE PHASE: a full-strength river running from the foreground, through its own carved valley, into the sea. The acceptance criterion is that rivers reach the sea without terminating in mid-air, and this is where that is judged by eye -- the channel widens, its bed drops below SEA_LEVEL, and the Phase 3a water surface takes over with no join and no river-specific rendering at all. Sand banks appear along the lower reaches because the surface palette's shore band is anchored to the same SEA_LEVEL the carve drains to. A river that stopped at the coastline, or an estuary with a step in it, shows here first."
+    },
+    {
+      "name": "river-mouth-shallow",
+      "params": "?time=3&pos=5024,60,6100&look=0,-6",
+      "expect": "Phase 3b. THE SHALLOW-PITCH RIVER VIEW: 60 m up, 6 degrees below the horizon, looking down the same river to its mouth. Every geometry budget in this project is decided near the horizon, because a steeply pitched camera measures frustum culling rather than the world -- so the phase needs at least one river view at that pitch. It is also the angle at which a carved bank reads as a bank rather than as shading: the valley wall on the left runs several hundred metres across the frame. If the carve profile ever grows a hard edge at the bank, this is where it appears."
+    },
+    {
+      "name": "river-mouth-wireframe",
+      "params": "?time=3&pos=5024,319,6336&look=0,-16&wireframe=1",
+      "expect": "Phase 3b. The same river mouth in wireframe: the structural view. Two things are only visible here. First, the carve lives in the ORDINARY terrain vertex grid -- there is no separate river mesh, no extra draw call, and the channel is a dent in the same 32x32 lattice every node has had since Phase 2a. Second, the water surface tracks the river exactly: water triangles are emitted only over ground below sea level, so the dense water grid follows the channel inland as a narrow ribbon and stops. If carving ever produced water where the ground is dry, or a channel the water failed to follow, this view says so and no shaded view would."
+    },
+    {
+      "name": "river-region-seam",
+      "params": "?time=3&pos=8192,560,9760&look=0,-89",
+      "expect": "Phase 3b. THE REGION-BOUNDARY CANARY, and the single most likely visual failure of the phase. Straight down from 560 m onto the point where a strong river crosses x = 8192 -- a REGION boundary, 4 km of world -- so the boundary is the vertical centre line of the frame and the channel crosses it diagonally at the middle. Rivers are routed per region; a river routed only inside its own region stops dead at the edge, and at 4 km scale that reads as a wall across the world. Here the channel must run through the centre line with no change of width, depth or direction. Nothing else in the harness looks at a region boundary at all."
     }
   ]
 }
