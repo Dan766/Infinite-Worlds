@@ -11,6 +11,7 @@
     "shot": "node scripts/shot.mjs",
     "shots": "node scripts/shots.mjs",
     "shots:check": "node scripts/shots-check.mjs",
+    "soak": "node scripts/soak.mjs",
     "verify:subpath": "node scripts/verify-subpath.mjs"
   },
   "dependencies": {

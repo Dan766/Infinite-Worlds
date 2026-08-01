@@ -26,6 +26,9 @@ export class FrameTimer {
   private elapsed = 0;
   private hasPublished = false;
   private published: FrameStats = { fps: 0, avgMs: 0, maxMs: 0, spikes: 0 };
+  private peak = 0;
+  private totalSpikeCount = 0;
+  private totalFrameCount = 0;
 
   constructor(windowSeconds = 0.5, spikeThresholdMs = 20) {
     this.windowSeconds = windowSeconds;
@@ -35,8 +38,16 @@ export class FrameTimer {
   /** Feed one frame's wall-clock delta, in seconds. */
   sample(wallDt: number): void {
     if (!Number.isFinite(wallDt) || wallDt <= 0) return;
-    this.samples.push(wallDt * 1000);
+    const ms = wallDt * 1000;
+    this.samples.push(ms);
     this.elapsed += wallDt;
+
+    // `published.maxMs` only covers the current half-second window, which is
+    // right for a HUD and useless for a five-minute soak run. Track the worst
+    // frame since the last `resetPeak()` alongside it.
+    this.totalFrameCount++;
+    if (ms > this.peak) this.peak = ms;
+    if (ms > this.spikeThresholdMs) this.totalSpikeCount++;
 
     // Publish early the first time round. Otherwise the HUD reads "fps 0" for
     // the first half second, which looks like a bug rather than a warm-up.
@@ -47,6 +58,28 @@ export class FrameTimer {
   /** Latest published statistics. Updated once per window, not per frame. */
   get stats(): FrameStats {
     return this.published;
+  }
+
+  /** Worst frame, in ms, since construction or the last `resetPeak()`. */
+  get peakMs(): number {
+    return this.peak;
+  }
+
+  /** Frames over the spike threshold since construction or the last `resetPeak()`. */
+  get totalSpikes(): number {
+    return this.totalSpikeCount;
+  }
+
+  /** Frames sampled since construction or the last `resetPeak()`. */
+  get totalFrames(): number {
+    return this.totalFrameCount;
+  }
+
+  /** Start a fresh measurement window for the long-run counters above. */
+  resetPeak(): void {
+    this.peak = 0;
+    this.totalSpikeCount = 0;
+    this.totalFrameCount = 0;
   }
 
   private publish(): void {

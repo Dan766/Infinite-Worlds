@@ -8,6 +8,7 @@
  */
 
 import * as THREE from 'three';
+import { Autopilot } from './core/autopilot';
 import { CameraRig } from './core/camera-rig';
 import { Loop } from './core/loop';
 import { parseParams, serializeParams, type AppParams } from './core/params';
@@ -16,6 +17,7 @@ import { formatCount, Hud, HudOrder, readHeapMb } from './debug/hud';
 import { DebugPanel } from './debug/panel';
 import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
+import { ChunkStreamer } from './world/chunk-streamer';
 
 declare global {
   interface Window {
@@ -39,6 +41,8 @@ export class App {
   private readonly scene = new THREE.Scene();
   private readonly rig: CameraRig;
   private readonly cube: CubeScene;
+  private readonly streamer: ChunkStreamer;
+  private readonly autopilot: Autopilot;
   private readonly hud: Hud;
   private readonly panel: DebugPanel;
   private readonly frameTimer = new FrameTimer();
@@ -55,7 +59,15 @@ export class App {
     this.hud = new Hud(hudElement, { visible: this.params.hud });
     this.panel = new DebugPanel({ visible: this.params.panel, title: 'Infinite World' });
 
-    this.scene.add(this.cube.root);
+    // All world generation happens in workers owned by the streamer; the main
+    // thread only builds meshes from the payloads they transfer back.
+    this.streamer = new ChunkStreamer({
+      worldSeed: this.params.seedHash,
+      onSceneChanged: () => this.renderer.invalidateMaterials(),
+    });
+    this.autopilot = new Autopilot(this.params.fly, this.params.flyLeg);
+
+    this.scene.add(this.cube.root, this.streamer.root);
     this.addLighting();
 
     this.renderer.setWireframe(this.params.wireframe);
@@ -76,6 +88,9 @@ export class App {
     this.registerHudLines();
     this.buildPanel();
     this.cube.registerDebug(this.hud, this.panel);
+    // Replaces the placeholder `chunks` and `worker queue` lines registered
+    // above, by label. See `Hud.register`.
+    this.streamer.registerDebug(this.hud, this.panel);
 
     this.rig.attach(canvas);
     window.addEventListener('resize', this.onResize);
@@ -94,6 +109,7 @@ export class App {
     window.removeEventListener('keydown', this.onKeyDown);
     this.panel.destroy();
     this.cube.dispose();
+    this.streamer.dispose();
     this.renderer.dispose();
   }
 
@@ -121,14 +137,86 @@ export class App {
     return this.hud.render();
   }
 
+  /**
+   * Machine-readable state for `npm run soak`.
+   *
+   * The five-minute flat-heap budget cannot be checked by a human staring at
+   * the HUD, so everything the soak test asserts on is exposed here in one
+   * plain object that survives `page.evaluate`'s structured clone.
+   */
+  perfSnapshot(): Record<string, number | boolean> {
+    const frame = this.frameTimer.stats;
+    const render = this.renderer.stats();
+    const chunks = this.streamer.stats();
+    const camera = this.rig.position;
+
+    return {
+      nowMs: performance.now(),
+      heapMb: readHeapMb() ?? -1,
+      fps: frame.fps,
+      avgFrameMs: frame.avgMs,
+      windowMaxFrameMs: frame.maxMs,
+      peakFrameMs: this.frameTimer.peakMs,
+      spikes: this.frameTimer.totalSpikes,
+      frames: this.frameTimer.totalFrames,
+      drawCalls: render.drawCalls,
+      triangles: render.triangles,
+      geometries: render.geometries,
+      textures: render.textures,
+      liveChunks: chunks.live,
+      cachedChunks: chunks.cached,
+      queuedChunks: chunks.queued,
+      inFlightChunks: chunks.inFlight,
+      generatedChunks: chunks.generated,
+      cancelledChunkRequests: chunks.cancelledRequests,
+      evictedChunks: chunks.evicted,
+      chunkBytes: chunks.bytes,
+      workers: chunks.workers,
+      cameraX: camera.x,
+      cameraZ: camera.z,
+      settled: chunks.settled,
+    };
+  }
+
+  /** Start a fresh worst-frame window, so warm-up hitches do not skew a soak run. */
+  resetFrameStats(): void {
+    this.frameTimer.resetPeak();
+  }
+
+  /** True when every chunk in range is resident. `window.__worldReady` waits on this too. */
+  worldSettled(): boolean {
+    return this.streamer.settled;
+  }
+
+  /**
+   * Colours of the chunks in a square around a world position, as actually
+   * resident. `null` where the chunk is not loaded. The soak test compares the
+   * result before and after a round trip.
+   */
+  sampleChunkColors(worldX: number, worldZ: number, radius: number): (readonly number[] | null)[] {
+    return this.streamer.sampleColors(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   private renderFrame(wallDt: number): void {
     this.rig.update(wallDt);
+    if (this.autopilot.active) {
+      const p = this.rig.position;
+      this.rig.setPosition(this.autopilot.advance(wallDt, p.x), p.y, p.z);
+    }
+    this.streamer.update(this.rig.camera.position);
     this.frameTimer.sample(wallDt);
     this.renderer.render(this.scene, this.rig.camera);
     this.hud.update(wallDt);
 
     this.renderedFrames++;
-    if (this.renderedFrames === READY_FRAME_COUNT) {
+    // Readiness now also waits for the world around the camera to be fully
+    // streamed. Without that, a screenshot could catch a half-loaded world and
+    // the byte-comparison harness would go flaky the moment Phase 1 landed.
+    if (
+      window.__worldReady !== true &&
+      this.renderedFrames >= READY_FRAME_COUNT &&
+      this.streamer.settled
+    ) {
       window.__worldReady = true;
     }
   }

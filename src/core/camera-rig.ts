@@ -78,6 +78,11 @@ export class CameraRig {
     return { yaw: this.yaw * RAD_TO_DEG, pitch: this.pitch * RAD_TO_DEG };
   }
 
+  /** Place the camera directly. Used by the autopilot, which owns the X axis. */
+  setPosition(x: number, y: number, z: number): void {
+    this.camera.position.set(x, y, z);
+  }
+
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     if (!enabled) this.keys.clear();

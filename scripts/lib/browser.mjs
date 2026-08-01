@@ -39,9 +39,14 @@ const LAUNCH_ARGS = [
   '--no-sandbox',
 ];
 
-export async function launchBrowser() {
+/**
+ * @param {{ extraArgs?: string[] }} options extra Chromium flags. Used only by
+ *   `npm run soak`, which needs precise heap reporting; screenshot runs must
+ *   never pass anything here or baselines stop being comparable.
+ */
+export async function launchBrowser({ extraArgs = [] } = {}) {
   const executablePath = process.env.CHROMIUM_PATH ?? PREINSTALLED_CHROMIUM;
-  const options = { args: LAUNCH_ARGS };
+  const options = { args: [...LAUNCH_ARGS, ...extraArgs] };
   if (existsSync(executablePath)) options.executablePath = executablePath;
   return chromium.launch(options);
 }

@@ -14,6 +14,8 @@
  *                         because fps and heap can never match between runs
  *   ?panel=0              hide the debug panel
  *   ?wireframe=1          start in wireframe
+ *   ?fly=<m/s>            deterministic autopilot along X; 0 is off
+ *   ?flyleg=<seconds>     seconds per autopilot leg before it reverses
  *
  * Unknown or malformed values fall back to the default rather than throwing; a
  * typo in a URL should not produce a blank page.
@@ -46,6 +48,13 @@ export interface AppParams {
   hud: boolean;
   panel: boolean;
   wireframe: boolean;
+  /**
+   * Autopilot speed in m/s along X. Zero means off. Used by `npm run soak` to
+   * fly a repeatable path with no human at the keyboard.
+   */
+  fly: number;
+  /** Seconds the autopilot travels before reversing. */
+  flyLeg: number;
 }
 
 export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
@@ -59,6 +68,8 @@ export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
   hud: true,
   panel: true,
   wireframe: false,
+  fly: 0,
+  flyLeg: 120,
 };
 
 const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
@@ -116,6 +127,8 @@ export function parseParams(search: string): AppParams {
     hud: parseBool(q.get('hud'), DEFAULT_PARAMS.hud),
     panel: parseBool(q.get('panel'), DEFAULT_PARAMS.panel),
     wireframe: parseBool(q.get('wireframe'), DEFAULT_PARAMS.wireframe),
+    fly: parseNumber(q.get('fly'), DEFAULT_PARAMS.fly),
+    flyLeg: Math.max(1, parseNumber(q.get('flyleg'), DEFAULT_PARAMS.flyLeg)),
   };
 }
 
@@ -154,6 +167,8 @@ export function serializeParams(params: AppParams): string {
   if (params.wireframe !== DEFAULT_PARAMS.wireframe) {
     q.set('wireframe', params.wireframe ? '1' : '0');
   }
+  if (round(params.fly) !== DEFAULT_PARAMS.fly) q.set('fly', String(round(params.fly)));
+  if (round(params.flyLeg) !== DEFAULT_PARAMS.flyLeg) q.set('flyleg', String(round(params.flyLeg)));
 
   const s = q.toString();
   return s === '' ? '' : `?${s}`;

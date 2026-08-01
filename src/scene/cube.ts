@@ -36,6 +36,9 @@ export class CubeScene {
       metalness: 0.05,
     });
     this.mesh = new THREE.Mesh(this.geometry, this.material);
+    // Phase 1 put a ground plane at y = 0, so the cube is lifted by its half
+    // extent to sit on it rather than being buried to the waist.
+    this.mesh.position.y = 1;
     this.root.add(this.mesh);
     this.root.name = 'cube';
   }

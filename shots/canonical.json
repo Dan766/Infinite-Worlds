@@ -5,27 +5,52 @@
     {
       "name": "cube-default",
       "params": "?time=3",
-      "expect": "Default seed, three seconds of sim. The baseline every phase is compared against."
+      "expect": "Default seed, three seconds of sim, camera near the ground. The baseline every phase is compared against."
     },
     {
       "name": "cube-t0",
       "params": "?time=0",
-      "expect": "Sim tick zero, cube unrotated. Proves ?time= seeks rather than just pausing."
+      "expect": "Sim tick zero, cube unrotated. Proves ?time= seeks rather than just pausing. Chunks are static, so the cube is the only thing that may differ from cube-default."
     },
     {
       "name": "cube-seed-alpha",
       "params": "?seed=alpha&time=3",
-      "expect": "Different seed, visibly different cube colour. Proves seed plumbing reaches content."
+      "expect": "Different seed: both the cube colour and every chunk colour change. Proves seed plumbing reaches content at every tier."
     },
     {
       "name": "cube-wireframe",
       "params": "?time=3&wireframe=1",
-      "expect": "Wireframe mode on from the URL."
+      "expect": "Wireframe mode on from the URL, applied to the cube and to streamed chunk meshes."
     },
     {
       "name": "cube-far",
       "params": "?time=3&pos=8,5,10&look=38.7,-21.3",
       "expect": "Camera placed entirely from the URL, far from the default framing."
+    },
+    {
+      "name": "chunks-aerial",
+      "params": "?time=3&pos=0,300,0&look=0,-72",
+      "expect": "Phase 1. Looking down on the streamed chunk grid from 300m. Every 64m cell is a flat colour derived from hash2i(coord, seed); a wrong colour or a missing cell is visible instantly."
+    },
+    {
+      "name": "chunks-aerial-seed-beta",
+      "params": "?seed=beta&time=3&pos=0,300,0&look=0,-72",
+      "expect": "Phase 1. Same viewpoint, different seed. The grid layout is identical and every colour differs, which is what proves the seed reaches the chunk generator inside the worker."
+    },
+    {
+      "name": "chunks-radius-edge",
+      "params": "?time=3&pos=-260,180,260&look=45,-32",
+      "expect": "Phase 1. The edge of the streaming radius against the sky. Shows how far chunks stream and catches an off-by-one in the load disc."
+    },
+    {
+      "name": "chunks-wireframe",
+      "params": "?time=3&pos=0,300,0&look=0,-72&wireframe=1",
+      "expect": "Phase 1. Wireframe over streamed chunks. Guards renderer.invalidateMaterials(): meshes added at runtime are invisible to wireframe mode without it, and this view goes blank if that call is lost."
+    },
+    {
+      "name": "chunks-far-from-origin",
+      "params": "?time=3&pos=204800,300,-131072&look=0,-72",
+      "expect": "Phase 1. 200km from the origin, at chunk (3200, -2048). Proves the coordinate hash and chunk-local vertex positions survive large coordinates rather than degenerating into repeats or float mush."
     }
   ]
 }

@@ -16,7 +16,7 @@ beyond static files.
 | Bundler         | Vite, target `esnext`, `base: './'`, output `/dist`          |
 | Renderer        | Three.js, WebGL2, behind a `Renderer` wrapper                |
 | Post-processing | `postprocessing` (pmndrs) -- **Phase 11, not yet installed** |
-| Generation      | Web Workers -- **Phase 1**; zero generation on the main thread |
+| Generation      | Web Workers (Phase 1); zero generation on the main thread   |
 | UI              | None. Plain classes and a fixed-timestep loop.               |
 
 No game engine, no React, no state library.
@@ -37,6 +37,8 @@ No game engine, no React, no state library.
    fully contains it.
 4. **Stable interfaces.** `src/world/contracts.ts` (Phase 1) is load-bearing. If
    a phase requires changing it, stop and explain the change before writing code.
+   Adding a field to `ChunkData` is expected as terrain arrives; renaming or
+   reshaping `ChunkCoord`, `ChunkProvider` or `TierContext` is not.
 5. **Budgets are hard limits**, checked every phase against the perf HUD:
    60fps at 1080p on integrated graphics; <=1200 draw calls; <=400MB JS heap
    after 5 minutes of continuous movement; <=16ms main-thread frame time with no
@@ -53,6 +55,17 @@ src/
     loop.ts             fixed-timestep loop; pausable, single-steppable
     params.ts           URL parameters in and out
     camera-rig.ts       free-fly camera
+    autopilot.ts        deterministic ?fly= flight path, for the soak test
+  world/
+    contracts.ts        ChunkCoord / ChunkData / ChunkProvider / TierContext
+    chunk-gen.ts        pure generation; runs in the worker AND in Node tests
+    chunk-worker.ts     the Web Worker entry point
+    worker-protocol.ts  the main-thread <-> worker message contract
+    worker-pool.ts      pool, priority queue, cancellation; is a ChunkProvider
+    priority-queue.ts   keyed binary min-heap with in-place re-ranking
+    lru-cache.ts        entry-capped LRU with an eviction hook
+    chunk-mesh.ts       the only file in world/ that imports Three.js
+    chunk-streamer.ts   load/unload by radius; owns the HUD lines and toggles
   render/
     renderer.ts         the ONLY module that touches THREE.WebGLRenderer
   scene/
@@ -65,7 +78,8 @@ scripts/
   shot.mjs              one screenshot of one URL
   shots.mjs             capture canonical baselines
   shots-check.mjs       re-capture and byte-compare against baselines
-  verify-subpath.mjs    prove the build runs from a nested static path
+  verify-subpath.mjs    prove the build (and its workers) run from a nested path
+  soak.mjs              5-minute headless flight; heap trend, chunk churn, frames
   lib/                  shared browser, static-server, and canonical-run helpers
 shots/
   canonical.json        the fixed viewpoint list
@@ -112,6 +126,43 @@ panel.folder('Streaming').addToggle('enabled', () => on, (v) => (on = v));
 `hud.register` replaces by label, so Phase 1 supplies real values for the
 placeholder `chunks` and `worker queue` lines without editing `app.ts`.
 
+### World generation never touches the main thread
+
+`src/world/` is layered so that only one file in it knows about Three.js:
+
+```
+contracts.ts   types only        importable from a worker and from Node
+chunk-gen.ts   pure functions    the worker and the unit tests run the same code
+worker-pool.ts scheduling        no DOM, no Three; `spawn` is injectable
+chunk-mesh.ts  Three.js          the boundary where payloads become GPU objects
+```
+
+That layering is what lets `npm test` cover determinism, priority ordering,
+cancellation and eviction with no browser at all. Keep it: the moment
+`chunk-gen.ts` imports Three, the generator stops being testable in Node and
+starts dragging a renderer into every worker.
+
+Payloads cross the boundary as transferred `ArrayBuffer`s, never as clones. If
+you add bulk per-vertex data to `ChunkData`, add it as a typed array and add its
+buffer to `chunkDataTransferables`.
+
+### Chunk draw order is derived from the coordinate
+
+Three.js sorts opaque draws by `renderOrder`, then `material.id`, then depth.
+Material ids are handed out in construction order, so without an explicit
+`renderOrder` chunks are drawn in whatever order their workers finished --
+which differs between runs. Solid quads do not care; wireframe does, because
+neighbouring chunks draw their shared edge at identical depth and the first one
+drawn wins. `chunk-mesh.ts` therefore sets `renderOrder` from the chunk
+coordinate. Without it, `shots:check` fails intermittently on the wireframe
+views.
+
+### `window.__worldReady` waits for the world, not just for a frame
+
+Since Phase 1 it means "two frames rendered AND every chunk in range resident".
+A screenshot harness that fired on the first frame would catch a half-streamed
+world and the byte comparison would go permanently flaky.
+
 ## Verification
 
 The whole point of Phase 0. Checking later phases should cost nothing but
@@ -129,6 +180,8 @@ running a command and looking at a browser.
 | `?hud=0`     | hide the perf HUD                              |
 | `?panel=0`   | hide the debug panel                           |
 | `?wireframe=1` | start in wireframe                           |
+| `?fly=`      | autopilot speed in m/s along X; 0 is off       |
+| `?flyleg=`   | seconds the autopilot travels before reversing |
 
 Malformed values fall back to defaults rather than throwing. In the browser,
 `__app.currentUrl()` returns a link reproducing exactly what is on screen; the
@@ -175,6 +228,45 @@ A literal `file://` open cannot work with this stack: Chrome blocks ES module
 scripts over `file://` for CORS reasons, and Phase 1's Web Workers hit the same
 wall. Serving over HTTP from an arbitrary subpath is the real, durable property.
 
+Since Phase 1 this also checks the worker specifically, because a worker is the
+likeliest thing to break a nested deploy: `new Worker('/assets/...')` passes
+every localhost test and 404s under a subdirectory. The worker must be spawned
+as `new Worker(new URL('./chunk-worker.ts', import.meta.url), {type:'module'})`,
+which Vite rewrites to a URL resolved relative to the importing module. The
+check asserts the worker asset was fetched from inside the mount path and that
+chunks actually streamed -- chunks exist only if a worker answered.
+
+### Soak
+
+```
+npm run soak                    # the 5-minute acceptance run
+npm run soak -- --seconds=60    # quick smoke run while iterating
+npm run soak -- --speed=90 --interval=10 --seed=whatever --no-build
+```
+
+Flies `?fly=` along a triangle wave for the requested duration and reports the
+JS heap at intervals (trend, not just endpoint), live and cached chunk counts,
+generation and eviction totals, worst frame time, and whether chunk colours
+where the flight started match after the round trip. Heap samples are taken
+after a forced `HeapProfiler.collectGarbage` over CDP, or the reading would
+measure uncollected garbage rather than a leak.
+
+It exits non-zero on a post-warmup heap slope above 6 MB/min, on a peak heap
+over 400MB, on over 1200 draw calls, on a colour mismatch across the round
+trip, or on any page error.
+
+Like `shots:check`, it guards against passing while nothing happened: a soak run
+over an empty world would show a beautifully flat heap. It fails if fewer than
+50 chunks were ever resident, if no more chunks were generated than were ever
+resident at once, if too few frames were drawn, or if the camera barely moved.
+
+Note that a short run legitimately shows a positive heap slope, because the LRU
+cache is still filling. It flattens once the cache reaches its cap, which at the
+default speed takes about 40 seconds. Judge the trend on a full-length run.
+
+Re-run this at every subsequent phase. A leak introduced in Phase 6 is far
+cheaper to find in Phase 6 than in Phase 11.
+
 ## Commands
 
 ```
@@ -185,4 +277,5 @@ npm test               # vitest
 npm run shots          # write screenshot baselines
 npm run shots:check    # verify nothing visual changed
 npm run verify:subpath # verify the build survives a nested deploy path
+npm run soak           # 5-minute headless flight; fails on a heap leak
 ```
