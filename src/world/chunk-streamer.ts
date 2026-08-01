@@ -81,6 +81,10 @@ export interface ChunkStreamerStats {
   workers: number;
   /** Vertex bytes held by live plus cached chunks. */
   bytes: number;
+  /** Triangles in the live (in-scene) chunks. GPU-independent, so it is budgetable. */
+  triangles: number;
+  /** Vertices in the live (in-scene) chunks. */
+  vertices: number;
   centre: ChunkCoord;
   settled: boolean;
 }
@@ -107,7 +111,7 @@ export class ChunkStreamer {
   private loadOffsets: Offset[] = [];
   private loadRadius: number;
   private unloadRadius: number;
-  private centre: ChunkCoord = { x: 0, z: 0 };
+  private centre: ChunkCoord = { x: 0, z: 0, lod: 0 };
   private maxBuildsPerFrame: number;
   private generatedCount = 0;
   private cancelledCount = 0;
@@ -172,7 +176,9 @@ export class ChunkStreamer {
     let sceneChanged = false;
 
     for (const offset of this.loadOffsets) {
-      const coord = { x: this.centre.x + offset.dx, z: this.centre.z + offset.dz };
+      // Phase 2a streams a uniform disc of finest-tier nodes. Phase 2b is what
+      // makes `lod` vary; nothing else here has to change when it does.
+      const coord = { x: this.centre.x + offset.dx, z: this.centre.z + offset.dz, lod: 0 };
       const key = chunkKey(coord);
       if (this.live.has(key) || this.arrivedKeys.has(key)) continue;
 
@@ -337,7 +343,13 @@ export class ChunkStreamer {
   stats(): ChunkStreamerStats {
     const providerStats = this.provider.stats;
     let bytes = 0;
-    for (const entry of this.live.values()) bytes += entry.bytes;
+    let triangles = 0;
+    let vertices = 0;
+    for (const entry of this.live.values()) {
+      bytes += entry.bytes;
+      triangles += entry.triangles;
+      vertices += entry.vertices;
+    }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
 
     return {
@@ -350,6 +362,8 @@ export class ChunkStreamer {
       evicted: this.cache.evictions,
       workers: providerStats.workers,
       bytes,
+      triangles,
+      vertices,
       centre: this.centre,
       settled: this.settled,
     };
@@ -372,13 +386,31 @@ export class ChunkStreamer {
     });
   }
 
+  /**
+   * Hashes of specific chunks' position buffers as they are actually resident,
+   * or null where the chunk is not loaded.
+   *
+   * This is the RULE 2 round-trip check the soak test runs: fly away, fly back,
+   * and assert the geometry came back with the same bits. It supersedes the
+   * Phase 1 colour comparison, which could only ever prove that the coordinate
+   * hash was pure -- geometry is the thing that is expensive to reproduce and
+   * therefore the thing worth proving reproducible.
+   */
+  samplePositionHashes(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.positionsHash;
+    });
+  }
+
   /** Chunk coordinates in a square around a world position. For the soak test. */
   static coordsAround(worldX: number, worldZ: number, radius: number): ChunkCoord[] {
     const centre = worldToChunk(worldX, worldZ);
     const coords: ChunkCoord[] = [];
     for (let dz = -radius; dz <= radius; dz++) {
       for (let dx = -radius; dx <= radius; dx++) {
-        coords.push({ x: centre.x + dx, z: centre.z + dz });
+        coords.push({ x: centre.x + dx, z: centre.z + dz, lod: 0 });
       }
     }
     return coords;
@@ -428,8 +460,16 @@ export class ChunkStreamer {
       HudOrder.workers,
     );
     hud.register(
+      'chunk geo',
+      () => {
+        const s = this.stats();
+        return `${s.triangles} tris / ${s.vertices} verts live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
       'chunk mem',
-      () => `${(this.stats().bytes / 1024).toFixed(1)} kB vertex data`,
+      () => `${(this.stats().bytes / 1048576).toFixed(1)} MB vertex data`,
       HudOrder.memory,
     );
 

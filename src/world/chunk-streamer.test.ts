@@ -148,17 +148,17 @@ describe('ChunkStreamer', () => {
     const { streamer, provider, flyTo } = makeStreamer();
     await flyTo(0, 0);
 
-    expect(provider.requestOrder[0]).toBe('0,0');
-    expect(provider.priorities.get('0,0')).toBe(0);
+    expect(provider.requestOrder[0]).toBe('0,0,0');
+    expect(provider.priorities.get('0,0,0')).toBe(0);
     // Priority is distance in metres, so a ring-1 chunk costs one chunk width.
-    expect(provider.priorities.get('1,0')).toBeCloseTo(CHUNK_SIZE);
+    expect(provider.priorities.get('1,0,0')).toBeCloseTo(CHUNK_SIZE);
     streamer.dispose();
   });
 
   it('is not fooled by negative world coordinates', async () => {
     const { streamer, flyTo } = makeStreamer();
     await flyTo(-CHUNK_SIZE * 3.5, -CHUNK_SIZE * 7.5);
-    expect(streamer.stats().centre).toEqual({ x: -4, z: -8 });
+    expect(streamer.stats().centre).toEqual({ x: -4, z: -8, lod: 0 });
     expect(streamer.liveCount).toBe(discSize(2));
     streamer.dispose();
   });
@@ -197,14 +197,17 @@ describe('ChunkStreamer', () => {
 
     await flyTo(0, 0);
     const before = streamer.sampleColors(coords);
+    const geometryBefore = streamer.samplePositionHashes(coords);
     expect(before.every((c) => c !== null)).toBe(true);
+    expect(geometryBefore.every((h) => h !== null)).toBe(true);
 
     await flyTo(CHUNK_SIZE * 40, 0);
     expect(streamer.stats().evicted).toBeGreaterThan(0);
 
     await flyTo(0, 0);
-    const after = streamer.sampleColors(coords);
-    expect(after).toEqual(before);
+    expect(streamer.sampleColors(coords)).toEqual(before);
+    // The stronger statement: the vertex bits themselves came back identical.
+    expect(streamer.samplePositionHashes(coords)).toEqual(geometryBefore);
     streamer.dispose();
   });
 
@@ -218,7 +221,7 @@ describe('ChunkStreamer', () => {
     // Camera jumps away before a single chunk came back.
     streamer.update(new THREE.Vector3(CHUNK_SIZE * 50, 0, 0));
     expect(provider.cancelled).toHaveLength(discSize(2));
-    expect(provider.cancelled).toContain('0,0');
+    expect(provider.cancelled).toContain('0,0,0');
     streamer.dispose();
   });
 
@@ -278,6 +281,18 @@ describe('ChunkStreamer', () => {
     streamer.dispose();
   });
 
+  it('reports geometry as null for chunks that are not resident', async () => {
+    const { streamer, flyTo } = makeStreamer({ loadRadius: 1, unloadRadius: 2 });
+    await flyTo(0, 0);
+    const hashes = streamer.samplePositionHashes([
+      { x: 0, z: 0, lod: 0 },
+      { x: 500, z: 500, lod: 0 },
+    ]);
+    expect(hashes[0]).toBeTypeOf('number');
+    expect(hashes[1]).toBeNull();
+    streamer.dispose();
+  });
+
   it('reports unsettled until every request has landed', async () => {
     const { streamer, provider } = makeStreamer();
     expect(streamer.settled).toBe(false);
@@ -332,12 +347,14 @@ describe('ChunkStreamer', () => {
     const coords = ChunkStreamer.coordsAround(0, 0, 1);
     await flyTo(0, 0);
     const before = streamer.sampleColors(coords);
+    const geometryBefore = streamer.samplePositionHashes(coords);
 
     streamer.reload();
     expect(streamer.liveCount).toBe(0);
 
     await flyTo(0, 0);
     expect(streamer.sampleColors(coords)).toEqual(before);
+    expect(streamer.samplePositionHashes(coords)).toEqual(geometryBefore);
     streamer.dispose();
   });
 });

@@ -13,6 +13,7 @@ import * as THREE from 'three';
 import { rngFromHash } from '../core/hash';
 import { HudOrder, type Hud } from '../debug/hud';
 import type { DebugPanel } from '../debug/panel';
+import { sampleHeight } from '../world/height-field';
 
 /** Radians per second. Applied to sim time, never wall time. */
 const SPIN_Y = 0.6;
@@ -36,9 +37,16 @@ export class CubeScene {
       metalness: 0.05,
     });
     this.mesh = new THREE.Mesh(this.geometry, this.material);
-    // Phase 1 put a ground plane at y = 0, so the cube is lifted by its half
-    // extent to sit on it rather than being buried to the waist.
-    this.mesh.position.y = 1;
+    // Seated on the terrain, half an extent above the ground at the origin.
+    //
+    // This is not decoration: it is a free parity check. The cube's Y comes
+    // from the MAIN THREAD's `sampleHeight`, while the ground under it comes
+    // from the same function called inside a worker. If those two ever
+    // disagree -- a coordinate derived differently, a rounding step added on
+    // one side, a stale cached payload -- the cube visibly floats or sinks in
+    // `shots/cube-default.png`, and a whole class of parity bug becomes
+    // catchable by a screenshot the harness already takes.
+    this.mesh.position.set(0, sampleHeight(0, 0, seedHash) + 1, 0);
     this.root.add(this.mesh);
     this.root.name = 'cube';
   }

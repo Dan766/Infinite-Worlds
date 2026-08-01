@@ -111,6 +111,21 @@ function parseLook(raw: string | null, fallback: LookParams): LookParams {
   return { yaw: parts[0] as number, pitch: parts[1] as number };
 }
 
+/**
+ * True when the query string mentioned this parameter at all.
+ *
+ * `parseParams` cannot express "absent" -- every field falls back to a default,
+ * which is what keeps a typo from producing a blank page. But from Phase 2a the
+ * app needs one absent/present distinction: with terrain, a fixed default
+ * camera Y is underground on one seed and in the clouds on the next, so the
+ * DEFAULT camera height is measured from the ground while an explicit `?pos=`
+ * stays absolute. See `App`'s constructor.
+ */
+export function hasParam(search: string, key: string): boolean {
+  const q = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  return q.has(key);
+}
+
 /** Parse a query string (with or without a leading `?`) into app parameters. */
 export function parseParams(search: string): AppParams {
   const q = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);

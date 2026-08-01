@@ -51,6 +51,16 @@
       "name": "chunks-far-from-origin",
       "params": "?time=3&pos=204800,300,-131072&look=0,-72",
       "expect": "Phase 1. 200km from the origin, at chunk (3200, -2048). Proves the coordinate hash and chunk-local vertex positions survive large coordinates rather than degenerating into repeats or float mush."
+    },
+    {
+      "name": "terrain-mountain-profile",
+      "params": "?time=3&pos=-3300,175,420&look=120,-8",
+      "expect": "Phase 2a. A mountain range in silhouette against the sky, 3.3km west of the origin on the default seed. This is the view that shows the height field is doing all four of its jobs at once: a continent shelf under it, a ridged multifractal peak, hillside relief, and slope/altitude colouring with a snow cap. If the terrain regresses to noise or to a plane, this view is the first to say so."
+    },
+    {
+      "name": "terrain-wireframe-relief",
+      "params": "?time=3&pos=-3300,175,420&look=120,-8&wireframe=1",
+      "expect": "Phase 2a. The same viewpoint in wireframe: the 32x32 (2m) triangle grid draped over real relief. Catches a change to SEGMENTS, a broken vertex grid, or a chunk that failed to build, none of which are obvious in the shaded view. Also re-tests the coordinate-derived renderOrder now that neighbouring chunks are no longer coplanar."
     }
   ]
 }

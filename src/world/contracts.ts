@@ -21,6 +21,21 @@
  *
  * Phase 1 only implements the Chunk tier. Region and Sector are declared here so
  * that Phases 2-4 add generators rather than reshaping this file.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE AUTHORISED RESHAPE, PHASE 2a
+ *
+ * `ChunkCoord` gained `lod`, and `chunkKey` gained it as a third component.
+ * This was reviewed and approved once, at the phase that forced it, and is now
+ * settled. The reason it happened here rather than in Phase 2b (which is what
+ * actually needs it) is that a chunk key is a persisted, cached, cross-thread
+ * identity: adding a component to it later would silently alias a lod-0 chunk
+ * with a lod-2 node covering the same square, and the symptom would be a
+ * corrupted cache rather than a compile error.
+ *
+ * Throughout Phase 2a `lod` is always 0. It exists so that Phase 2b adds
+ * behaviour without touching this file again. Do not treat it as licence for
+ * further reshaping: RULE 4 still stands.
  */
 
 // ---------------------------------------------------------------------------
@@ -67,6 +82,14 @@ export function isCoarserThan(candidate: TierName, tier: TierName): boolean {
 export interface ChunkCoord {
   readonly x: number;
   readonly z: number;
+  /**
+   * Quadtree level. `0` is the finest tier -- one 64 m cell -- and a node at
+   * `lod` covers `CHUNK_SIZE << lod` metres, so `x` and `z` are indices in that
+   * node's own grid, not in the lod-0 grid.
+   *
+   * Phase 2a always passes 0. Phase 2b is what makes it vary.
+   */
+  readonly lod: number;
 }
 
 export interface SectorCoord {
@@ -79,20 +102,34 @@ export interface RegionCoord {
   readonly z: number;
 }
 
-/** Map key for a chunk. Stable, sortable, and cheap to parse back. */
+/** Metres along one axis of a quadtree node at `lod`. `lod` 0 is `CHUNK_SIZE`. */
+export function chunkSizeAt(lod: number): number {
+  return CHUNK_SIZE * 2 ** lod;
+}
+
+/**
+ * Map key for a chunk. Stable, sortable, and cheap to parse back.
+ *
+ * `lod` is part of the key, not an afterthought: two nodes at different levels
+ * can share `(x, z)` while covering completely different squares, so leaving it
+ * out would let them collide in the streamer's maps and in the worker pool's
+ * job table.
+ */
 export function chunkKey(coord: ChunkCoord): string {
-  return `${coord.x},${coord.z}`;
+  return `${coord.x},${coord.z},${coord.lod}`;
 }
 
 /** Inverse of `chunkKey`. Throws on anything it did not produce. */
 export function parseChunkKey(key: string): ChunkCoord {
-  const comma = key.indexOf(',');
-  const x = Number(key.slice(0, comma));
-  const z = Number(key.slice(comma + 1));
-  if (comma < 0 || !Number.isInteger(x) || !Number.isInteger(z)) {
+  const parts = key.split(',');
+  if (parts.length !== 3) throw new Error(`Not a chunk key: ${JSON.stringify(key)}`);
+  const x = Number(parts[0]);
+  const z = Number(parts[1]);
+  const lod = Number(parts[2]);
+  if (!Number.isInteger(x) || !Number.isInteger(z) || !Number.isInteger(lod) || lod < 0) {
     throw new Error(`Not a chunk key: ${JSON.stringify(key)}`);
   }
-  return { x, z };
+  return { x, z, lod };
 }
 
 /** Floor division that behaves correctly for negative coordinates. */
@@ -100,25 +137,39 @@ function floorDiv(value: number, divisor: number): number {
   return Math.floor(value / divisor);
 }
 
-/** Which chunk contains a world-space point. */
-export function worldToChunk(worldX: number, worldZ: number): ChunkCoord {
-  return { x: floorDiv(worldX, CHUNK_SIZE), z: floorDiv(worldZ, CHUNK_SIZE) };
+/** Which node at `lod` contains a world-space point. */
+export function worldToChunk(worldX: number, worldZ: number, lod = 0): ChunkCoord {
+  const size = chunkSizeAt(lod);
+  return { x: floorDiv(worldX, size), z: floorDiv(worldZ, size), lod };
 }
 
-/** World-space position of a chunk's minimum (-X, -Z) corner, in metres. */
-export function chunkOrigin(coord: ChunkCoord): { x: number; z: number } {
-  return { x: coord.x * CHUNK_SIZE, z: coord.z * CHUNK_SIZE };
+/**
+ * World-space position of a node's minimum (-X, -Z) corner, in metres.
+ *
+ * The `lod` parameter defaults to the coordinate's own level rather than to a
+ * literal 0. A separate default would be a second source of truth for a value
+ * the coordinate already carries, and in Phase 2b that is precisely how a
+ * coarse node ends up drawn at a fine node's origin. Passing it explicitly is
+ * still available for callers that hold a bare `(x, z)` pair.
+ */
+export function chunkOrigin(coord: ChunkCoord, lod: number = coord.lod): { x: number; z: number } {
+  const size = chunkSizeAt(lod);
+  return { x: coord.x * size, z: coord.z * size };
 }
 
-/** World-space position of a chunk's centre, in metres. */
-export function chunkCenter(coord: ChunkCoord): { x: number; z: number } {
-  return {
-    x: coord.x * CHUNK_SIZE + CHUNK_SIZE / 2,
-    z: coord.z * CHUNK_SIZE + CHUNK_SIZE / 2,
-  };
+/** World-space position of a node's centre, in metres. See `chunkOrigin` on `lod`. */
+export function chunkCenter(coord: ChunkCoord, lod: number = coord.lod): { x: number; z: number } {
+  const size = chunkSizeAt(lod);
+  return { x: coord.x * size + size / 2, z: coord.z * size + size / 2 };
 }
 
-/** The sector containing a chunk (RULE 3: fine reads coarse, never the reverse). */
+/**
+ * The sector containing a chunk (RULE 3: fine reads coarse, never the reverse).
+ *
+ * Defined for `lod` 0 coordinates. A coarser quadtree node can span several
+ * sectors, so there is no single answer for one; Phase 2b should ask this of
+ * the node's corners, not of the node.
+ */
 export function chunkToSector(coord: ChunkCoord): SectorCoord {
   const ratio = SECTOR_SIZE / CHUNK_SIZE;
   return { x: floorDiv(coord.x, ratio), z: floorDiv(coord.z, ratio) };
@@ -191,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 1;
+export const CHUNK_DATA_VERSION = 2;
 
 /**
  * The result of generating one chunk.
@@ -206,25 +257,58 @@ export interface ChunkData {
   readonly coord: ChunkCoord;
   /** The seed this was generated with. Guards against a stale cache after `?seed=` changes. */
   readonly worldSeed: number;
-  /** Vertex positions, xyz triples, in chunk-local metres (0..CHUNK_SIZE on x/z). */
+  /**
+   * Vertex positions, xyz triples. X and Z are node-local metres
+   * (`0..chunkSizeAt(coord.lod)`) so precision stays usable far from the
+   * origin; Y is absolute world height, because the mesh is placed at y = 0.
+   */
   readonly positions: Float32Array;
   /** Triangle indices into `positions`. */
   readonly indices: Uint32Array;
-  /** Flat surface colour, sRGB-encoded RGB in [0, 1]. Derived from the coordinate hash. */
+  /** Unit surface normals, xyz triples, one per vertex. */
+  readonly normals: Float32Array;
+  /** Per-vertex colour, rgb triples, LINEAR (not sRGB) in [0, 1]. */
+  readonly colors: Float32Array;
+  /**
+   * One representative sRGB colour for the whole chunk, derived from the
+   * coordinate hash.
+   *
+   * Nothing renders this since Phase 2a -- the surface uses `colors` -- but it
+   * is a stable per-chunk identity that debug readouts and the streamer's
+   * colour sampler still use. Cheap, and independent of the terrain, which is
+   * what makes it useful for spotting "this is a different chunk" at a glance.
+   */
   readonly color: readonly [number, number, number];
-  /** Vertical extent in chunk-local metres, for bounds and culling. */
+  /** Vertical extent in absolute world metres, for bounds and culling. */
   readonly minY: number;
   readonly maxY: number;
 }
 
 /** Total transferable bytes in a payload. Used for cache accounting and the HUD. */
 export function chunkDataBytes(data: ChunkData): number {
-  return data.positions.byteLength + data.indices.byteLength;
+  return (
+    data.positions.byteLength +
+    data.indices.byteLength +
+    data.normals.byteLength +
+    data.colors.byteLength
+  );
 }
 
-/** The buffers to hand to `postMessage`'s transfer list. */
+/**
+ * The buffers to hand to `postMessage`'s transfer list.
+ *
+ * Every bulk array in `ChunkData` must appear here. A buffer that is left out
+ * is not an optimisation that was missed -- it is structured-cloned instead,
+ * which copies the whole mesh on the worker thread and again on the main
+ * thread, every chunk, forever.
+ */
 export function chunkDataTransferables(data: ChunkData): Transferable[] {
-  return [data.positions.buffer as ArrayBuffer, data.indices.buffer as ArrayBuffer];
+  return [
+    data.positions.buffer as ArrayBuffer,
+    data.indices.buffer as ArrayBuffer,
+    data.normals.buffer as ArrayBuffer,
+    data.colors.buffer as ArrayBuffer,
+  ];
 }
 
 // ---------------------------------------------------------------------------

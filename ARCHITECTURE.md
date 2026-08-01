@@ -39,6 +39,16 @@ No game engine, no React, no state library.
    a phase requires changing it, stop and explain the change before writing code.
    Adding a field to `ChunkData` is expected as terrain arrives; renaming or
    reshaping `ChunkCoord`, `ChunkProvider` or `TierContext` is not.
+
+   **One reshape was authorised, in Phase 2a, and is now settled.** `ChunkCoord`
+   gained `readonly lod`, `chunkKey` became `x,z,lod`, `chunkSizeAt(lod)` was
+   added, and `worldToChunk` / `chunkOrigin` / `chunkCenter` became lod-aware.
+   It was done at the phase that forced it rather than in Phase 2b, which is
+   what actually varies `lod`, because a chunk key is a cached, cross-thread
+   identity: adding a component to it later would silently alias a lod-0 chunk
+   with a coarser node over the same square, and the symptom would be a
+   corrupted cache rather than a compile error. Throughout Phase 2a `lod` is
+   always 0. This is not a precedent — RULE 4 still stands.
 5. **Budgets are hard limits**, checked every phase against the perf HUD:
    60fps at 1080p on integrated graphics; <=1200 draw calls; <=400MB JS heap
    after 5 minutes of continuous movement; <=16ms main-thread frame time with no
@@ -58,6 +68,8 @@ src/
     autopilot.ts        deterministic ?fly= flight path, for the soak test
   world/
     contracts.ts        ChunkCoord / ChunkData / ChunkProvider / TierContext
+    noise.ts            gradient noise, fBm, ridged multifractal, domain warp
+    height-field.ts     sampleHeight + the four biome fields. THE terrain.
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
     chunk-worker.ts     the Web Worker entry point
     worker-protocol.ts  the main-thread <-> worker message contract
@@ -131,10 +143,12 @@ placeholder `chunks` and `worker queue` lines without editing `app.ts`.
 `src/world/` is layered so that only one file in it knows about Three.js:
 
 ```
-contracts.ts   types only        importable from a worker and from Node
-chunk-gen.ts   pure functions    the worker and the unit tests run the same code
-worker-pool.ts scheduling        no DOM, no Three; `spawn` is injectable
-chunk-mesh.ts  Three.js          the boundary where payloads become GPU objects
+contracts.ts    types only       importable from a worker and from Node
+noise.ts        pure functions   no Three, no DOM, built on core/hash.ts
+height-field.ts pure functions   sampleHeight; the single source of terrain truth
+chunk-gen.ts    pure functions   the worker and the unit tests run the same code
+worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
+chunk-mesh.ts   Three.js         the boundary where payloads become GPU objects
 ```
 
 That layering is what lets `npm test` cover determinism, priority ordering,
@@ -144,7 +158,42 @@ starts dragging a renderer into every worker.
 
 Payloads cross the boundary as transferred `ArrayBuffer`s, never as clones. If
 you add bulk per-vertex data to `ChunkData`, add it as a typed array and add its
-buffer to `chunkDataTransferables`.
+buffer to `chunkDataTransferables`. A buffer left off that list is not a missed
+optimisation: it gets structured-cloned instead, copying the whole mesh on the
+worker thread and again on the main thread, for every chunk, forever.
+`chunk-gen.test.ts` asserts the list is complete.
+
+### `sampleHeight` is the only description of the ground
+
+`src/world/height-field.ts` owns the shape of the world. The chunk generator
+calls it per vertex inside a worker; `src/scene/cube.ts` and `App`'s default
+camera call it on the main thread. There is deliberately no second, cheaper
+copy: the moment two exist they drift, and the symptom is objects floating
+above or sinking into ground that renders correctly.
+
+Two consequences worth keeping:
+
+- **Nothing on the path from `(x, z)` to a stored vertex may use `Math.pow`,
+  `Math.sin`, `Math.cos` or `Math.exp`.** ECMAScript only *approximates* those,
+  so two engines may disagree in the last bits, and that value ends up in a
+  buffer RULE 2 says must come back identical. `Math.sqrt` and the `Math.SQRT2`
+  / `Math.SQRT1_2` constants are exact and are fine.
+- **Normals come from the height field, not from the triangles.** Triangle
+  normals are discontinuous at every chunk border, and the seam would be a
+  lighting crease along every 64 m boundary in the world. `chunk-gen.ts`
+  samples a one-cell skirt beyond the node and takes central differences, so
+  two neighbouring chunks compute the same normal at a shared vertex because
+  they evaluate the same function at the same world position.
+
+### Surface colour is baked in the worker, not in a shader
+
+Per-vertex colours by slope, altitude and climate, computed in `chunk-gen.ts`
+and uploaded as a `color` attribute against a `vertexColors` material. The
+roadmap's triplanar splat is Phase 11. Keeping the palette here means
+`chunk-gen.ts` stays the single testable source of truth for what the world
+looks like — a Node test asserts that a cliff is grey and a cold peak is white
+without a GPU — and leaves the material dumb enough for Phase 11 to replace
+outright.
 
 ### Chunk draw order is derived from the coordinate
 
@@ -182,6 +231,13 @@ running a command and looking at a browser.
 | `?wireframe=1` | start in wireframe                           |
 | `?fly=`      | autopilot speed in m/s along X; 0 is off       |
 | `?flyleg=`   | seconds the autopilot travels before reversing |
+
+One asymmetry, added in Phase 2a: when `pos` is **absent**, the default `y` is
+read as metres above the ground rather than as an absolute altitude, because a
+fixed default height is underground on one seed and in the clouds on the next.
+An explicit `?pos=` is always absolute — a URL has to mean exactly one thing or
+the screenshot harness stops reproducing. `__app.currentUrl()` serialises the
+resolved absolute position, so copying a link is unaffected.
 
 Malformed values fall back to defaults rather than throwing. In the browser,
 `__app.currentUrl()` returns a link reproducing exactly what is on screen; the
@@ -246,14 +302,35 @@ npm run soak -- --speed=90 --interval=10 --seed=whatever --no-build
 
 Flies `?fly=` along a triangle wave for the requested duration and reports the
 JS heap at intervals (trend, not just endpoint), live and cached chunk counts,
-generation and eviction totals, worst frame time, and whether chunk colours
-where the flight started match after the round trip. Heap samples are taken
-after a forced `HeapProfiler.collectGarbage` over CDP, or the reading would
-measure uncollected garbage rather than a leak.
+generation and eviction totals, worst frame time, geometry volume, and whether
+the chunks where the flight started come back **byte-identical** afterwards.
+Heap samples are taken after a forced `HeapProfiler.collectGarbage` over CDP, or
+the reading would measure uncollected garbage rather than a leak.
+
+The round-trip check hashes each chunk's uploaded **position buffer**. Phase 1
+compared flat colours, which could only ever prove the coordinate hash was pure.
+Hashing the vertex bits proves the thing that is actually expensive to
+reproduce, and it is the direct statement of RULE 2. Keep it for every remaining
+phase.
 
 It exits non-zero on a post-warmup heap slope above 6 MB/min, on a peak heap
-over 400MB, on over 1200 draw calls, on a colour mismatch across the round
+over 400MB, on a geometry budget breach, on a geometry mismatch across the round
 trip, or on any page error.
+
+**GPU-independent budgets are hard failures since Phase 2a**, because they are
+the only budgets this container can honestly judge:
+
+| Budget                        | Limit    | Phase 2a measured |
+| ----------------------------- | -------- | ----------------- |
+| live triangles                | 900,000  | 505,856 peak      |
+| live vertices                 | 500,000  | 268,983 peak      |
+| draw calls                    | 1,200    | 105 peak          |
+| chunk payload bytes           | 96 MB    | 38.4 MB peak      |
+
+Those limits are the measured Phase 2a peaks with roughly 1.8x headroom, for a
+uniform disc of 32x32-segment chunks at load radius 8 / unload radius 10.
+**Phase 2b should reduce them**, because reducing them is what a quadtree is
+for. fps and frame time are deliberately NOT failures: see below.
 
 Like `shots:check`, it guards against passing while nothing happened: a soak run
 over an empty world would show a beautifully flat heap. It fails if fewer than

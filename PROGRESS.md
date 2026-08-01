@@ -7,7 +7,8 @@ state moves between sessions. Update both at the end of every phase.
 | ----- | ---------------------------------- | ------ |
 | 0     | Scaffold and verification harness  | Done   |
 | 1     | Chunk streaming skeleton           | Done   |
-| 2     | Terrain heightfield and LOD        | Next   |
+| 2a    | Terrain heightfield                | Done   |
+| 2b    | Quadtree LOD                       | Next   |
 | 3     | Water                              | -      |
 | 4     | Settlements and road network       | -      |
 | 5     | Road meshes                        | -      |
@@ -295,20 +296,260 @@ runs it is a check nobody reads.
 
 ---
 
-## Phase 2 -- Terrain heightfield and LOD (next)
+## Phase 2a -- Terrain heightfield (done)
 
-Starting points that already exist:
+The roadmap's Phase 2 bundled heightfield + quadtree LOD + `sampleHeight` parity
++ splat material. It was split deliberately. **2a is the heightfield; 2b is the
+quadtree.** This phase keeps the Phase 1 uniform 512 m load radius and builds no
+quadtree, no skirts, no stitching and no LOD transitions.
 
-- `generateChunk` in `src/world/chunk-gen.ts` is the one function to change.
-  Raise `SEGMENTS`, write real Y values, and set `minY` / `maxY`. Everything
-  downstream -- transfer, priority, cancellation, caching, disposal -- already
-  works and is tested.
-- `TierContext.coarser('region')` and `coarser('sector')` are already wired and
-  already enforce RULE 3. Populate them in the worker's `createTierContext` call.
-- `ChunkData` may gain fields (normals, materials). Add them as typed arrays and
-  add their buffers to `chunkDataTransferables`, or they will be cloned instead
-  of transferred.
-- Re-run `npm run soak` and expect `cancelled` to stop being zero. If it is still
-  zero once generation is expensive, the cancellation path has regressed.
-- Add canonical views for terrain and re-run `npm run shots`. The existing ten
-  will change; say so here.
+### Built
+
+- **`src/world/noise.ts`** (new) -- gradient noise on `hash2i`, fBm, ridged
+  multifractal, domain warp, plus `smoothstep` / `lerp` / `clamp`. No Three, no
+  DOM, importable from a worker and from Node.
+- **`src/world/height-field.ts`** (new) -- `sampleHeight(x, z, worldSeed)` and
+  the four low-frequency fields Phase 4 onward reads for biomes:
+  `continentalness` and `erosion` in [-1, 1], `temperature` and `humidity` in
+  [0, 1]. Elevation is a domain-warped fBm continent shelf, plus a ridged
+  multifractal masked to young inland ground, plus hills, plus detail.
+- **`src/world/contracts.ts`** -- the one authorised reshape (see below), plus
+  `normals` and `colors` on `ChunkData`, both added to
+  `chunkDataTransferables` and to `chunkDataBytes`. `CHUNK_DATA_VERSION` is 2.
+- **`src/world/chunk-gen.ts`** -- `SEGMENTS` 1 -> 32 (2 m resolution; 1089
+  vertices and 2048 triangles per chunk). Vertex Y from `sampleHeight`, normals
+  from central differences of the height field over a one-cell skirt, per-vertex
+  colours from slope / altitude / temperature / humidity, real `minY`/`maxY`.
+  `surfaceColor` is exported as a pure function of five scalars so the palette
+  is unit-testable without a GPU.
+- **`src/world/chunk-mesh.ts`** -- `normal` and `color` attributes, a
+  `MeshLambertMaterial` with `vertexColors`, bounds from the real vertical
+  extent. The coordinate-derived `renderOrder` is kept. Adds `hashPositions`,
+  used by the soak's RULE 2 check.
+- **`src/scene/cube.ts`** -- the cube is seated at `sampleHeight(0,0) + 1` via
+  the MAIN-THREAD function, so a main-thread/worker parity bug shows up as a
+  floating or buried cube in `shots/cube-default.png`.
+- **`src/core/params.ts`** -- `hasParam`, so `App` can tell an absent `?pos=`
+  from a supplied one.
+- **`scripts/soak.mjs`** -- round-trip check replaced with a position-buffer
+  hash; four GPU-independent hard budgets added.
+- Two new canonical views, and 90 new unit tests (228 total).
+
+### The contract change
+
+Pre-authorised by the user, made once, and now settled. `ARCHITECTURE.md`
+rule 4 records it. `ChunkCoord` gained `readonly lod`, `chunkKey` became
+`x,z,lod` (`parseChunkKey` rejects a Phase 1 two-component key rather than
+reading it as lod 0), `chunkSizeAt(lod)` was added, and `worldToChunk` /
+`chunkOrigin` / `chunkCenter` became lod-aware. **Throughout Phase 2a `lod` is
+always 0.** It exists so Phase 2b adds behaviour without touching contracts
+again.
+
+### Verified
+
+All run on 2026-08-01 in the dev container, software rendering (SwiftShader).
+
+| Check                    | Result                                                             |
+| ------------------------ | ------------------------------------------------------------------ |
+| `npm test`               | 228 passed, 13 files (138 -> 228)                                   |
+| `npm run build`          | clean `tsc --noEmit`; `dist/` 585.0 kB + a 6.1 kB worker chunk       |
+| `npm run shots:check`    | all 12 views byte-identical, run twice                              |
+| `npm run verify:subpath` | app ready, zero failed requests, 3 workers from the nested mount, 197 chunks streamed |
+| `npm run soak`           | 300s, heap trend **-0.07 MB/min**, **25/25 geometry hashes identical** |
+
+Full 5-minute soak, 45 m/s, seed `soak`:
+
+```
+heap     18.6 MB at t=0 -> 48.4 MB by t=75s -> 48.3 MB at t=300s
+         post-warmup trend -0.07 MB/min (limit 6), peak 48.9 MB (budget 400)
+chunks   live 214 min / 245.0 mean / 247 max
+         3345 generated, 2714 evicted, 384 cached at the cap
+geometry 505,856 live triangles peak (budget 900,000)
+         268,983 live vertices peak (budget 500,000)
+         38.4 MB payload peak (budget 96 MB), 63,780 bytes per chunk
+         105 draw calls peak (budget 1200)
+frames   2206 drawn, worst 900 ms, 2050 over 20 ms
+trip     out to x=6644 m and back to x=101 m; 25/25 position hashes identical
+```
+
+The chunk totals (3345 generated, 2714 evicted, 384 cached) reproduce Phase 1's
+exactly, which is the streaming machinery behaving identically under a payload
+nearly 900x larger.
+
+Live HUD at `?seed=hud-check&pos=0,300,0&look=0,-72&time=3`:
+
+```
+fps           6.5
+frame ms      154.2 avg / 299.9 max / 3 spikes
+draw calls    58
+triangles     116,748
+programs      2
+js heap       18.4 MB
+chunk mem     12.0 MB vertex data
+chunks        197 live / 0 cached / 0 evicted
+chunk geo     403456 tris / 214533 verts live
+worker queue  0 queued / 0 busy / 3 workers
+chunk gen     197 built / 0 cancelled
+```
+
+### Budgets
+
+| Budget                         | Status                                                    |
+| ------------------------------ | --------------------------------------------------------- |
+| <=1200 draw calls              | **Met.** 105 peak.                                          |
+| <=400MB heap after 5 minutes   | **Met.** 48.9 MB peak, trend flat.                          |
+| live triangles <=900,000       | **Met.** 505,856 peak. New this phase, hard failure.        |
+| live vertices <=500,000        | **Met.** 268,983 peak. New this phase, hard failure.        |
+| chunk payload <=96 MB          | **Met.** 38.4 MB peak. New this phase, hard failure.        |
+| 60fps at 1080p                 | **UNVERIFIED.** 4-10 fps at 1280x720 under SwiftShader.     |
+| <=16ms frame, no >4ms GC spike | **UNVERIFIED.** Worst frame 900 ms under SwiftShader.       |
+
+Be blunt about the last two. This container has no GPU and every timing above
+comes from a software rasteriser now pushing half a million triangles of
+fill. They are recorded as unverified, not as passed, exactly as Phase 1 did.
+Someone with a GPU should open `?pos=0,300,0&look=0,-72` at 1080p and read the
+HUD. What CAN be said from these numbers: the frame cost tracks fill rate and
+triangle count, and it got roughly 10x worse than Phase 1 for a ~1000x increase
+in triangles, which is the signature of a fill-bound software rasteriser rather
+than of a scene-complexity problem.
+
+The four geometry budgets were added precisely because they are the part of the
+budget this environment can judge honestly, and because Phase 2b needs a real
+number to land against.
+
+### Screenshots: all ten existing baselines changed, and two were added
+
+Every one of the ten Phase 0/1 baselines is different, and legitimately so:
+the ground went from a flat y=0 plane of hash-coloured quads to a lit,
+vertex-coloured heightfield, and the cube and the default camera now sit on it.
+No canonical view's `params` were edited -- only their pixels changed -- so each
+one still tests exactly what it used to. The two new views are:
+
+- `terrain-mountain-profile` (`?time=3&pos=-3300,175,420&look=120,-8`) -- a
+  mountain in silhouette against the sky with a snow cap, 3.3 km west of the
+  origin on the default seed. All four elevation terms visible at once. If the
+  terrain regresses to noise or to a plane, this view says so first.
+- `terrain-wireframe-relief` (the same viewpoint, `&wireframe=1`) -- the 2 m
+  triangle grid draped over relief. Catches a change to `SEGMENTS`, a broken
+  vertex grid, or a chunk that failed to build, none of which are obvious in the
+  shaded view, and re-tests the coordinate-derived `renderOrder` now that
+  neighbouring chunks are no longer coplanar.
+
+All twelve were inspected by eye before being committed, and `shots:check` was
+run twice afterwards.
+
+### Judgement calls worth knowing about
+
+1. **The origin was a lattice point, and it mattered.** Gradient noise is
+   exactly zero at every integer lattice point, and the world origin is a
+   lattice point of every frequency. The first working build returned
+   `h(0,0) = -9.6` for *every seed* -- the terrain was seed-independent exactly
+   where the default camera looks, which is a silent hole in the whole `?seed=`
+   verification story. Each field now offsets its lattice by a seed-derived
+   amount (`offsetX` / `offsetZ` in `height-field.ts`). The height-field tests
+   assert `field(0, 0, seedA) !== field(0, 0, seedB)` so this cannot come back.
+
+2. **The snow line's sign was inverted, and a test caught it.** The first
+   version put snow *lower* in warm climates. The unit test
+   `puts the snow line higher in a warm climate than a cold one` failed on it.
+   That is the argument for keeping `surfaceColor` a pure function of five
+   scalars instead of inlining the palette into the vertex loop: the property is
+   directly assertable, and no screenshot comparison would have flagged it.
+
+3. **The two `sampleHeight` parity assertions are deliberately different.**
+   Function-to-function is `===`, exact, because both sides compute in float64
+   and anything less is a bug being tolerated -- it is what catches a generator
+   that accumulates `x += step` instead of recomputing `origin + col * step`.
+   Function-to-stored-vertex uses `abs(h) * 1e-6 + 1e-4`, because vertices are
+   `Float32Array` and float32 carries about 1e-5 of absolute precision at these
+   heights; a 1e-6 assertion there could never pass however correct the code.
+   That tolerance is a statement about the storage format, not a knob. A third
+   test asserts neighbouring vertices differ by far more than the tolerance, so
+   the tolerant assertion cannot pass vacuously.
+
+4. **Normals come from the height field, not from the triangles.** Triangle
+   normals are discontinuous at chunk borders and would draw a lighting crease
+   along every 64 m boundary in the world. `chunk-gen.ts` samples a one-cell
+   skirt beyond the node and takes central differences; a unit test asserts the
+   shared edge of two neighbouring chunks gets bit-identical normals from both.
+   This also gives Phase 2b a normal that does not depend on the node's
+   resolution.
+
+5. **No `Math.pow` on the path to a vertex.** ECMAScript only approximates
+   `pow`/`sin`/`cos`/`exp`, so two engines may disagree in the last bits, and
+   these values land in buffers RULE 2 says must come back identical. The
+   gradient table is eight fixed directions built from `Math.SQRT1_2` rather
+   than `cos`/`sin` of a hashed angle, and the sRGB->linear conversion is a
+   polynomial rather than `x^2.4`.
+
+6. **The fractal functions take positional parameters, not an options object.**
+   They run five or six times per height sample and a height sample runs ~1200
+   times per chunk; an options literal per call is millions of short-lived
+   objects per soak run, which is GC pressure in exactly the frame budget this
+   project is trying to hold.
+
+7. **The default camera Y is now relative to the ground; an explicit `?pos=` is
+   not.** With terrain, one fixed default height is underground on one seed and
+   in the clouds on the next. `hasParam(search, 'pos')` makes the distinction,
+   and `currentUrl()` serialises the resolved absolute position, so links still
+   round-trip. This is the only asymmetry in the URL contract and it is
+   documented in `ARCHITECTURE.md`.
+
+8. **Vertex colours, not a shader.** The roadmap's triplanar splat is Phase 11.
+   Baking the palette in the worker keeps `chunk-gen.ts` the single testable
+   source of truth for what the world looks like and leaves the material dumb
+   enough to be replaced outright.
+
+9. **`ChunkData.color` was kept even though nothing renders it.** It is the
+   stable per-chunk identity colour from `chunkColor(coord, seed)`, still used
+   by the streamer's debug sampler. Removing it would have been a second
+   contract reshape in a phase that was authorised exactly one.
+
+10. **One material per chunk was kept, not a shared instance.** A shared
+    material would make `disposeChunkMesh` a no-op nobody notices until it
+    matters, and Three caches the compiled program across identical materials
+    anyway, so the cost is a JS object. Revisit if `programs` in the HUD ever
+    stops reading 2.
+
+### Known gaps, deliberately left
+
+- **No LOD.** Uniform 512 m radius, every chunk full detail, exactly as scoped.
+  Phase 2b owns the quadtree, skirts and stitching. `lod` is plumbed and always
+  0; `chunkSizeAt` and the lod-aware coordinate helpers are already tested at
+  non-zero levels.
+- **`cancelled` is still 0 in the soak**, at every speed tried. Phase 1 expected
+  this to start firing once generation cost something, and it has not: chunk
+  generation is now ~10 ms instead of ~5 us, but SwiftShader renders at 5-10 fps,
+  so three workers still empty the queue faster than the camera can invalidate
+  it. The path is covered by unit tests (queued-cancel, cancel-after-dispatch,
+  `cancelExcept`) and by the streamer test. Expect it to fire for real on
+  hardware that renders fast enough to move the camera quickly, and in Phase 2b
+  when the streamer starts churning nodes across LOD boundaries.
+- **No water.** Roughly a third of the world is below y=0 and currently renders
+  as dark silt. Phase 3 fills it. The basin floor deliberately keeps 30% of its
+  hill relief so there is a lake bed with shape for water to sit in.
+- **No rock texture, no triplanar, no normal maps.** Phase 11.
+- **Lighting in `app.ts` is still the Phase 0 placeholder** (hemisphere +
+  directional). Chunks are now lit by it, so terrain shading will change when
+  Phase 10 replaces it -- expect the baselines to move then, and say so.
+- **`temperature` ignores altitude.** A peak is not colder than the valley below
+  it in the climate field; only the snow-line term in `surfaceColor` accounts
+  for height. Phase 4 may want a lapse rate.
+- The bundle is still one 585 kB chunk plus a 6.1 kB worker. Vite still warns.
+  Not worth splitting until Phase 12 sets an asset budget.
+
+### For Phase 2b
+
+- `ChunkCoord.lod`, `chunkKey`, `chunkSizeAt`, `worldToChunk(x, z, lod)`,
+  `chunkOrigin` and `chunkCenter` are all lod-aware and tested at levels 0, 1, 2
+  and 4. Contracts should not need to change again.
+- `chunk-gen.ts` already generates at any `lod`: `vertexWorldX` / `vertexWorldZ`
+  scale by `chunkSizeAt(coord.lod)` and `SEGMENTS` is fixed, which is what makes
+  a coarse node cheaper than the four fine nodes it replaces.
+- Normals are sampled from the height field, so they are already consistent
+  between levels; only positions need stitching.
+- The four geometry budgets in `scripts/soak.mjs` are the numbers to beat. They
+  should go **down**.
+- `chunk-mesh.ts` sets `renderOrder` from `(x, z)` only. Two nodes at different
+  levels over the same square would collide; fold `lod` in when nodes can
+  overlap during a transition.

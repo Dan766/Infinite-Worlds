@@ -161,7 +161,7 @@ export class WorkerPool implements ChunkProvider {
 
     const job: Job = {
       id: this.nextId++,
-      coord: { x: coord.x, z: coord.z },
+      coord: { x: coord.x, z: coord.z, lod: coord.lod },
       key,
       priority,
       state: 'queued',

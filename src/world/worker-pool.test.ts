@@ -72,7 +72,7 @@ function makePool(workerCount = 1): { pool: WorkerPool; workers: FakeWorker[]; e
   return { pool, workers, errors };
 }
 
-const at = (x: number, z: number): ChunkCoord => ({ x, z });
+const at = (x: number, z: number): ChunkCoord => ({ x, z, lod: 0 });
 const dispatchedCoords = (worker: FakeWorker): string[] =>
   worker.received.map((r) => `${r.coord.x},${r.coord.z}`);
 
@@ -86,7 +86,7 @@ describe('WorkerPool', () => {
 
     worker.finishOldest();
     const data = await promise;
-    expect(data?.coord).toEqual({ x: 0, z: 0 });
+    expect(data?.coord).toEqual({ x: 0, z: 0, lod: 0 });
     expect(pool.stats.completed).toBe(1);
     expect(pool.stats.inFlight).toBe(0);
     pool.dispose();
@@ -205,11 +205,11 @@ describe('WorkerPool', () => {
     const dropA = pool.request(at(2, 0), 20);
     const dropB = pool.request(at(3, 0), 30);
 
-    expect(pool.cancelExcept(new Set(['0,0', '1,0']))).toBe(2);
+    expect(pool.cancelExcept(new Set(['0,0,0', '1,0,0']))).toBe(2);
     expect(await dropA).toBeNull();
     expect(await dropB).toBeNull();
     expect(pool.stats.queued).toBe(1);
-    expect(pool.outstandingKeys().sort()).toEqual(['0,0', '1,0']);
+    expect(pool.outstandingKeys().sort()).toEqual(['0,0,0', '1,0,0']);
     void keep;
     pool.dispose();
   });

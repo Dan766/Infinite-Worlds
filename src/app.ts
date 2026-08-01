@@ -11,13 +11,14 @@ import * as THREE from 'three';
 import { Autopilot } from './core/autopilot';
 import { CameraRig } from './core/camera-rig';
 import { Loop } from './core/loop';
-import { parseParams, serializeParams, type AppParams } from './core/params';
+import { hasParam, parseParams, serializeParams, type AppParams } from './core/params';
 import { FrameTimer } from './debug/frame-timer';
 import { formatCount, Hud, HudOrder, readHeapMb } from './debug/hud';
 import { DebugPanel } from './debug/panel';
 import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
+import { sampleHeight } from './world/height-field';
 
 declare global {
   interface Window {
@@ -54,7 +55,17 @@ export class App {
     this.params = parseParams(search);
 
     this.renderer = new Renderer(canvas);
-    this.rig = new CameraRig(this.params.pos, this.params.look);
+    // With terrain, one fixed default camera height is underground on one seed
+    // and in the clouds on the next, so the DEFAULT Y is read as metres above
+    // the ground. An explicit `?pos=` is always absolute -- a URL has to mean
+    // exactly one thing or the whole screenshot harness stops reproducing.
+    const start = hasParam(search, 'pos')
+      ? this.params.pos
+      : {
+          ...this.params.pos,
+          y: sampleHeight(this.params.pos.x, this.params.pos.z, this.params.seedHash) + this.params.pos.y,
+        };
+    this.rig = new CameraRig(start, this.params.look);
     this.cube = new CubeScene(this.params.seedHash);
     this.hud = new Hud(hudElement, { visible: this.params.hud });
     this.panel = new DebugPanel({ visible: this.params.panel, title: 'Infinite World' });
@@ -171,6 +182,11 @@ export class App {
       cancelledChunkRequests: chunks.cancelledRequests,
       evictedChunks: chunks.evicted,
       chunkBytes: chunks.bytes,
+      // From the chunk payloads, not from the renderer: these are what the
+      // world costs regardless of which GPU (or software rasteriser) draws it,
+      // which is why the soak can budget them and cannot budget frame time.
+      chunkTriangles: chunks.triangles,
+      chunkVertices: chunks.vertices,
       workers: chunks.workers,
       cameraX: camera.x,
       cameraZ: camera.z,
@@ -195,6 +211,23 @@ export class App {
    */
   sampleChunkColors(worldX: number, worldZ: number, radius: number): (readonly number[] | null)[] {
     return this.streamer.sampleColors(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
+  /**
+   * Hashes of the position buffers of the chunks in a square around a world
+   * position, as actually resident. `null` where the chunk is not loaded.
+   *
+   * The soak test compares this before and after a round trip. Byte-identical
+   * geometry after an unload and a regeneration is the strongest statement of
+   * RULE 2 available without shipping the buffers out of the page.
+   */
+  sampleChunkGeometry(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.samplePositionHashes(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
+  /** Ground height at a world position, from the main thread. For debugging parity. */
+  groundHeight(worldX: number, worldZ: number): number {
+    return sampleHeight(worldX, worldZ, this.params.seedHash);
   }
 
   private renderFrame(wallDt: number): void {
