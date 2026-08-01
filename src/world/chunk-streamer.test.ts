@@ -378,7 +378,7 @@ describe('ChunkStreamer', () => {
 
     await flyTo(0, 0);
     const before = streamer.sampleColors(coords);
-    const geometryBefore = streamer.samplePositionHashes(coords);
+    const geometryBefore = streamer.sampleGeometryHashes(coords);
     expect(before.every((c) => c !== null)).toBe(true);
     expect(geometryBefore.every((h) => h !== null)).toBe(true);
 
@@ -388,7 +388,7 @@ describe('ChunkStreamer', () => {
     await flyTo(0, 0);
     expect(streamer.sampleColors(coords)).toEqual(before);
     // The stronger statement: the vertex bits themselves came back identical.
-    expect(streamer.samplePositionHashes(coords)).toEqual(geometryBefore);
+    expect(streamer.sampleGeometryHashes(coords)).toEqual(geometryBefore);
     streamer.dispose();
   });
 
@@ -477,7 +477,7 @@ describe('ChunkStreamer', () => {
   it('reports geometry as null for nodes that are not resident', async () => {
     const { streamer, flyTo } = makeStreamer({ viewDistance: 128 });
     await flyTo(0, 0);
-    const hashes = streamer.samplePositionHashes([
+    const hashes = streamer.sampleGeometryHashes([
       { x: 0, z: 0, lod: 0 },
       { x: 500, z: 500, lod: 0 },
     ]);
@@ -561,14 +561,14 @@ describe('ChunkStreamer', () => {
     const coords = ChunkStreamer.coordsAround(0, 0, 1);
     await flyTo(0, 0);
     const before = streamer.sampleColors(coords);
-    const geometryBefore = streamer.samplePositionHashes(coords);
+    const geometryBefore = streamer.sampleGeometryHashes(coords);
 
     streamer.reload();
     expect(streamer.liveCount).toBe(0);
 
     await flyTo(0, 0);
     expect(streamer.sampleColors(coords)).toEqual(before);
-    expect(streamer.samplePositionHashes(coords)).toEqual(geometryBefore);
+    expect(streamer.sampleGeometryHashes(coords)).toEqual(geometryBefore);
     streamer.dispose();
   });
 
@@ -579,7 +579,7 @@ describe('ChunkStreamer', () => {
     // reasons that have nothing to do with determinism.
     const { streamer, flyTo } = makeStreamer({ viewDistance: 4096 });
     await flyTo(0, 0);
-    const hashes = streamer.samplePositionHashes(ChunkStreamer.coordsAround(0, 0, 2));
+    const hashes = streamer.sampleGeometryHashes(ChunkStreamer.coordsAround(0, 0, 2));
     expect(hashes).toHaveLength(25);
     expect(hashes.every((h) => h !== null)).toBe(true);
     streamer.dispose();

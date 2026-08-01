@@ -36,8 +36,8 @@
  *   hills      mid-frequency fBm, damped by erosion
  *   detail     high-frequency fBm, small amplitude, everywhere
  *
- * Heights are absolute metres. There is no water plane in Phase 2a, so negative
- * ground simply reads as a basin; Phase 3 fills it.
+ * Heights are absolute metres, measured from `SEA_LEVEL`. Ground below it is
+ * sea floor: Phase 3a puts a water surface over exactly that ground.
  *
  * ---------------------------------------------------------------------------
  * DETERMINISM
@@ -49,6 +49,32 @@
 
 import { hash2i, hashCombine } from '../core/hash';
 import { clamp, fbm2, hashUnit, lerp, ridged2, smoothstep, unitToZeroOne, warp2 } from './noise';
+
+// ---------------------------------------------------------------------------
+// Sea level
+// ---------------------------------------------------------------------------
+
+/**
+ * The altitude of the sea, in absolute world metres. THE definition of where
+ * the coastline is.
+ *
+ * Until Phase 3a this was implicit: `sampleHeight` returned negative values in
+ * basins, `surfaceColor` faded silt into sand somewhere around zero, and
+ * nothing else knew. Two independent hardcoded zeros is exactly how a shoreline
+ * ends up with the water surface and the sand band in different places, so
+ * there is now one constant and both read it.
+ *
+ * It lives here rather than in `chunk-gen.ts` because it is a property of the
+ * WORLD, not of how a chunk is meshed: the elevation model's `SHELF_FLOOR` and
+ * `SHELF_CEILING` are quoted relative to it, Phase 3b's rivers will drain to
+ * it, and Phase 8's swimming test will be against it.
+ *
+ * Changing it moves the coastline coherently -- the water surface, the sand
+ * band and the snow line all shift together -- but it moves every committed
+ * screenshot baseline with it, so treat it as a world-defining constant rather
+ * than a tuning knob.
+ */
+export const SEA_LEVEL = 0;
 
 // ---------------------------------------------------------------------------
 // Per-field seeds

@@ -76,6 +76,26 @@
       "name": "lod-rings-wireframe",
       "params": "?time=3&pos=-1400,2600,420&look=0,-88&wireframe=1",
       "expect": "Phase 2b. Straight down from 2.6 km, in wireframe: the quadtree's structure itself. The bright centre is lod 0, whose 2 m cells are sub-pixel at this scale and so read as solid fill; each step outward doubles the node size and halves the apparent line density. The stepped boundaries are the quadtree staircase. If the selection ever collapses to a single level, inverts, or stops tiling, this is the view that says so instantly -- and nothing else in the harness would."
+    },
+    {
+      "name": "water-coast",
+      "params": "?time=3&pos=3000,150,1800&look=-90,-6",
+      "expect": "Phase 3a. A coastline 900 m east of a headland on the default seed, with open sea beyond it. THE view that says the sea exists and is in the right place: sand at the waterline, turquoise shallows tracing the shore, deep navy offshore, and no hard line anywhere along the intersection. Every earlier canonical view was chosen before there was any water, and none of them frames a shoreline; without this one, a phase that stopped emitting water entirely would move a few pixels of colour and pass."
+    },
+    {
+      "name": "water-shoreline-shallow",
+      "params": "?time=3&pos=3900,5.5,1800&look=-90,-3",
+      "expect": "Phase 3a. THE SHALLOW-PITCH SHORELINE VIEW: standing on the beach 5.5 m above sea level, 3 degrees below the horizon, with the waterline a few metres away and the sea running to the horizon. This is the angle at which a hard intersection between the water plane and the ground is most visible -- a grazing view stretches a one-metre depth band across hundreds of pixels -- so it is where depth-derived alpha earns its place. If the alpha ramp is ever flattened, or given a non-zero floor, this view grows a crisp edge along the shore and says so."
+    },
+    {
+      "name": "water-bay-aerial",
+      "params": "?time=3&pos=3400,800,1800&look=-90,-30",
+      "expect": "Phase 3a. The whole bay from 800 m, where the depth shading is the subject: shallows follow the coastline as a turquoise band and the middle of the bay is nearly opaque navy. A flat, uniformly coloured sea passes `water-coast` and fails here. It also shows the water surface tracking a meandering coastline across many nodes at several levels at once -- if a node ever failed to emit water it would appear as a square hole in the sea."
+    },
+    {
+      "name": "water-bay-wireframe",
+      "params": "?time=3&pos=3400,800,1800&look=-90,-30&wireframe=1",
+      "expect": "Phase 3a. The same bay in wireframe: the structural view of which nodes carry water at all. Water triangles are only emitted over ground below sea level, so the dense water grid stops at the coastline and inland nodes show terrain wireframe alone -- that is the discipline the whole phase's draw-call budget rests on, and it is invisible in every shaded view. Also catches a change to the water grid's resolution, which is deliberately the terrain's."
     }
   ]
 }

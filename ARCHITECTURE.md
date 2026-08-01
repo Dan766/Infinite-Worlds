@@ -72,7 +72,7 @@ src/
   world/
     contracts.ts        ChunkCoord / ChunkData / ChunkProvider / TierContext
     noise.ts            gradient noise, fBm, ridged multifractal, domain warp
-    height-field.ts     sampleHeight + the four biome fields. THE terrain.
+    height-field.ts     sampleHeight + SEA_LEVEL + the four biome fields. THE terrain.
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
     chunk-worker.ts     the Web Worker entry point
     worker-protocol.ts  the main-thread <-> worker message contract
@@ -261,6 +261,69 @@ and the coincident aprons are bit-identical, so their z-fight is invisible.
 Popping is handled by threshold tuning alone -- no geomorphing, no custom
 shader, so Phase 11 is free to replace the material outright.
 
+### `SEA_LEVEL` is one constant, and the water is per-chunk geometry
+
+Sea level was implicit at height 0 until Phase 3a: `sampleHeight` returned
+negative values in basins and `surfaceColor` faded silt into sand somewhere
+near zero, with nothing connecting the two. `height-field.ts` now exports
+`SEA_LEVEL`, and the surface palette's altitude bands, the snow line and the
+water surface all read it. Changing it moves the coastline coherently. It lives
+with the height field rather than with the mesher because it is a property of
+the world -- Phase 3b's rivers drain to it and Phase 8's swimming test is
+against it.
+
+**Water is generated per chunk, in the worker, like everything else.** A single
+plane the size of the view distance is the obvious alternative and is worse in
+three specific ways: it has to be clipped to whatever the quadtree currently
+covers, it cannot carry per-vertex depth shading, and its extent is a function
+of camera position, which is exactly the state RULE 2 keeps out of chunk
+content. Per-chunk geometry gets all three for free -- water exists exactly
+where chunks do -- and the soak's round-trip hash covers it.
+
+Two things terrain needs and water does not:
+
+- **No skirt.** A crack at a level boundary exists because two nodes sample a
+  *curved* surface at different rates. The water surface is the plane
+  `y = SEA_LEVEL` at every level, so neighbours agree on their shared edge
+  exactly and there is nothing to crack.
+- **No normal in the payload.** Every water normal is +Y; `chunk-mesh.ts` fills
+  the attribute in on the main thread rather than shipping 1,089 copies of a
+  constant through `postMessage` for every coastal node in the world.
+
+**The one discipline that keeps this inside budget: a node with no ground below
+sea level emits zero water vertices and gets no water mesh at all.** About nine
+tenths of the world is inland. An empty water plane on every node would cost a
+draw call each to draw nothing, and draw calls are the budget this project is
+actually near.
+
+The water grid is the terrain grid, at full `SEGMENTS` resolution, which looks
+wasteful for a flat surface and is not negotiable. A quad is emitted when any of
+its four corners is below sea level, and the rendered terrain inside a quad is
+the linear interpolation of those same four corners -- so that test is exactly
+"rendered ground dips below the sea here". Two properties follow: no ground that
+renders below sea level is left uncovered, and every emitted quad has at least
+one submerged corner and therefore some non-zero alpha. A coarser water grid
+breaks the second (a quad whose corners are all dry shades to alpha 0 and leaves
+a patch of bare sea floor), and every repair for that either reintroduces a hard
+edge at the shore or makes a vertex's colour depend on which side of a chunk
+border it was computed from, which is a seam along every boundary in the world.
+
+**The shoreline is soft because alpha is exactly zero at zero depth.** Opacity
+is `WATER_ALPHA_MAX * sqrt(depth / WATER_ALPHA_FULL_DEPTH)`, so the sea fades
+out as the floor rises to meet it instead of stopping at some minimum opacity.
+That, and not a shader, is what stops the intersection reading as a line. It
+also means the water plane may overlap the beach harmlessly: where the ground is
+above sea level the water is both occluded and transparent.
+
+**Water is the project's first transparent geometry, and it carries the same
+coordinate-derived `renderOrder` the terrain does.** Three sorts transparent
+draws by `renderOrder`, then view depth, then *object id* -- construction order,
+i.e. whichever worker finished first. A perfectly flat surface makes depth ties
+easy to arrange, so without an explicit order `shots:check` would go
+intermittently red exactly as it did in Phase 1. Ordering water back-to-front is
+neither needed nor attempted: the sea is one plane cut into disjoint squares, so
+no two water fragments overlap and blend order between nodes is unobservable.
+
 ### Surface colour is baked in the worker, not in a shader
 
 Per-vertex colours by slope, altitude and climate, computed in `chunk-gen.ts`
@@ -347,6 +410,12 @@ Three things make byte-identical comparison possible:
 - **Captures wait on `window.__worldReady`, never on a timer.** A sleep-based
   harness starts producing flaky diffs as soon as a phase adds async work.
 
+Captures wait up to 120 s for `window.__worldReady` (raised from 30 s in Phase
+3a). That is a wall-clock allowance for a software rasteriser, not a correctness
+threshold -- waiting on readiness is what makes the byte comparison meaningful,
+so a generous limit loosens nothing, while a harness that goes red under load
+teaches people to re-run until green.
+
 `shots:check` also guards the two ways a screenshot harness can pass while being
 broken: a frame that rendered nothing (measured as distinct-colour count), and
 all canonical views collapsing to the same image. Both would otherwise sail
@@ -403,43 +472,70 @@ The run now also fails if the shallow leg produced fewer than 3 samples or
 peaked under 55 draw calls, so a canary pointed at nothing is a failure rather
 than a pass.
 
-The round-trip check hashes each chunk's uploaded **position buffer**. Phase 1
-compared flat colours, which could only ever prove the coordinate hash was pure.
-Hashing the vertex bits proves the thing that is actually expensive to
-reproduce, and it is the direct statement of RULE 2. Keep it for every remaining
-phase.
+The round-trip check hashes each chunk's uploaded **position buffer**, and since
+Phase 3a its **water positions and water colours** as well. Phase 1 compared flat
+colours, which could only ever prove the coordinate hash was pure. Hashing the
+vertex bits proves the thing that is actually expensive to reproduce, and it is
+the direct statement of RULE 2. Keep it for every remaining phase.
 
-It exits non-zero on a post-warmup heap slope above 6 MB/min, on a peak heap
-over 400MB, on a geometry budget breach, on a geometry mismatch across the round
+**The flight starts over water, and that is load-bearing.** The autopilot flies
+along X from a fixed start; on seed `soak` the line `z = 0` is dry for all
+6.75 km of it, so every water assertion the phase added would have passed by
+never encountering any sea. The start moved to `(-7000, -3500)`, which is 3.5 km
+of open water with a coastline and mountains beyond it, and the run now fails if
+no water was generated, if no water was ever *drawn*, if the shallow leg drew
+none, or if the round-tripped chunks contained no sea. Water existing and water
+rendering are different claims; `waterDrawCalls` is counted from
+`Object3D.onBeforeRender`, so it measures the second one.
+
+It exits non-zero on a post-warmup slope above 6 MB/min in the heap NOT
+accounted for by chunk payload, on a peak heap over 400MB, on a geometry budget breach, on a geometry mismatch across the round
 trip, or on any page error.
 
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit     | Phase 2b measured (shallow leg) |
+| Budget                        | Limit     | Phase 3a measured (over water)  |
 | ----------------------------- | --------- | ------------------------------- |
-| live triangles                | 1,300,000 | 724,480 peak                    |
-| live vertices                 | 620,000   | 345,543 peak                    |
-| draw calls                    | 200       | 106 peak                        |
-| chunk payload bytes           | 76 MB     | 56.6 MB peak                    |
+| live triangles                | 2,100,000 | 1,229,124 peak                  |
+| live vertices                 | 1,040,000 | 610,917 peak                    |
+| draw calls                    | 500       | 292 peak (199 terrain + 93 water) |
+| chunk payload bytes           | 100 MB    | 92.5 MB peak                    |
 
-Those limits are the Phase 2b peaks with roughly 1.8x headroom, measured on the
-shallow-pitch leg at a 4 km view distance. They are deliberately far tighter
-than the project ceiling of 1200 draw calls: the ceiling says what the hardware
-can take, these say what the world costs today, so a regression fails instead of
-quietly consuming slack.
+The first three are the Phase 3a peaks with roughly 1.7x headroom, measured on
+a flight whose shallow-pitch leg crosses 3.5 km of open sea. They are still far
+tighter than the project ceiling of 1200 draw calls: the ceiling says what the
+hardware can take, these say what the world costs today, so a regression fails
+instead of quietly consuming slack.
 
-The triangle and vertex limits went UP against Phase 2a, which looks like the
-wrong direction until you see what changed underneath: the view distance went
-from 512 m to 4096 m -- 64x the area -- for 1.43x the triangles and the SAME
-draw calls, and each node now carries a skirt on top of that. Per square
-kilometre of world, triangles fell about 45x and draw calls about 64x.
+**All four Phase 2b limits were breached on purpose, and 2b said so in
+advance.** Water is one extra mesh per submerged node, so draw calls roughly
+double over open sea, and a node entirely at sea carries 55,068 bytes and 2,048
+triangles more than an inland one. The instruction was to re-derive with a
+stated number rather than raise them quietly; the numbers are above.
 
-`chunk payload bytes` is structurally capped rather than free to drift: the LRU
-cap is 512 nodes over a resident set of ~300, so at 74,676 bytes a node the
-ceiling is about 61 MB. Phase 2a's 96 MB was therefore unreachable and could
-never have fired; 76 MB sits above the worst plausible transient and below
-anything a per-node size regression would produce.
+`chunk payload bytes` is the one that cannot have 1.7x headroom, and pretending
+otherwise would make it unfireable -- the mistake Phase 2a made and 2b caught.
+It is structurally capped: 512 cached nodes over a live set of ~318, at 129,744
+bytes for the most expensive possible node, puts the absolute ceiling near
+108 MB. 100 MB is 1.08x the measured peak and below that ceiling, so a per-node
+size regression still trips it. The cost of that tightness is real: a flight
+spending its whole length over open ocean rather than half of it would
+legitimately approach 104 MB. `bytes per chunk` in the soak report is the figure
+that separates a genuine regression from a wetter route.
+
+**The heap trend is fitted on heap MINUS chunk payload since Phase 3a.** The
+resident payload now depends on where the camera is -- a node at sea costs 74%
+more than an inland one -- so on a flight that starts at sea, crosses a coast
+and comes back, the raw heap is a V. A least-squares line through a V whose
+warm-up window clips one arm reported +13.3 MB/min on a run that ended 8 MB
+above where it started. Nothing was wrong with the window; the quantity was
+wrong. A leak is heap the streamer is not knowingly holding, so that is what
+gets the trend line, and the payload keeps its own hard budget. This is a
+stronger leak detector, not a weaker one: a retained mesh whose cache entry has
+already been evicted -- exactly what explicit disposal exists to prevent --
+leaves the streamer's byte count and stays in the heap, so it shows up here and
+in nothing else. The raw trend is still printed.
 
 fps and frame time are deliberately NOT failures: see below.
 
@@ -461,7 +557,8 @@ cheaper to find in Phase 6 than in Phase 11.
 npm run dev            # dev server on :5173
 npm run build          # tsc --noEmit && vite build
 npm run preview        # serve dist/ on :4173
-npm test               # vitest
+npm test               # vitest (60 s per-test timeout; the streaming tests
+                       #  generate hundreds of real chunks inside one `it`)
 npm run shots          # write screenshot baselines
 npm run shots:check    # verify nothing visual changed
 npm run verify:subpath # verify the build survives a nested deploy path

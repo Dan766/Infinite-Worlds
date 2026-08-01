@@ -12,7 +12,8 @@
 
 import * as THREE from 'three';
 import { hashCombine } from '../core/hash';
-import { skirtDepthOf } from './chunk-gen';
+import { skirtDepthOf, WATER_COLOR_COMPONENTS } from './chunk-gen';
+import { SEA_LEVEL } from './height-field';
 import { chunkDataBytes, chunkOrigin, chunkSizeAt, type ChunkCoord, type ChunkData } from './contracts';
 
 /**
@@ -99,6 +100,144 @@ function createChunkGeometry(data: ChunkData): THREE.BufferGeometry {
   return geometry;
 }
 
+// ---------------------------------------------------------------------------
+// Water
+// ---------------------------------------------------------------------------
+
+/**
+ * Water meshes actually rasterised since the last reset.
+ *
+ * THE THIRD ANTI-VACUITY GUARD IN THIS PROJECT, and the reason it is a counter
+ * rather than an assumption. Phase 0 shipped a screenshot harness that compared
+ * five blank frames byte-for-byte and called it a pass; Phase 2a's soak
+ * measured draw calls from a camera pointed at the ground; Phase 2b's draw-call
+ * budget could not fire. The equivalent failure here is a phase whose every
+ * water check passes because the flight never went near the sea, and no
+ * geometry test can rule that out -- generating water and RENDERING water are
+ * different claims.
+ *
+ * `Object3D.onBeforeRender` fires once per object that survives frustum culling
+ * and is actually submitted, so counting it is a direct measurement of "water
+ * reached the screen". The soak fails if this stays at zero.
+ *
+ * It is a module-level counter, not world state: nothing generated depends on
+ * it, and resetting it cannot change a single vertex.
+ */
+let waterDraws = 0;
+
+/** Water meshes drawn since `resetWaterDraws`. Read straight after a render. */
+export function waterDrawsSinceReset(): number {
+  return waterDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetWaterDraws(): void {
+  waterDraws = 0;
+}
+
+const countWaterDraw = (): void => {
+  waterDraws++;
+};
+
+/**
+ * Phase 3a: the water surface material.
+ *
+ * `transparent` with a four-component vertex colour is the entire depth-fade
+ * mechanism: Three defines `USE_COLOR_ALPHA` when the colour attribute's
+ * itemSize is 4 and multiplies the fragment's alpha by it, so opacity comes
+ * from `waterColor(depth)` in the worker and there is no custom shader to keep
+ * in step with it.
+ *
+ * `depthWrite: false` because a transparent surface that writes depth occludes
+ * whatever is drawn after it. Nothing else in the scene is transparent yet, so
+ * this costs nothing today and stops Phase 7's foliage or Phase 10's
+ * atmosphere from being mysteriously clipped by the sea.
+ *
+ * `DoubleSide` is safe here in a way it explicitly was NOT for the Phase 2b
+ * skirt. The skirt broke because two same-level neighbours put coincident
+ * aprons in one plane and a lit front face z-fought a normal-flipped black back
+ * face. The water surface has no coincident partner -- adjacent nodes abut, they
+ * do not overlap -- so the only thing double-siding changes is that a camera
+ * below sea level sees the underside of the sea instead of seeing straight
+ * through it into the sky.
+ *
+ * Lambert rather than Basic so the sea is lit by the same lights as the ground
+ * and follows Phase 10 when it replaces them. The surface is flat, so this is
+ * a constant factor over the whole world -- which is exactly what makes it safe
+ * to leave the normal off the payload (see `createWaterGeometry`).
+ */
+function createWaterMaterial(): THREE.MeshLambertMaterial {
+  return new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
+/**
+ * The water submesh's geometry, or `null` when this node has no water.
+ *
+ * `null` is not a tidiness detail: it is what makes an inland node cost zero
+ * draw calls. Roughly nine tenths of the world is inland, so building an empty
+ * mesh "for uniformity" would double the project's draw calls to draw nothing.
+ *
+ * THE NORMAL IS BUILT HERE, NOT SHIPPED. Every water normal is +Y, so sending
+ * 1,089 copies of it through `postMessage` for every coastal node in the world
+ * would be pure redundancy in the one budget (payload bytes) this project
+ * actually measures. It is filled in on the main thread instead -- the same
+ * heap either way, but nothing crosses the worker boundary and nothing has to
+ * be accounted for in `chunkDataBytes`.
+ */
+function createWaterGeometry(data: ChunkData): THREE.BufferGeometry | null {
+  if (data.waterIndices.length === 0) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(data.waterPositions, 3));
+  geometry.setAttribute(
+    'color',
+    new THREE.BufferAttribute(data.waterColors, WATER_COLOR_COMPONENTS),
+  );
+  geometry.setAttribute('normal', upNormals(data.waterPositions.length / 3));
+  geometry.setIndex(new THREE.BufferAttribute(data.waterIndices, 1));
+
+  // Bounds from the vertices that were actually emitted rather than from the
+  // node square: a node with one submerged corner has water over one corner,
+  // and telling the frustum test the truth is what keeps its draw call
+  // proportional to what is on screen.
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  const p = data.waterPositions;
+  for (let i = 0; i < p.length; i += 3) {
+    const x = p[i] as number;
+    const z = p[i + 2] as number;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  geometry.boundingBox = new THREE.Box3(
+    new THREE.Vector3(minX, SEA_LEVEL, minZ),
+    new THREE.Vector3(maxX, SEA_LEVEL, maxZ),
+  );
+  const halfX = (maxX - minX) / 2;
+  const halfZ = (maxZ - minZ) / 2;
+  geometry.boundingSphere = new THREE.Sphere(
+    new THREE.Vector3(minX + halfX, SEA_LEVEL, minZ + halfZ),
+    Math.sqrt(halfX * halfX + halfZ * halfZ),
+  );
+  return geometry;
+}
+
+/** A `normal` attribute of `count` copies of +Y. */
+function upNormals(count: number): THREE.BufferAttribute {
+  const normals = new Float32Array(count * 3);
+  for (let i = 1; i < normals.length; i += 3) normals[i] = 1;
+  return new THREE.BufferAttribute(normals, 3);
+}
+
 /**
  * A hash of the vertex positions actually uploaded to the GPU.
  *
@@ -113,9 +252,31 @@ function createChunkGeometry(data: ChunkData): THREE.BufferGeometry {
  * bits, including the sign of a zero.
  */
 export function hashPositions(positions: Float32Array): number {
-  const words = new Uint32Array(positions.buffer, positions.byteOffset, positions.length);
-  let hash = 0x811c9dc5 >>> 0;
+  return hashFloats(0x811c9dc5 >>> 0, positions);
+}
+
+function hashFloats(seed: number, values: Float32Array): number {
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length);
+  let hash = seed >>> 0;
   for (let i = 0; i < words.length; i++) hash = hashCombine(hash, words[i] as number);
+  return hash >>> 0;
+}
+
+/**
+ * One hash covering everything about a node that is expensive to reproduce:
+ * the terrain vertices, the water vertices, and the water's depth shading.
+ *
+ * The soak compares this before and after a round trip. Water is folded in
+ * deliberately -- if it were left out, the RULE 2 check would keep passing
+ * while the sea came back a different shape, and Phase 3b is about to start
+ * cutting river channels through exactly this ground. `waterPositions` is what
+ * encodes WHICH cells the shoreline covered; `waterColors` is what encodes how
+ * deep it thought they were.
+ */
+export function hashChunkGeometry(data: ChunkData): number {
+  let hash = hashPositions(data.positions);
+  hash = hashFloats(hash, data.waterPositions);
+  hash = hashFloats(hash, data.waterColors);
   return hash >>> 0;
 }
 
@@ -123,16 +284,22 @@ export interface ChunkMesh {
   readonly mesh: THREE.Mesh;
   readonly geometry: THREE.BufferGeometry;
   readonly material: THREE.MeshLambertMaterial;
+  /** The water submesh, or null on a node with no ground below sea level. */
+  readonly waterMesh: THREE.Mesh | null;
+  readonly waterGeometry: THREE.BufferGeometry | null;
+  readonly waterMaterial: THREE.MeshLambertMaterial | null;
   /** Stable per-chunk identity colour, sRGB. Not what the surface is painted with. */
   readonly color: readonly [number, number, number];
-  /** Hash of the uploaded position buffer, for the RULE 2 round-trip check. */
-  readonly positionsHash: number;
-  /** Bytes of vertex data held by this chunk. */
+  /** Hash of the uploaded terrain and water buffers, for the RULE 2 round trip. */
+  readonly geometryHash: number;
+  /** Bytes of vertex data held by this chunk, terrain and water. */
   readonly bytes: number;
-  /** Triangles in this chunk's geometry. */
+  /** Triangles in this chunk's geometry, terrain and water. */
   readonly triangles: number;
-  /** Vertices in this chunk's geometry. */
+  /** Vertices in this chunk's geometry, terrain and water. */
   readonly vertices: number;
+  /** Triangles in the water submesh alone. Zero on an inland node. */
+  readonly waterTriangles: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -149,15 +316,52 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
   mesh.matrixAutoUpdate = false;
   mesh.updateMatrix();
 
+  const waterGeometry = createWaterGeometry(data);
+  let waterMesh: THREE.Mesh | null = null;
+  let waterMaterial: THREE.MeshLambertMaterial | null = null;
+  if (waterGeometry !== null) {
+    waterMaterial = createWaterMaterial();
+    waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+    waterMesh.name = `water ${data.coord.x},${data.coord.z},${data.coord.lod}`;
+
+    // WHY WATER GETS AN EXPLICIT renderOrder TOO, AND WHY IT IS THE SAME
+    // FUNCTION. Three sorts TRANSPARENT draws by groupOrder, then renderOrder,
+    // then view depth, then OBJECT ID -- and object ids are handed out in
+    // construction order, which is whichever worker finished first. Two water
+    // meshes at equal depth (trivially arranged: any two nodes symmetric about
+    // the view axis, on a surface that is perfectly flat by construction) would
+    // therefore fall back to a run-to-run coin flip. That is precisely the
+    // flake Phase 1 chased down on the wireframe views and Phase 2b had to fix
+    // again when a node and its parent collided.
+    //
+    // Ordering water back-to-front is not needed and not attempted: the sea is
+    // one plane cut into disjoint squares, so no two water fragments ever
+    // overlap and blend order between nodes cannot be observed.
+    waterMesh.renderOrder = chunkRenderOrder(data.coord);
+    waterMesh.matrixAutoUpdate = false;
+    waterMesh.updateMatrix();
+    waterMesh.onBeforeRender = countWaterDraw;
+
+    // Parented to the terrain mesh rather than added to the scene separately,
+    // so every add/remove/dispose the streamer already does carries the water
+    // with it. Frustum culling still tests each mesh against its own bounds --
+    // Three projects children whether or not the parent survived the cull.
+    mesh.add(waterMesh);
+  }
+
   return {
     mesh,
     geometry,
     material,
+    waterMesh,
+    waterGeometry,
+    waterMaterial,
     color: data.color,
-    positionsHash: hashPositions(data.positions),
+    geometryHash: hashChunkGeometry(data),
     bytes: chunkDataBytes(data),
-    triangles: data.indices.length / 3,
-    vertices: data.positions.length / 3,
+    triangles: (data.indices.length + data.waterIndices.length) / 3,
+    vertices: (data.positions.length + data.waterPositions.length) / 3,
+    waterTriangles: data.waterIndices.length / 3,
   };
 }
 
@@ -172,6 +376,9 @@ export function disposeChunkMesh(entry: ChunkMesh): void {
   entry.mesh.removeFromParent();
   entry.geometry.dispose();
   disposeMaterial(entry.material);
+  if (entry.waterMesh !== null) entry.waterMesh.removeFromParent();
+  entry.waterGeometry?.dispose();
+  if (entry.waterMaterial !== null) disposeMaterial(entry.waterMaterial);
 }
 
 function disposeMaterial(material: THREE.Material): void {

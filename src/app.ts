@@ -18,6 +18,7 @@ import { DebugPanel } from './debug/panel';
 import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
+import { resetWaterDraws, waterDrawsSinceReset } from './world/chunk-mesh';
 import { sampleHeight } from './world/height-field';
 
 declare global {
@@ -50,6 +51,14 @@ export class App {
   private readonly loop: Loop;
 
   private renderedFrames = 0;
+  /**
+   * Water submeshes actually rasterised in the last frame.
+   *
+   * Not a cosmetic HUD line: the soak fails if this never rises above zero, so
+   * a Phase 3a whose flight happens to miss the sea is a failure rather than a
+   * green run that proved nothing. See `chunk-mesh.ts`.
+   */
+  private waterDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -187,6 +196,13 @@ export class App {
       // which is why the soak can budget them and cannot budget frame time.
       chunkTriangles: chunks.triangles,
       chunkVertices: chunks.vertices,
+      // Phase 3a. `waterNodes` is what was generated and resident;
+      // `waterDrawCalls` is what actually reached the rasteriser. The soak
+      // needs both -- a world full of sea that is never on screen would pass
+      // every water check ever written against the first number alone.
+      waterNodes: chunks.waterNodes,
+      waterTriangles: chunks.waterTriangles,
+      waterDrawCalls: this.waterDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -242,7 +258,19 @@ export class App {
    * RULE 2 available without shipping the buffers out of the page.
    */
   sampleChunkGeometry(worldX: number, worldZ: number, radius: number): (number | null)[] {
-    return this.streamer.samplePositionHashes(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+    return this.streamer.sampleGeometryHashes(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
+  /**
+   * Water triangles in the chunks around a world position, as actually
+   * resident. `null` where the chunk is not loaded.
+   *
+   * The soak asserts this is non-zero somewhere in the round-tripped square, so
+   * that "geometry came back byte-identical" is a statement about the sea and
+   * not only about the ground under it.
+   */
+  sampleChunkWater(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleWaterTriangles(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
   /** Ground height at a world position, from the main thread. For debugging parity. */
@@ -258,7 +286,9 @@ export class App {
     }
     this.streamer.update(this.rig.camera.position);
     this.frameTimer.sample(wallDt);
+    resetWaterDraws();
     this.renderer.render(this.scene, this.rig.camera);
+    this.waterDrawCalls = waterDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -301,6 +331,7 @@ export class App {
     hud.register('draw calls', () => this.renderer.stats().drawCalls, HudOrder.render);
     hud.register('triangles', () => formatCount(this.renderer.stats().triangles), HudOrder.render);
     hud.register('programs', () => this.renderer.stats().programs, HudOrder.render);
+    hud.register('water draws', () => this.waterDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

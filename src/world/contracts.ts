@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 2;
+export const CHUNK_DATA_VERSION = 3;
 
 /**
  * The result of generating one chunk.
@@ -270,6 +270,24 @@ export interface ChunkData {
   /** Per-vertex colour, rgb triples, LINEAR (not sRGB) in [0, 1]. */
   readonly colors: Float32Array;
   /**
+   * Water surface vertex positions, xyz triples, in the same node-local frame
+   * as `positions`. Y is always exactly `SEA_LEVEL`.
+   *
+   * ZERO-LENGTH ON A NODE WITH NO WATER, which is most of them. An inland node
+   * must cost no water draw call and no water bytes -- that discipline is what
+   * keeps a whole-world water surface off the draw-call budget, and it is the
+   * reason these are separate arrays rather than a flag on the terrain mesh.
+   */
+  readonly waterPositions: Float32Array;
+  /**
+   * Water vertex colour, rgbA quadruples: linear rgb plus an alpha derived from
+   * depth. FOUR components, not three -- Three.js only takes opacity from a
+   * vertex colour attribute whose `itemSize` is 4.
+   */
+  readonly waterColors: Float32Array;
+  /** Triangle indices into `waterPositions`. */
+  readonly waterIndices: Uint32Array;
+  /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
    *
@@ -290,7 +308,10 @@ export function chunkDataBytes(data: ChunkData): number {
     data.positions.byteLength +
     data.indices.byteLength +
     data.normals.byteLength +
-    data.colors.byteLength
+    data.colors.byteLength +
+    data.waterPositions.byteLength +
+    data.waterColors.byteLength +
+    data.waterIndices.byteLength
   );
 }
 
@@ -301,6 +322,11 @@ export function chunkDataBytes(data: ChunkData): number {
  * is not an optimisation that was missed -- it is structured-cloned instead,
  * which copies the whole mesh on the worker thread and again on the main
  * thread, every chunk, forever.
+ *
+ * The empty water buffers of an inland node belong here too. A zero-length
+ * `ArrayBuffer` transfers fine, and listing them unconditionally means there is
+ * one rule ("every bulk array, always") rather than a conditional that a later
+ * phase can get subtly wrong.
  */
 export function chunkDataTransferables(data: ChunkData): Transferable[] {
   return [
@@ -308,6 +334,9 @@ export function chunkDataTransferables(data: ChunkData): Transferable[] {
     data.indices.buffer as ArrayBuffer,
     data.normals.buffer as ArrayBuffer,
     data.colors.buffer as ArrayBuffer,
+    data.waterPositions.buffer as ArrayBuffer,
+    data.waterColors.buffer as ArrayBuffer,
+    data.waterIndices.buffer as ArrayBuffer,
   ];
 }
 
