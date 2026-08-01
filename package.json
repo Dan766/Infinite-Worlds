@@ -12,13 +12,15 @@
     "shots": "node scripts/shots.mjs",
     "shots:check": "node scripts/shots-check.mjs",
     "soak": "node scripts/soak.mjs",
-    "verify:subpath": "node scripts/verify-subpath.mjs"
+    "verify:subpath": "node scripts/verify-subpath.mjs",
+    "deploy:firebase": "npm run build && firebase deploy --only hosting"
   },
   "dependencies": {
     "three": "^0.185.1"
   },
   "devDependencies": {
     "@types/three": "^0.185.0",
+    "firebase-tools": "^14.3.0",
     "lil-gui": "^0.21.0",
     "playwright": "^1.62.1",
     "typescript": "^7.0.2",
