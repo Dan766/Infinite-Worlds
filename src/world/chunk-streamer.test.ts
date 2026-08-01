@@ -13,11 +13,10 @@
 
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
-import { generateChunk } from './chunk-gen';
+import { chunkTierContext, generateChunk } from './chunk-gen';
 import { ChunkStreamer, type ChunkStreamerOptions } from './chunk-streamer';
 import {
   chunkKey,
-  createTierContext,
   worldToChunk,
   type ChunkCoord,
   type ChunkData,
@@ -93,7 +92,7 @@ class FakeProvider implements ChunkProvider {
       this.pending.delete(key);
       this.completedCount++;
       delivered++;
-      entry.settle(generateChunk(entry.coord, createTierContext(SEED, 'chunk')));
+      entry.settle(generateChunk(entry.coord, chunkTierContext(SEED)));
     }
   }
 

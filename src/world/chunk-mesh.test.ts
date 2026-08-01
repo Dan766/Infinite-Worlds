@@ -13,12 +13,12 @@ import {
   resetWaterDraws,
   waterDrawsSinceReset,
 } from './chunk-mesh';
-import { generateChunk, skirtDepthOf } from './chunk-gen';
+import { chunkTierContext, generateChunk, skirtDepthOf } from './chunk-gen';
 import { SEA_LEVEL } from './height-field';
-import { CHUNK_SIZE, createTierContext, type ChunkCoord } from './contracts';
+import { CHUNK_SIZE, type ChunkCoord } from './contracts';
 
 const build = (coord: ChunkCoord = { x: 0, z: 0, lod: 0 }): ReturnType<typeof createChunkMesh> =>
-  createChunkMesh(generateChunk(coord, createTierContext(99, 'chunk')));
+  createChunkMesh(generateChunk(coord, chunkTierContext(99)));
 
 /**
  * Three nodes on seed 99, chosen because the water tests need all three cases
@@ -125,7 +125,7 @@ describe('createChunkMesh', () => {
     // boundary running off the bottom of the view.
     const entry = build({ x: 11, z: 7, lod: 3 });
     const box = entry.geometry.boundingBox as THREE.Box3;
-    const data = generateChunk({ x: 11, z: 7, lod: 3 }, createTierContext(99, 'chunk'));
+    const data = generateChunk({ x: 11, z: 7, lod: 3 }, chunkTierContext(99));
     expect(skirtDepthOf(data.positions)).toBeGreaterThan(0);
     expect(box.min.y).toBeCloseTo(data.minY - skirtDepthOf(data.positions), 3);
     disposeChunkMesh(entry);

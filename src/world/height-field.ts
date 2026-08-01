@@ -49,6 +49,13 @@
 
 import { hash2i, hashCombine } from '../core/hash';
 import { clamp, fbm2, hashUnit, lerp, ridged2, smoothstep, unitToZeroOne, warp2 } from './noise';
+import {
+  RIVER_MAX_CUT,
+  regionRiverField,
+  riverDrop,
+  type RegionRiverField,
+  type RiverTerrain,
+} from './rivers';
 
 // ---------------------------------------------------------------------------
 // Sea level
@@ -172,8 +179,11 @@ const DETAIL_AMPLITUDE = 13;
  * Advisory bounds on `sampleHeight`, for camera placement and for tests.
  * The extremes require several independent fields to peak together, so real
  * terrain sits well inside them; they are a guarantee, not a description.
+ *
+ * The floor drops by `RIVER_MAX_CUT` from Phase 3b: a channel carved into the
+ * deepest possible basin is the lowest ground the world can produce.
  */
-export const MIN_HEIGHT = SHELF_FLOOR - HILL_AMPLITUDE - DETAIL_AMPLITUDE;
+export const MIN_HEIGHT = SHELF_FLOOR - HILL_AMPLITUDE - DETAIL_AMPLITUDE - RIVER_MAX_CUT;
 export const MAX_HEIGHT = SHELF_CEILING + MOUNTAIN_AMPLITUDE + HILL_AMPLITUDE + DETAIL_AMPLITUDE;
 
 // ---------------------------------------------------------------------------
@@ -272,12 +282,25 @@ export function reliefMask(continent: number, erosionValue: number): number {
 }
 
 /**
- * Ground height in metres at a world-space point.
+ * Ground height in metres at a world-space point, BEFORE rivers.
  *
- * THE single source of truth. If this and the rendered mesh ever disagree, the
- * bug is in whoever duplicated it, not here.
+ * This is exactly the body `sampleHeight` had through Phase 3a. It was split
+ * out in Phase 3b, and the split is the whole architecture of everything that
+ * modifies terrain from here on:
+ *
+ *   baseHeight   pure terrain. The only thing river routing -- and Phase 4's
+ *                road routing -- is allowed to read.
+ *   sampleHeight baseHeight blended toward the carved channel profile.
+ *
+ * Rivers carve terrain but are routed FROM terrain, which is circular unless
+ * the two are separated. NOTHING UPSTREAM OF THE CARVE MAY READ `sampleHeight`:
+ * if routing saw its own output the result would depend on evaluation order,
+ * and RULE 1 would be gone. See `rivers.ts`.
+ *
+ * Almost nothing should call this directly. If you want "the height of the
+ * ground", you want `sampleHeight`.
  */
-export function sampleHeight(x: number, z: number, worldSeed: number): number {
+export function baseHeight(x: number, z: number, worldSeed: number): number {
   const seed = worldSeed >>> 0;
 
   const continent = continentalness(x, z, seed);
@@ -343,4 +366,51 @@ export function sampleHeight(x: number, z: number, worldSeed: number): number {
     );
 
   return base + mountains + hills + detail;
+}
+
+// ---------------------------------------------------------------------------
+// Rivers
+// ---------------------------------------------------------------------------
+
+/**
+ * The pre-carve world, as river routing sees it.
+ *
+ * One module-level constant, deliberately: `rivers.ts` compares terrains by
+ * REFERENCE when it looks in its memo, so a fresh object literal per call would
+ * turn every cache hit into a 56 ms miss.
+ */
+const WORLD_TERRAIN: RiverTerrain = {
+  id: 'height-field',
+  seaLevel: SEA_LEVEL,
+  height: baseHeight,
+};
+
+/**
+ * The region-tier river record for this world, for a chunk generator to read
+ * through `TierContext.coarser('region')`.
+ *
+ * Both this and `sampleHeight` route through the same memo in `rivers.ts`, so
+ * the ground a worker meshes and the ground the main thread seats the cube on
+ * are the same arithmetic, not two implementations that agree today.
+ */
+export function worldRiverField(worldSeed: number): RegionRiverField {
+  return regionRiverField(WORLD_TERRAIN, worldSeed);
+}
+
+/**
+ * Ground height in metres at a world-space point.
+ *
+ * THE single source of truth, and still the only name any caller needs: since
+ * Phase 3b it is `baseHeight` with river channels carved into it, so every
+ * existing caller -- chunk vertices, normals, the water surface, the cube's
+ * seating, the camera's ground-relative default Y -- sees rivers without
+ * changing a line.
+ *
+ * If this and the rendered mesh ever disagree, the bug is in whoever duplicated
+ * it, not here.
+ */
+export function sampleHeight(x: number, z: number, worldSeed: number): number {
+  const seed = worldSeed >>> 0;
+  const base = baseHeight(x, z, seed);
+  return base - riverDrop(WORLD_TERRAIN, seed, x, z, base);
 }

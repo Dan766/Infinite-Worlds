@@ -18,15 +18,43 @@
  */
 
 import { rngAt2i } from '../core/hash';
-import { humidity, SEA_LEVEL, sampleHeight, temperature } from './height-field';
+import { humidity, SEA_LEVEL, sampleHeight, temperature, worldRiverField } from './height-field';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
+import type { RegionRiverField } from './rivers';
 import {
   CHUNK_DATA_VERSION,
+  createTierContext,
   chunkSizeAt,
   type ChunkCoord,
   type ChunkData,
   type TierContext,
 } from './contracts';
+
+/**
+ * The tier context a chunk generator needs: a world seed plus the REGION-tier
+ * river network, which is what decides where rivers go.
+ *
+ * RULE 3 in one function. Rivers span hundreds of chunks, so no chunk may
+ * decide where one runs; the routing happens at the Region tier and arrives
+ * here as coarse data. `generateChunk` reads it through `coarser('region')` and
+ * throws if it is missing, rather than reaching around the tier system and
+ * calling `rivers.ts` itself -- which would work, and would quietly make the
+ * tier plumbing decorative.
+ *
+ * The region field is memoised inside `rivers.ts`, so building a context per
+ * chunk costs one object.
+ */
+export function chunkTierContext(worldSeed: number): TierContext {
+  return createTierContext(worldSeed, 'chunk', { region: worldRiverField(worldSeed) });
+}
+
+/**
+ * Metres of carving below which a vertex is not counted as "in a river".
+ *
+ * Only used for the anti-vacuity statistic on `ChunkData.riverVertices`: a
+ * quarter of a metre is far above float noise and far below a real channel.
+ */
+const RIVER_VERTEX_MIN_CUT = 0.25;
 
 /**
  * Convert HSL to RGB. Hand-rolled rather than borrowed from Three.js because
@@ -631,6 +659,23 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   }
 
   const worldSeed = context.worldSeed;
+
+  // RULE 3: the river network is Region-tier data and arrives through the tier
+  // context. Missing is a hard error rather than a silent fall-back to
+  // uncarved terrain, which would render a chunk that disagrees with its
+  // neighbours about where the ground is. Use `chunkTierContext`.
+  const rivers = context.coarser<RegionRiverField>('region');
+  if (rivers === undefined) {
+    throw new Error(
+      'generateChunk needs Region-tier river data on its TierContext. ' +
+        'Build the context with chunkTierContext(worldSeed).',
+    );
+  }
+  if (rivers.worldSeed !== worldSeed) {
+    throw new Error(
+      `Region river data is for seed ${rivers.worldSeed} but this chunk is seed ${worldSeed}`,
+    );
+  }
   const side = VERTS_PER_EDGE;
   const size = chunkSizeAt(coord.lod);
   const step = size / SEGMENTS;
@@ -642,11 +687,26 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
 
   // Heights on a grid padded by one cell, so every interior normal has both
   // neighbours available and border normals match the adjacent chunk exactly.
+  //
+  // Heights come from the Region-tier record, spelled out as
+  // `baseHeight - drop` rather than through `sampleHeight`, so the carve depth
+  // is available for the river statistic below without paying for a second
+  // `baseHeight` evaluation. It is the identical arithmetic `sampleHeight`
+  // performs -- `chunk-gen.test.ts` asserts that with `===`, which is what
+  // keeps the worker and the main thread on the same ground.
   const padded = side + 2;
   const heights = new Float64Array(padded * padded);
+  let riverVertices = 0;
   for (let row = -1; row <= SEGMENTS + 1; row++) {
+    const worldZ = vertexWorldZ(coord, row);
     for (let col = -1; col <= SEGMENTS + 1; col++) {
-      heights[(row + 1) * padded + (col + 1)] = vertexHeight(coord, col, row, worldSeed);
+      const worldX = vertexWorldX(coord, col);
+      const base = rivers.terrain.height(worldX, worldZ, worldSeed);
+      const drop = rivers.drop(worldX, worldZ, base);
+      heights[(row + 1) * padded + (col + 1)] = base - drop;
+      if (drop >= RIVER_VERTEX_MIN_CUT && col >= 0 && col <= SEGMENTS && row >= 0 && row <= SEGMENTS) {
+        riverVertices++;
+      }
     }
   }
   const heightAt = (col: number, row: number): number =>
@@ -802,6 +862,7 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     waterPositions: water.positions,
     waterColors: water.colors,
     waterIndices: water.indices,
+    riverVertices,
     color: chunkColor(coord, worldSeed),
     minY,
     maxY,

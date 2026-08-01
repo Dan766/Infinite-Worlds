@@ -123,6 +123,10 @@ export interface ChunkStreamerStats {
   waterNodes: number;
   /** Triangles of water surface in the live nodes. */
   waterTriangles: number;
+  /** Live nodes a Phase 3b river channel carved. Zero away from any river. */
+  riverNodes: number;
+  /** Surface vertices lowered by river carving, across the live nodes. */
+  riverVertices: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -508,6 +512,8 @@ export class ChunkStreamer {
     let vertices = 0;
     let waterNodes = 0;
     let waterTriangles = 0;
+    let riverNodes = 0;
+    let riverVertices = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
@@ -515,6 +521,10 @@ export class ChunkStreamer {
       if (entry.waterTriangles > 0) {
         waterNodes++;
         waterTriangles += entry.waterTriangles;
+      }
+      if (entry.riverVertices > 0) {
+        riverNodes++;
+        riverVertices += entry.riverVertices;
       }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
@@ -533,6 +543,8 @@ export class ChunkStreamer {
       vertices,
       waterNodes,
       waterTriangles,
+      riverNodes,
+      riverVertices,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -595,6 +607,24 @@ export class ChunkStreamer {
       const key = chunkKey(coord);
       const entry = this.live.get(key) ?? this.cache.peek(key);
       return entry === undefined ? null : entry.waterTriangles;
+    });
+  }
+
+  /**
+   * River-carved vertices in specific nodes as they are actually resident, or
+   * null where the node is not loaded.
+   *
+   * The same anti-vacuity role `sampleWaterTriangles` plays for the sea. The
+   * geometry hash covers carved ground automatically -- carving moves the very
+   * vertices it hashes -- but only if the round-tripped square had a river in
+   * it, and over ordinary hillside it does not. The soak fails if none of the
+   * chunks it round-tripped were carved.
+   */
+  sampleRiverVertices(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.riverVertices;
     });
   }
 
@@ -683,6 +713,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.waterNodes} nodes / ${s.waterTriangles} tris live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'rivers',
+      () => {
+        const s = this.stats();
+        return `${s.riverNodes} nodes / ${s.riverVertices} carved verts live`;
       },
       HudOrder.world,
     );

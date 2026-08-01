@@ -10,8 +10,8 @@ state moves between sessions. Update both at the end of every phase.
 | 2a    | Terrain heightfield                | Done   |
 | 2b    | Quadtree LOD                       | Done   |
 | 3a    | Sea level and shoreline            | Done   |
-| 3b    | Rivers                             | Next   |
-| 4     | Settlements and road network       | -      |
+| 3b    | Rivers                             | Done   |
+| 4     | Settlements and road network       | Next   |
 | 5     | Road meshes                        | -      |
 | 6     | Lots and buildings                 | -      |
 | 7     | Vegetation and props               | -      |
@@ -1402,3 +1402,532 @@ are in the table in `ARCHITECTURE.md`.
 - `ChunkData` now has seven bulk buffers. Anything Phase 3b adds goes in
   `chunkDataTransferables` AND `chunkDataBytes`, and `chunk-gen.test.ts` asserts
   the list length -- update the number rather than the assertion.
+
+---
+
+## Phase 3b -- Rivers (done)
+
+The second half of the roadmap's Phase 3, and **the first phase that uses the
+tier system for anything.** 3a was the sea; 3b is flow accumulation on the
+Region heightfield, a channel carved into `sampleHeight`, and the
+`baseHeight` / `finalHeight` layering that Phase 4's roads will slot into.
+
+No roads, no settlements, no separate lake bodies, no waves, no custom shaders,
+no render targets, no post-processing. **`contracts.ts` gained exactly one
+field -- a scalar on `ChunkData` -- and a version bump; nothing changed shape**
+(RULE 4 permits adding fields). `ChunkCoord`, `ChunkProvider` and `TierContext`
+are untouched, which is what the tier system was declared for in Phase 1.
+
+### Why this phase mattered more than it looks
+
+Three things had been documented since Phase 1 and never exercised:
+`TierContext.coarser()` was called only from its own unit tests, `REGION_SIZE`
+was a constant nothing read, and RULE 3 was a paragraph. Rivers are the first
+content that spans chunks -- a river is hundreds of chunks long -- so they are
+the first content that *has* to be decided at a tier that contains it.
+
+### Built
+
+- **`src/world/rivers.ts`** (new, ~730 lines) -- the Region tier. Priority-flood
+  to a depression-less surface, D8 flow direction, flow accumulation, a
+  threshold into channel nodes and segments, a monotonic water-surface profile,
+  a spatial index, and the carve. Plus the bounded memo. It imports
+  `contracts.ts` and `noise.ts` and **nothing else** -- in particular not
+  `height-field.ts` (see judgement call 1).
+- **`src/world/height-field.ts`** -- `sampleHeight`'s Phase 3a body renamed
+  `baseHeight`; `sampleHeight` is now `baseHeight - riverDrop(...)`. Same name,
+  same signature, same callers. `MIN_HEIGHT` drops by `RIVER_MAX_CUT`. New
+  `worldRiverField(worldSeed)`, the Region-tier record a chunk generator reads.
+- **`src/world/chunk-gen.ts`** -- `chunkTierContext(worldSeed)` builds a chunk
+  context **with** its region record; `generateChunk` reads it through
+  `coarser('region')` and **throws** if it is missing or belongs to another
+  seed. Vertex heights are `base - drop` spelled out, so the carve depth is
+  available for `riverVertices` without a second `baseHeight` evaluation.
+- **`src/world/contracts.ts`** -- `ChunkData.riverVertices` (a scalar, so the
+  transfer list is untouched), `CHUNK_DATA_VERSION` 3 -> 4.
+- **`src/world/chunk-mesh.ts`** -- `riverDrawsSinceReset` / `resetRiverDraws`
+  and an `onBeforeRender` counter on nodes that actually carry carved ground.
+  Exactly the Phase 3a water pattern, for exactly the same reason.
+- **`src/world/chunk-streamer.ts`** -- `riverNodes` / `riverVertices` in
+  `stats()`, a `rivers` HUD line, `sampleRiverVertices`.
+- **`src/app.ts`** -- `riverNodes` / `riverVertices` / `riverDrawCalls` in
+  `perfSnapshot`, a `river draws` HUD line, `sampleChunkRivers`.
+- **`src/world/chunk-worker.ts`** -- builds the context with
+  `chunkTierContext`. Still stateless per message.
+- **`scripts/soak.mjs`** -- five river assertions and a river report block.
+- **`src/world/rivers.test.ts`** (new, 32 tests) plus additions to
+  `chunk-gen.test.ts` (+6) and `height-field.test.ts` (+7). 289 -> 334.
+- Five new canonical views.
+
+### The layering, which is the part Phase 4 inherits
+
+```
+baseHeight()    pure terrain, exactly Phase 3a's sampleHeight body.
+                The ONLY thing river routing may read.
+sampleHeight()  baseHeight blended toward the carved channel profile.
+                What EVERYTHING downstream reads.
+```
+
+Rivers carve terrain but are routed *from* terrain. If routing read its own
+output the network would depend on how many times it had been evaluated, and
+RULE 1 would be gone. `rivers.ts` therefore takes the base sampler as a
+`RiverTerrain` argument rather than importing `height-field.ts`, which makes the
+dependency acyclic and puts the rule in the type system instead of in a comment.
+
+`sampleHeight` kept its name and signature, so every existing caller -- chunk
+vertices, normals, the water surface, `cube.ts`, the camera's ground-relative
+default Y, the parity tests -- sees rivers without a single edit.
+
+### The algorithm, and its numbers
+
+Per region, on a **global** 64 m lattice covering the region plus 1,536 m of
+margin: 112 x 112 = 12,544 `baseHeight` samples, **54-59 ms**.
+
+1. sample `baseHeight`;
+2. priority-flood (min-heap, ties broken by cell index) to a depression-less
+   surface, so every cell drains somewhere;
+3. D8 steepest descent on the filled surface, with the flood's own discovery
+   edges as the fallback on flats -- both edge kinds strictly decrease
+   `(filled, pop order)`, so the union is acyclic and one forward pass over the
+   pop order is a valid downstream-first traversal;
+4. accumulate;
+5. threshold at `RIVER_HEAD_ACCUM` = 150 cells (0.6 km^2) into nodes and
+   segments -- about **400-500 nodes per region window**, 150-210 of them at
+   strength above 0.5;
+6. a profile `waterY = max(waterY[downstream], base)`, monotonically
+   non-increasing downstream.
+
+The carve blends terrain toward `waterY - depth` inside a bank of
+`12 + strength * 32` metres, `strength = sqrt((accum - 150) / 1250)` clamped,
+depth up to 20 m, total cut capped at 45 m.
+
+What that costs the world, measured over 12 km x 12 km on two seeds:
+
+```
+dry land carved >= 0.25 m   4.6%        >= 1 m  3.7%   >= 4 m  2.0%   >= 10 m  0.4%
+mean cut over dry land      0.20 m
+dry ground newly submerged  0.56%       (estuaries -- these become water nodes)
+sea floor carved >= 1 m     11.5%       (drowned channels; invisible under the sea)
+```
+
+That is a river network, not a global smoothing filter, and it is the number to
+watch if a later phase widens the bank.
+
+### Region-boundary continuity, and its limits
+
+**The chosen scheme.** Three things together, and all three are needed:
+
+1. **The routing lattice is global**, not per-region: cell index is
+   `floor(world / 64)`. Two neighbouring regions therefore sample the identical
+   points, get identical `baseHeight`, and compute **identical flow
+   directions**. The *path* of a river is continuous across a boundary by
+   construction; only its *size* can disagree.
+2. **Each region routes on a window padded 1,536 m beyond its own square**, so a
+   cell on a region's edge still sees 1.5 km of its upstream catchment.
+3. **A point takes the maximum influence over every region within `RIVER_BLEND`
+   (768 m) of it**, each weighted by a factor that is exactly 1 over the
+   region's own square, exactly 1 for *both* regions on a shared boundary, and
+   exactly **0** where a region stops being consulted. A region contributes
+   nothing at the moment it drops out, so the combined field is continuous
+   everywhere; and in the overlap band the region with more of the catchment
+   wins.
+
+**`RIVER_PAD` (1,536 m) and `RIVER_BLEND` (768 m) are deliberately different
+numbers.** The pad is how much catchment a region gets to *see*; the blend is
+how far its answer is allowed to *reach*. The first version made them equal,
+which meant 56% of the world consulted four region networks per vertex and the
+carve cost **7.1 us a call** near a four-region corner against 1.6 us mid-region.
+Halving the blend changed no drainage at all -- every region still routes on the
+full 1,536 m -- and dropped the four-region case to about 14% of the world:
+**3.8 us at the corner, 0.18 us mid-region.**
+
+**Measured seam, three seeds.** Worst 2 m height step (2 m is the lod-0 vertex
+spacing, so this is exactly the step a rendered triangle would have to draw) on
+lines crossing `x = 4096`, against the same measure taken in the middle of a
+region:
+
+| seed             | at the boundary | mid-region control |
+| ---------------- | --------------- | ------------------ |
+| `infinite-world` | 1.591 m         | 1.851 m            |
+| `soak`           | 1.779 m         | 1.865 m            |
+| `beta`           | 2.068 m         | 1.550 m            |
+
+Crossing a region boundary is not a different *kind* of event from crossing
+ordinary ground. `rivers.test.ts` asserts this numerically and
+`shots/river-region-seam.png` is the visual corroboration.
+
+**The limit, stated plainly.** Accumulation is still truncated at the padded
+window edge, so a river whose catchment reaches more than 1,536 m past a
+boundary is under-measured by the region it flows *into*. Because the field is
+continuous and combined by max, that shows as a channel slightly **shallower**
+for a stretch, never one that stops. The case this cannot fix: a river whose
+entire catchment lies more than 1.5 km outside the region it enters **and**
+whose accumulation is near the head threshold -- the downstream region may not
+see it as a channel at all, and the upstream region's contribution fades out
+768 m past the boundary. That is a channel tapering to nothing over ~800 m, not
+a hard edge. Fixing it properly means a second, coarser accumulation pass over a
+multi-region window, which is a Phase 4-or-later trade.
+
+### Verified
+
+All run on 2026-08-01 in the dev container, software rendering (SwiftShader).
+
+| Check                    | Result                                                             |
+| ------------------------ | ------------------------------------------------------------------ |
+| `npm test`               | **334 passed, 15 files** (289 -> 334)                               |
+| `npm run build`          | clean `tsc --noEmit`; `dist/` 597.0 kB + a 14.3 kB worker chunk      |
+| `npm run shots:check`    | all 25 views byte-identical, run twice                              |
+| `npm run verify:subpath` | app ready, zero failed requests, 3 workers from the nested mount, 256 nodes streamed |
+| `npm run soak`           | 300s, unexplained heap trend **+2.83 MB/min**, **25/25 geometry hashes identical, water AND rivers included** |
+
+Full 5-minute soak, 45 m/s, seed `soak`, from `(-7000, 90, -3500)`:
+
+```
+heap     72.0 MB at t=0 -> 119.6 MB peak -> 109.5 MB at t=300s
+         raw trend +10.84 MB/min -- REPORTED ONLY (tracks how much sea is in view)
+         UNEXPLAINED trend +2.83 MB/min (limit 6); residual 15.8 -> 23.3 MB
+nodes    live 292 min / 305.5 mean / 318 max; 307 selected at the end
+         lod [80 64 59 56 46 2 0], view distance 4096 m
+         4170 generated, 20 cancelled, 3361 evicted, 502 cached
+geometry 1,225,890 live triangles peak (budget 2,100,000)
+         610,035 live vertices peak (budget 1,040,000)
+         92.9 MB payload peak (budget 100 MB), 111,773 bytes per node
+         288 draw calls peak (budget 500) -- 288 steep leg, 279 shallow leg
+water    252 water nodes peak of 318 live; 435,586 water triangles peak
+         92 water meshes DRAWN at peak (floor 30); 196 peak draws without water
+         25/25 round-tripped chunks had sea in them
+rivers   160 carved nodes peak of 318 live (floor 60)
+         47,043 carved vertices peak
+         59 carved meshes DRAWN at peak (floor 20); 59 on the shallow leg
+         12/25 round-tripped chunks were carved by a river
+frames   1337 drawn, worst 799.9 ms, 1244 over 20 ms
+trip     out to x=-263 m and back to x=-6308 m; 25/25 geometry hashes identical
+```
+
+The steep leg peaked *above* the shallow leg this run (288 against 279), the
+first time in three phases. It is a 3% difference on a route whose outbound
+pitch of -18 degrees was already close enough to the horizon to reach the 4 km
+rim -- Phase 2b measured 105 against 106 for the same reason. The shallow leg's
+55-call floor still fires if a future change tips the canary back toward nadir.
+
+**The leak margin, which is the tightest budget in the project.** 3a ran at
++3.62 MB/min against a limit of 6 -- a 1.66x margin. 3b measures **+2.83 MB/min,
+a 2.12x margin**, despite adding a 16-entry region-network cache per JS context
+(~1 MB when full). Two full runs of this phase measured +2.45 and +2.83, so
+treat 2.1x as the number and the spread as the same route-sensitivity 3a
+documented in its judgement call 8 -- not as headroom that has been won. It is
+still the budget to fix first if a later phase makes it fire.
+
+**Rivers cost no draw calls.** 288 peak against 3a's 292, and 279 on the shallow
+leg against 292 -- flat to slightly down, because carving lives in the terrain
+mesh every node already had. The only mechanism by which rivers *can* add draw
+calls is an estuary turning a dry node into a water-bearing one, and 0.56% of
+dry ground going under is not enough to show. Triangles and vertices are within
+1% of 3a. The four geometry budgets are therefore **left exactly as 3a derived
+them**; there is nothing to re-derive.
+
+### Generation cost, before and after carving
+
+Measured in the dev container, memo warm, seed `soak`:
+
+```
+baseHeight                       2.95 - 4.45 us per call   (= Phase 3a's cost)
+riverDrop, mid-region            0.18 us per call
+riverDrop, four-region corner    3.81 us per call          (worst case, ~14% of the world)
+generateChunk, memo warm         10.2 - 10.4 ms per node   (Phase 2a recorded "~10 ms")
+region routing, cold             54 - 59 ms per 4 km region window, ONCE per (seed, region)
+```
+
+The memo is what makes this affordable: ~1,300 height samples per node would
+otherwise trigger 1,300 flow-accumulation passes. With it, steady-state node
+generation is within noise of Phase 3a's, and the routing shows up as a
+one-off 54 ms per region per worker -- about 500 ms of start-up per worker for
+the 9 regions a 4 km view distance can touch.
+
+**One consequence worth knowing: the first `sampleHeight` call on a new seed
+routes a region synchronously on the main thread**, in the `App` constructor,
+seating the cube and resolving the default camera Y. That is one 54 ms hitch
+before the first frame, not per frame and not per chunk. It is the only place
+the "no generation on the main thread" rule is bent, and it was already bent --
+`sampleHeight` has been called there since Phase 2a.
+
+### Budgets
+
+| Budget                         | Status                                                    |
+| ------------------------------ | --------------------------------------------------------- |
+| <=1200 draw calls              | **Met.** 288 peak over open sea (3a: 292).                 |
+| <=400MB heap after 5 minutes   | **Met.** 119.6 MB peak, unexplained trend +2.83 MB/min.    |
+| live triangles <=2,100,000     | **Met.** 1,225,890 peak. Budget unchanged from 3a.         |
+| live vertices <=1,040,000      | **Met.** 610,035 peak. Budget unchanged from 3a.           |
+| chunk payload <=100 MB         | **Met.** 92.9 MB peak. Budget unchanged from 3a, 1.08x.    |
+| rivers reach the sea           | **Met.** Numerically in `rivers.test.ts` (a chain is walked downstream to a node below `SEA_LEVEL`), and by eye in `river-to-the-sea`. |
+| no seam at a Region boundary   | **Met.** Table above; `river-region-seam` by eye.          |
+| `sampleHeight` worker parity   | **Met. Exact.** Function-to-function `===`, unchanged from 2a; float32-aware against stored vertices. |
+| byte-identical regeneration    | **Met.** 25/25 geometry hashes, water and carved ground included. |
+| 60fps at 1080p                 | **UNVERIFIED.** 1.6-4.4 fps at 1280x720 under SwiftShader. |
+| <=16ms frame, no >4ms GC spike | **UNVERIFIED.** Worst frame 799.9 ms under SwiftShader.    |
+
+The last two are recorded as unverified, not as passed, exactly as Phases 1, 2a,
+2b and 3a did. This container has no GPU. Someone with one should open
+`?pos=5024,60,6100&look=0,-6` at 1080p and read the HUD.
+
+### Before and after, same viewpoint, same machine
+
+Phase 3a was checked out into a worktree and built, so this is a direct
+comparison rather than a recollection. `?pos=928,220,5008&look=0,-16` on the
+default seed at 1280x720 -- the `river-valley` framing:
+
+```
+                   Phase 3a          Phase 3b
+draw calls              100               105
+triangles           248,468           257,324
+programs                  4                 4     (unchanged; 3a already 4 here)
+chunk geo     752,240 tris      780,044 tris
+              359,631 verts     373,473 verts
+water          14 nodes /        21 nodes /
+                9,840 tris       14,604 tris
+chunk mem           20.9 MB           21.7 MB
+js heap             31.8 MB           32.2 MB
+rivers                    -   106 nodes / 20,376 carved verts
+river draws               -                38
+```
+
+The 3a capture of that frame is a featureless green slope; the 3b capture has a
+river valley running the length of it. That is the whole phase in two images.
+`programs` was already 4 at this viewpoint before the phase, so the extra
+program 3a's notes mention is not a regression here.
+
+### Screenshots: 19 of 20 baselines changed, one did not, and five were added
+
+Every change is explained by ground that a river lowered. Measured as the
+fraction of pixels that differ at all (and, in brackets, by more than 24/765):
+
+```
+chunks-aerial            29.4% (23.4%)   straight down on the origin's inland sea:
+                                         a channel now runs through the shallows
+chunks-wireframe         29.0% (21.2%)   the same, in wireframe
+seed-canary-inland       13.8% ( 1.4%)   seed beta's uplands grew a drainage network
+chunks-far-from-origin   13.1% (10.5%)   200 km out; rivers work there too
+lod-rings-wireframe       7.8% ( 4.1%)
+water-bay-aerial          5.9% ( 0.5%)   a channel joins the bay
+cube-wireframe            5.9% ( 5.0%)
+water-bay-wireframe       5.4% ( 3.1%)
+chunks-radius-edge        2.3% ( 0.7%)
+cube-far                  1.7% ( 0.8%)
+water-coast               1.3% ( 0.1%)
+lod-horizon               0.8% ( 0.0%)   distant creases only
+water-shoreline-shallow   0.7% ( 0.0%)
+cube-seed-alpha           0.4% ( 0.1%)
+cube-default / cube-t0    0.3% ( 0.1%)   the cube is seated identically; the
+                                         change is a channel at the far shore
+lod-ground-horizon        0.1% ( 0.0%)
+chunks-aerial-seed-beta   0.1% ( 0.0%)
+terrain-wireframe-relief  0.0% ( 0.0%)
+terrain-mountain-profile  BYTE-IDENTICAL -- no river within 4 km of that frame
+```
+
+`terrain-mountain-profile` coming back unchanged is the cheapest possible
+confirmation that carving happens where rivers are and nowhere else.
+
+**`cube-default` deserves a sentence of its own.** It is the parity canary: the
+cube is seated with the MAIN-THREAD `sampleHeight` while the ground under it
+comes from the worker. It moved 0.3% of pixels and the cube itself is in exactly
+the same place, pixel for pixel, as the Phase 3a baseline. Main thread and
+worker agree.
+
+The five new views:
+
+- **`river-valley`** (`?time=3&pos=928,220,5008&look=0,-16`) -- an inland dry
+  channel at ~95 m elevation with tributaries joining it and the whole dendritic
+  network of the surrounding hills visible as finer creases. A river network is
+  a *tree*; a router that thresholded noise would produce disconnected
+  scratches here.
+- **`river-to-the-sea`** (`?time=3&pos=5024,319,6336&look=0,-16`) -- THE view of
+  the phase. A full-strength river runs from the foreground through its own
+  valley into the sea; the bed drops below `SEA_LEVEL` and the Phase 3a water
+  surface takes over with no join and no river-specific rendering at all. Sand
+  banks appear along the lower reaches because the palette's shore band is
+  anchored to the same `SEA_LEVEL` the carve drains to.
+- **`river-mouth-shallow`** (`?time=3&pos=5024,60,6100&look=0,-6`) -- the same
+  river at 60 m and 6 degrees below the horizon. Every geometry budget is
+  decided near the horizon, so the phase needs a river view at that pitch.
+- **`river-mouth-wireframe`** -- the same mouth in wireframe. Shows the two
+  things no shaded view can: the carve lives in the ordinary terrain lattice
+  (no river mesh, no extra draw call), and the water grid follows the channel
+  inland as a narrow ribbon and stops exactly where the ground rises.
+- **`river-region-seam`** (`?time=3&pos=8192,560,9760&look=0,-89`) -- straight
+  down onto the point where a strong river crosses `x = 8192`, a **region**
+  boundary. The boundary is the vertical centre line of the frame; the channel
+  crosses it diagonally and must show no change of width, depth or direction.
+  Nothing else in the harness looks at a region boundary at all.
+
+All 25 were inspected by eye before being committed. **I looked specifically
+for: a straight-line discontinuity at the region boundary in `river-region-seam`
+and at three further exploratory framings not kept as baselines; a channel that
+stops at the coastline in `river-to-the-sea` and `river-mouth-shallow`; water
+appearing over dry ground, or a channel the water failed to follow, in
+`river-mouth-wireframe` and `water-bay-wireframe`; and the cube's seating in
+`cube-default`.** None of them.
+
+**`river-region-seam` is the lowest-contrast view in the set at 20 distinct
+colours** (the blank-frame guard is 4, and `lod-ground-horizon` has 23). That is
+inherent -- it is a nadir view of smooth green upland, which is precisely the
+background against which a straight seam line would be unmissable. It is
+corroboration, not the primary check: the primary check is the numeric
+boundary-step table above, which is a unit test.
+
+### Judgement calls worth knowing about
+
+1. **`rivers.ts` does not import `height-field.ts`, and that is the whole
+   layering.** It takes the pre-carve sampler as a `RiverTerrain` argument. The
+   obvious alternative -- import `baseHeight` directly -- creates a cycle
+   (`height-field -> rivers -> height-field`) that ES modules tolerate right up
+   until someone writes a top-level `const` depending on the other module, and
+   more importantly it hides the rule. Passing the sampler in states in the type
+   system that routing sees the PRE-CARVE world. It also bought the synthetic
+   tests: a V-shaped valley and a cone have exactly one right answer for "where
+   does the water go", so the routing is *asserted* rather than described, with
+   no noise in the way. The cone is the sharpest of them -- every flow line
+   diverges, so the correct number of rivers is **zero**, and a router that
+   thresholded noise instead of drainage would fail it.
+
+2. **Priority flooding is not optional, and it is what "no river terminates in
+   mid-air" actually means.** fBm on a 64 m lattice is full of local minima. A
+   D8 router without depression filling walks a channel downhill until it finds
+   one and stops, which is a ditch ending halfway up a hillside. Flooding first
+   makes every cell drain to the window boundary, so within a region every
+   channel either reaches ground below `SEA_LEVEL` or continues into the
+   neighbouring region -- and the neighbour continues it, because both compute
+   the same flow directions from the same global lattice. A unit test asserts
+   every interior node has a downstream cell.
+
+3. **The channel's water surface is `max(profile[downstream], base)`, and the
+   two properties that fall out are both load-bearing.** It is monotonically
+   non-increasing downstream, so a carved channel can never run uphill; and a
+   chain that reaches ground below sea level *ends* below sea level, so the
+   Phase 3a water surface covers the river's last stretch for free. That is why
+   `river-to-the-sea` needed no river-specific rendering to build.
+
+4. **The memo is a pure cache, it is bounded, and both halves are tested.**
+   Sixteen region networks per JS context, promoted by **swapping with the entry
+   in front** rather than by `splice` + `unshift` -- the lookup runs up to four
+   times per vertex, i.e. ~5,000 times per node, and splice moves every element
+   and allocates. The key comparison is four numeric fields plus a reference
+   compare, deliberately not a template-string key: building a key string per
+   call is ~1,200 short-lived strings per node, forever, on the hottest path in
+   the codebase. There is a test that clears the cache and demands a
+   byte-identical rebuild, one that evicts an entry twenty times over and
+   demands it back unchanged, and one that asserts the entry count never exceeds
+   the cap.
+
+5. **`RIVER_PAD` and `RIVER_BLEND` were split after measuring.** See the
+   region-boundary section. The short version: how much catchment a region sees
+   and how far its answer reaches are different questions, and conflating them
+   cost 4x on the carve path for no quality gain.
+
+6. **`generateChunk` throws without region data rather than falling back.** It
+   could have called `rivers.ts` itself and got an identical answer, because the
+   memo is global -- and that is exactly the habit that makes a tier boundary
+   decorative. Five call sites now build their context with
+   `chunkTierContext(worldSeed)`; a bare `createTierContext(seed, 'chunk')` is a
+   hard error with a message naming the fix. The region generator is
+   symmetrically constrained: it is handed a `region` context, and nothing is
+   coarser than a region, so **every** `coarser()` call from inside it throws.
+
+7. **`ChunkData.riverVertices` is a scalar, and it exists for the anti-vacuity
+   guard.** Water is its own submesh, so "was any sea drawn" is answerable by
+   looking at the object list. A river is not a mesh -- it is a dent in the
+   terrain mesh every node already had. Without a count, "the flight never went
+   near a river" and "carving silently returns zero" produce identical evidence,
+   and every river assertion in the soak would pass on either. Being a number
+   rather than a buffer, it changes nothing about the transfer list.
+
+8. **The soak flight did not move, and it did not need to.** 3a chose
+   `(-7000, -3500)` on seed `soak` for the 3.5 km of open sea it crosses, and
+   that line turns out to cross several drowned channels (cuts of 6-10 m on the
+   sea floor) and carved valleys inland. Measured on the run: 160 carved nodes
+   resident at peak, 59 carved meshes reaching the rasteriser, 59 of them on the
+   shallow leg, and **12 of the 25 round-tripped chunks carved** -- so the
+   byte-identical-regeneration check is a statement about rivers as well as
+   about the sea. Five assertions turn that from an intention into a check.
+   Moving the start would have re-based every Phase 3a water number for no gain.
+
+9. **The carve is one-directional and capped.** `sampleHeight <= baseHeight`
+   everywhere, asserted over 2,000 probes: carving that could *raise* ground
+   could lift a sea floor out of the water and put Phase 3a's shoreline
+   somewhere the mesh disagrees with. The 45 m cap exists because the profile is
+   "blend the terrain toward the bed", and a channel at the foot of a cliff
+   would otherwise cut the cliff down to the river. It is also what bounds
+   `MIN_HEIGHT`.
+
+10. **One height-field test was relaxed, deliberately and narrowly.** `does not
+    depend on evaluation order or on unrelated work` used to do its "unrelated
+    work" with 500 distinct seeds. A first call on a new seed now routes that
+    seed's rivers, so that test became a three-minute test. It uses three other
+    seeds now, which still evicts the region memo many times over and still
+    demands the original answer back -- and `rivers.test.ts` tests eviction
+    directly and much harder. No tolerance was widened anywhere.
+
+### Known gaps, deliberately left
+
+- **A river above sea level is a dry channel.** There is no inland water
+  surface: the Phase 3a sea covers everything below `SEA_LEVEL` and nothing
+  else, which is what the phase was scoped to. So a river reads as a carved
+  valley inland and as water from wherever its bed drops below sea level --
+  which on a coastal river is a long way up, but on an upland one is never.
+  Giving inland rivers their own surface means a second water body whose height
+  varies along its length, i.e. per-node water geometry that is no longer a
+  plane; that is a phase, not a tweak.
+- **No lakes.** A filled depression gets a flat `waterY`, and inside it the
+  terrain is already below the bed so the carve does nothing -- correctly. It
+  would take the same inland-water-surface machinery to render one.
+- **The seam is continuous but the size is only approximately continuous.** See
+  the limit stated above: a river fed entirely from more than 1.5 km outside the
+  region it enters can taper rather than arrive at full width. Not observed in
+  any of the framings looked at; it is a property of the algorithm, not a
+  sighting.
+- **The routing lattice is 64 m, so a channel's centreline is a polyline of
+  64 m steps**, lightly smoothed toward its up- and downstream neighbours. At a
+  30-90 m channel width that reads as meander; at a much narrower channel it
+  would read as a staircase. `RIVER_CELL` is the knob, and halving it
+  quadruples routing cost.
+- **`Sector` is still unused.** Region and Chunk are now both real; Phase 4 is
+  the phase that plausibly needs the middle tier.
+- **The region memo is per JS context**, so three workers plus the main thread
+  each route the same region independently. That is ~54 ms x 4 rather than
+  x 1, paid once per region. Sharing it would mean shipping networks across
+  `postMessage`, which is a cache-coherence problem for 200 kB of savings.
+- **Popping at a level switch is still quantified but unobserved**, unchanged
+  from 2b. Carving does not make it worse -- it is the same height field at
+  every level.
+- **Lighting is still the Phase 0 placeholder.** Phase 10 replaces it and the
+  baselines will move again.
+- The bundle is one 597 kB chunk plus a 14.3 kB worker (up from 8.3 kB: the
+  worker now carries `rivers.ts`). Vite still warns. Not worth splitting until
+  Phase 12 sets an asset budget.
+
+### For Phase 4
+
+- **`baseHeight` is the field roads must route on**, exactly as rivers do.
+  Reading `sampleHeight` would make roads follow river valleys that the roads
+  themselves then re-carve, and the result would depend on evaluation order.
+  Add the road drop to `sampleHeight` alongside `riverDrop` -- probably as a
+  `max` or a sum of drops, which is a decision Phase 4 has to make and state.
+- **The Region-tier plumbing is built and load-bearing.** `chunkTierContext`
+  attaches the region record; add roads to the same record rather than a second
+  one, or `generateChunk` grows a second coarse read for no reason.
+- **`rivers.ts` is the template for a Region-tier generator**: pure, handed a
+  `region` `TierContext`, memoised in a bounded array keyed by
+  `(terrain, seed, region)`, with `clearRiverCache()` for tests. Copy the
+  shape; do not copy a second memo implementation.
+- **A road crossing a river needs a bridge**, and nothing here provides one.
+  A road carved into a channel will follow it down.
+- **Every geometry budget is unchanged from 3a and still has ~1.7x headroom**,
+  except `chunk payload bytes` at 1.08x, which is structural. Roads that add a
+  mesh per node will move draw calls the way water did; re-derive with a stated
+  number.
+- The soak's flight start is chosen for the water AND the rivers it crosses. If
+  Phase 4 needs it to pass a settlement, move it deliberately and add the
+  matching anti-vacuity assertion -- and check `sea at the start` and
+  `river at the start` in the report afterwards, because both go quiet without
+  failing if the route stops being interesting.

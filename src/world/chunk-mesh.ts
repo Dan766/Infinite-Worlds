@@ -140,6 +140,37 @@ const countWaterDraw = (): void => {
 };
 
 /**
+ * Terrain meshes carrying Phase 3b river carving, actually rasterised since the
+ * last reset.
+ *
+ * THE SAME GUARD AS `waterDraws`, for the same reason, and rivers need it more.
+ * Water is its own submesh, so "was any water drawn" is answerable by looking at
+ * the object list. A river is not a mesh: it is a dent in the terrain mesh every
+ * node already had. Without a counter, "the flight never went near a river" and
+ * "carving silently returns zero" are the same observation, and every river
+ * assertion in the soak would pass on either.
+ *
+ * A node is counted when its payload reported at least one measurably lowered
+ * vertex, so this is "carved ground reached the screen", not "a node that might
+ * contain a river was on screen".
+ */
+let riverDraws = 0;
+
+/** Carved-terrain meshes drawn since `resetRiverDraws`. Read straight after a render. */
+export function riverDrawsSinceReset(): number {
+  return riverDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetRiverDraws(): void {
+  riverDraws = 0;
+}
+
+const countRiverDraw = (): void => {
+  riverDraws++;
+};
+
+/**
  * Phase 3a: the water surface material.
  *
  * `transparent` with a four-component vertex colour is the entire depth-fade
@@ -300,6 +331,8 @@ export interface ChunkMesh {
   readonly vertices: number;
   /** Triangles in the water submesh alone. Zero on an inland node. */
   readonly waterTriangles: number;
+  /** Surface vertices a Phase 3b river channel lowered. Zero on most nodes. */
+  readonly riverVertices: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -315,6 +348,9 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
   mesh.renderOrder = chunkRenderOrder(data.coord);
   mesh.matrixAutoUpdate = false;
   mesh.updateMatrix();
+  // Only on a node that actually carries carved ground, so the counter means
+  // "a river reached the screen" rather than "terrain reached the screen".
+  if (data.riverVertices > 0) mesh.onBeforeRender = countRiverDraw;
 
   const waterGeometry = createWaterGeometry(data);
   let waterMesh: THREE.Mesh | null = null;
@@ -362,6 +398,7 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     triangles: (data.indices.length + data.waterIndices.length) / 3,
     vertices: (data.positions.length + data.waterPositions.length) / 3,
     waterTriangles: data.waterIndices.length / 3,
+    riverVertices: data.riverVertices,
   };
 }
 

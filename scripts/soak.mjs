@@ -164,6 +164,30 @@ const START_Z = -3500;
 const MIN_WATER_DRAW_CALLS = 30; //         measured 93 peak
 const MIN_SHALLOW_WATER_DRAW_CALLS = 25; // measured 93 peak
 
+/**
+ * PHASE 3b: THE SAME GUARD FOR RIVERS, AND IT MATTERS MORE.
+ *
+ * Water is its own submesh, so "was any sea drawn" is answerable by looking at
+ * the object list. A river is not a mesh -- it is a dent in the terrain mesh
+ * every node already had. Without a counter, "the flight never went near a
+ * river" and "carving silently returns zero" produce identical evidence, and
+ * every river assertion in this file would pass on either.
+ *
+ * `riverNodes` is carved terrain that is resident; `riverDrawCalls` comes from
+ * `Object3D.onBeforeRender` on nodes whose payload reported carved vertices, so
+ * it measures carved ground that reached the rasteriser. Both are needed, and
+ * the shallow leg is checked separately because that is the leg the geometry
+ * budgets are decided on.
+ *
+ * On seed "soak" the flight from (-7000, -3500) crosses several drowned
+ * channels on the sea floor and a carved valley inland; the 5x5 square of
+ * lod-0 chunks it round-trips contains carved ground, which is what makes the
+ * byte-identical-regeneration check a statement about rivers as well.
+ */
+const MIN_RIVER_NODES = 60; //              measured 174 peak of 318 live
+const MIN_RIVER_DRAW_CALLS = 20; //         measured  64 peak
+const MIN_SHALLOW_RIVER_DRAW_CALLS = 20; // measured  61 peak
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -289,6 +313,14 @@ try {
     [originX, originZ],
   );
   const waterChunksAtStart = waterBefore.filter((t) => t !== null && t > 0).length;
+  // ...and how much of it a river carved. Same role: the geometry hash covers
+  // carved ground automatically, because carving moves the very vertices it
+  // hashes -- but only if the round-tripped square had a river in it.
+  const riverBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkRivers(x, z, 2),
+    [originX, originZ],
+  );
+  const riverChunksAtStart = riverBefore.filter((v) => v !== null && v > 0).length;
 
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
@@ -330,6 +362,7 @@ try {
       `evict ${String(snapshot.evictedChunks).padStart(6)}  ` +
       `draws ${String(snapshot.drawCalls).padStart(4)}  ` +
       `water ${String(snapshot.waterDrawCalls).padStart(3)}/${String(snapshot.waterNodes).padStart(3)}  ` +
+      `river ${String(snapshot.riverDrawCalls).padStart(3)}/${String(snapshot.riverNodes).padStart(3)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
       `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
@@ -365,6 +398,10 @@ try {
   const waterNodes = samples.map((s) => s.waterNodes);
   const waterTris = samples.map((s) => s.waterTriangles);
   const shallowWaterDraws = shallowSamples.map((s) => s.waterDrawCalls);
+  const riverDraws = samples.map((s) => s.riverDrawCalls);
+  const riverNodes = samples.map((s) => s.riverNodes);
+  const riverVerts = samples.map((s) => s.riverVertices);
+  const shallowRiverDraws = shallowSamples.map((s) => s.riverDrawCalls);
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -487,6 +524,17 @@ try {
     `  draws without it  ${max(draws.map((d, i) => d - waterDraws[i]))} peak terrain-only draw calls`,
   );
   console.log(`  sea at the start  ${waterChunksAtStart}/${waterBefore.length} round-tripped chunks`);
+
+  console.log('');
+  console.log('rivers (Phase 3b)');
+  console.log(`  carved nodes      ${max(riverNodes)} peak of ${max(lives)} live nodes (floor ${MIN_RIVER_NODES})`);
+  console.log(`  carved vertices   ${max(riverVerts)} peak`);
+  console.log(`  carved DRAWN      ${max(riverDraws)} peak (floor ${MIN_RIVER_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowRiverDraws.length === 0 ? 'n/a' : max(shallowRiverDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_RIVER_DRAW_CALLS})`,
+  );
+  console.log(`  river at the start ${riverChunksAtStart}/${riverBefore.length} round-tripped chunks`);
 
   console.log('');
   console.log('frames');
@@ -628,6 +676,42 @@ try {
       'none of the round-tripped chunks had water in them, so the ' +
         'byte-identical-regeneration check said nothing about the sea. Move the ' +
         'flight start (START_X / START_Z) over water.',
+    );
+  }
+
+  // ---- rivers, and the vacuity guards around them -----------------------
+  if (max(riverVerts) === 0) {
+    failures.push(
+      'no river carving was generated at any point in the flight. Either ' +
+        'carving is broken or the flight path never went near a river -- in ' +
+        'which case every river check in this run passed vacuously.',
+    );
+  }
+  if (max(riverNodes) < MIN_RIVER_NODES) {
+    failures.push(
+      `only ${max(riverNodes)} carved nodes were ever resident (floor ` +
+        `${MIN_RIVER_NODES}). The flight barely touched a river.`,
+    );
+  }
+  if (max(riverDraws) < MIN_RIVER_DRAW_CALLS) {
+    failures.push(
+      `carved terrain was drawn at most ${max(riverDraws)} times in a frame ` +
+        `(floor ${MIN_RIVER_DRAW_CALLS}). Rivers existing and rivers REACHING ` +
+        'THE SCREEN are different claims; this run only made the first one.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowRiverDraws) < MIN_SHALLOW_RIVER_DRAW_CALLS) {
+    failures.push(
+      `the shallow-pitch leg drew carved terrain at most ${max(shallowRiverDraws)} ` +
+        `times (floor ${MIN_SHALLOW_RIVER_DRAW_CALLS}). The draw-call budget is ` +
+        'decided on that leg, so it was measured without this phase in it.',
+    );
+  }
+  if (riverChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks was carved by a river, so the ' +
+        'byte-identical-regeneration check said nothing about rivers. Move the ' +
+        'flight start (START_X / START_Z) onto a channel.',
     );
   }
 

@@ -18,7 +18,12 @@ import { DebugPanel } from './debug/panel';
 import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
-import { resetWaterDraws, waterDrawsSinceReset } from './world/chunk-mesh';
+import {
+  resetRiverDraws,
+  resetWaterDraws,
+  riverDrawsSinceReset,
+  waterDrawsSinceReset,
+} from './world/chunk-mesh';
 import { sampleHeight } from './world/height-field';
 
 declare global {
@@ -59,6 +64,13 @@ export class App {
    * green run that proved nothing. See `chunk-mesh.ts`.
    */
   private waterDrawCalls = 0;
+  /**
+   * Terrain meshes carrying river carving actually rasterised in the last
+   * frame. Same role as `waterDrawCalls`, and rivers need it more: a river is
+   * not its own mesh, so nothing else can tell "no river nearby" apart from
+   * "carving stopped working". See `chunk-mesh.ts`.
+   */
+  private riverDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -203,6 +215,11 @@ export class App {
       waterNodes: chunks.waterNodes,
       waterTriangles: chunks.waterTriangles,
       waterDrawCalls: this.waterDrawCalls,
+      // Phase 3b, mirroring the pair above: what was carved and resident, and
+      // what actually reached the rasteriser.
+      riverNodes: chunks.riverNodes,
+      riverVertices: chunks.riverVertices,
+      riverDrawCalls: this.riverDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -273,6 +290,18 @@ export class App {
     return this.streamer.sampleWaterTriangles(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * River-carved vertices in the chunks around a world position, as actually
+   * resident. `null` where the chunk is not loaded.
+   *
+   * The soak asserts this is non-zero somewhere in the round-tripped square, so
+   * that "geometry came back byte-identical" is a statement about the river as
+   * well as about the ground and the sea.
+   */
+  sampleChunkRivers(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleRiverVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -287,8 +316,10 @@ export class App {
     this.streamer.update(this.rig.camera.position);
     this.frameTimer.sample(wallDt);
     resetWaterDraws();
+    resetRiverDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
+    this.riverDrawCalls = riverDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -332,6 +363,7 @@ export class App {
     hud.register('triangles', () => formatCount(this.renderer.stats().triangles), HudOrder.render);
     hud.register('programs', () => this.renderer.stats().programs, HudOrder.render);
     hud.register('water draws', () => this.waterDrawCalls, HudOrder.render);
+    hud.register('river draws', () => this.riverDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

@@ -13,8 +13,8 @@
  * because that lib conflicts with `dom` and this project needs both.
  */
 
-import { createTierContext, chunkDataTransferables } from './contracts';
-import { generateChunk } from './chunk-gen';
+import { chunkDataTransferables } from './contracts';
+import { chunkTierContext, generateChunk } from './chunk-gen';
 import type { WorkerRequest, WorkerResponse } from './worker-protocol';
 
 interface WorkerScope {
@@ -30,9 +30,17 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>): void => {
 
   try {
     const startedAt = performance.now();
-    // Phase 1 has no coarser tiers to supply. Phases 2-4 pass the region and
-    // sector records in here; nothing else about this file changes.
-    const context = createTierContext(request.worldSeed, 'chunk');
+    // Phase 3b supplies the Region tier for the first time: `chunkTierContext`
+    // attaches the river network so `generateChunk` reads it through
+    // `coarser('region')` (RULE 3). The network itself is memoised per region
+    // inside `rivers.ts`, so this is one object per request, not one flow
+    // accumulation pass.
+    //
+    // The worker is still stateless PER MESSAGE. The river memo is derived data
+    // -- a pure function of `(seed, region)` that can be dropped and rebuilt
+    // byte-identically -- so which worker answers a request still cannot
+    // influence the result.
+    const context = chunkTierContext(request.worldSeed);
     const data = generateChunk(request.coord, context);
     const elapsedMs = performance.now() - startedAt;
 

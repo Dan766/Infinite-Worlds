@@ -72,7 +72,8 @@ src/
   world/
     contracts.ts        ChunkCoord / ChunkData / ChunkProvider / TierContext
     noise.ts            gradient noise, fBm, ridged multifractal, domain warp
-    height-field.ts     sampleHeight + SEA_LEVEL + the four biome fields. THE terrain.
+    height-field.ts     baseHeight + sampleHeight + SEA_LEVEL + the biome fields. THE terrain.
+    rivers.ts           Region-tier flow accumulation and the channel carve
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
     chunk-worker.ts     the Web Worker entry point
     worker-protocol.ts  the main-thread <-> worker message contract
@@ -149,6 +150,7 @@ placeholder `chunks` and `worker queue` lines without editing `app.ts`.
 ```
 contracts.ts    types only       importable from a worker and from Node
 noise.ts        pure functions   no Three, no DOM, built on core/hash.ts
+rivers.ts       pure functions   Region tier; imports contracts + noise ONLY
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
@@ -166,6 +168,128 @@ buffer to `chunkDataTransferables`. A buffer left off that list is not a missed
 optimisation: it gets structured-cloned instead, copying the whole mesh on the
 worker thread and again on the main thread, for every chunk, forever.
 `chunk-gen.test.ts` asserts the list is complete.
+
+### The tier system, finally exercised: `Region -> Chunk`
+
+Phases 1 to 3a declared `Region (4km) -> Sector (512m) -> Chunk (64m)` and used
+none of it. `TierContext.coarser()` was called only from its own unit tests,
+`REGION_SIZE` was a constant nothing read, and RULE 3 was documentation.
+
+**Phase 3b's rivers are the first content that spans chunks**, so they are the
+first content that has to be decided at a tier that contains them. A river is
+hundreds of chunks long; no chunk can know where it goes.
+
+```
+rivers.ts          Region tier: flow accumulation over a 4 km window,
+                   from baseHeight ONLY, memoised per (terrain, seed, region)
+height-field.ts    sampleHeight = baseHeight - riverDrop
+chunk-gen.ts       reads the region record through coarser('region')
+chunk-worker.ts    builds that context with chunkTierContext(worldSeed)
+```
+
+Two things make this a real use of the tier system rather than a decorative one:
+
+- **`generateChunk` throws if the region record is missing.** It could have
+  called `rivers.ts` itself -- the memo is global and the answer would be
+  identical -- and that is exactly the habit that makes the tier boundary
+  meaningless. The record arrives through `coarser('region')` or generation
+  fails.
+- **The region generator is handed a `region` `TierContext`, so it *cannot*
+  read anything finer.** Nothing is coarser than a region, so every `coarser()`
+  call from inside `generateRegionRivers` throws. RULE 3 is enforced by the
+  context, not by review.
+
+`Sector` is still unused. Phase 4 is expected to be what needs it.
+
+### `baseHeight` and `sampleHeight`: the layer everything after Phase 3 sits on
+
+Rivers carve terrain, but river routing is computed *from* terrain. That is
+circular, and the resolution generalises to Phase 4's roads and to anything else
+that modifies the ground:
+
+```
+baseHeight()    pure terrain, exactly Phase 3a's sampleHeight body.
+                The ONLY thing routing may read.
+sampleHeight()  baseHeight blended toward the carved channel profile.
+                What EVERYTHING downstream reads.
+```
+
+**Nothing upstream of the carve may read `sampleHeight`.** If routing saw its own
+output the answer would depend on how many times it had been evaluated, and RULE
+1 would be gone. `rivers.ts` therefore never imports `height-field.ts`: it takes
+the base sampler as a `RiverTerrain` argument. That keeps the dependency acyclic,
+states the rule in the type system, and has the useful side effect that the
+routing can be tested against synthetic terrain -- a V-shaped valley, a cone --
+where the right answer is known and no noise is in the way.
+
+`sampleHeight` kept its name and signature. Every Phase 0-3a caller -- chunk
+vertices, normals, the water surface, the cube's seating, the camera's
+ground-relative default Y, the parity tests -- sees rivers without changing a
+line.
+
+### Rivers: flow accumulation, and what happens at a Region boundary
+
+Per region, on a **global** 64 m lattice covering the region plus 1,536 m of
+margin (112 x 112 = 12,544 samples, about 56 ms):
+
+1. sample `baseHeight`;
+2. priority-flood to a depression-less surface, so no channel can end in a pit
+   halfway up a mountain;
+3. D8 flow direction by steepest descent on the filled surface, with the flood's
+   own discovery edges as the fallback on flats;
+4. accumulate;
+5. threshold into channel nodes and segments;
+6. a water-surface profile per node, `max(profile[downstream], base)`, which is
+   monotonically non-increasing downstream and therefore reaches `SEA_LEVEL`
+   wherever the chain reaches the coast.
+
+The carve blends the terrain toward `profile - depth` inside a bank whose width
+grows with `sqrt(accumulation)`, capped at `RIVER_MAX_CUT` so a river next to a
+cliff is a river and not a canyon. It is one-directional: carving only ever cuts
+down, so it can never lift a sea floor out of the water.
+
+**The region boundary is the failure this phase is most likely to have, and
+three things together prevent it:**
+
+- The lattice is **global** (cell index is `floor(world / 64)`, not an offset
+  from a region origin) and `baseHeight` is pure, so two neighbouring regions
+  sample identical points and compute identical flow directions. **The path of a
+  river is continuous across a boundary by construction; only its size can
+  disagree.**
+- Each region routes on a window padded 1,536 m beyond its own square, so a cell
+  on a region's edge still sees 1.5 km of its upstream catchment.
+- A query point takes the **maximum** influence over every region whose window
+  contains it, each weighted by a factor that is exactly 1 over the region's own
+  square and falls smoothly to exactly **0** at the edge of its padded window. A
+  region contributes nothing at the moment it stops being consulted, so the
+  combined field is continuous everywhere, and in the overlap band the region
+  with more of the catchment wins.
+
+The limit, stated: accumulation is still truncated at the window edge, so a river
+whose catchment reaches more than 1.5 km past a boundary is under-measured by the
+downstream region. Because the field is continuous and combined by max, that
+shows as a channel that is slightly *shallower* for a stretch, never one that
+stops.
+
+### The region memo is derived data, and it is bounded
+
+Every chunk vertex needs river influence; a chunk is ~1,200 vertices and hundreds
+are resident. A flow-accumulation pass per vertex would stop generation dead, so
+the network is computed once per `(terrain, seed, region)` and cached.
+
+That is not global mutable world state under RULE 2: it is a pure function of its
+key that can be dropped and rebuilt byte-identically, and a unit test does
+exactly that. It is capped at 16 entries with move-to-front eviction, because an
+unbounded memo is a leak with a friendly name and the soak's leak check has the
+thinnest margin of any budget in this project. The lookup is a linear scan over
+an array rather than a `Map` keyed by a template string -- a key string per call
+would allocate ~1,200 short-lived strings per chunk, forever, on the hottest path
+in the codebase.
+
+One consequence worth knowing: **the first `sampleHeight` call on a new seed
+routes a region synchronously**, ~56 ms. On the main thread that happens once, in
+the `App` constructor, seating the cube and resolving the default camera Y. It is
+not per frame and it is not per chunk.
 
 ### `sampleHeight` is the only description of the ground
 
@@ -473,10 +597,24 @@ peaked under 55 draw calls, so a canary pointed at nothing is a failure rather
 than a pass.
 
 The round-trip check hashes each chunk's uploaded **position buffer**, and since
-Phase 3a its **water positions and water colours** as well. Phase 1 compared flat
+Phase 3a its **water positions and water colours** as well. Phase 3b needed no
+new hash: carving moves the very vertices the position buffer already holds. It
+needed a new anti-vacuity guard instead -- see below. Phase 1 compared flat
 colours, which could only ever prove the coordinate hash was pure. Hashing the
 vertex bits proves the thing that is actually expensive to reproduce, and it is
 the direct statement of RULE 2. Keep it for every remaining phase.
+
+**Since Phase 3b the flight also has to cross a river, and that needs its own
+guard for a reason water did not.** Water is its own submesh, so "was any sea
+drawn" is answerable by looking at the object list. A river is not a mesh -- it
+is a dent in the terrain mesh every node already had, so "the flight never went
+near a river" and "carving silently returns zero" produce identical evidence.
+`ChunkData.riverVertices` counts the surface vertices a channel measurably
+lowered; `riverDrawCalls` counts, via `Object3D.onBeforeRender`, the nodes
+carrying carved ground that actually reached the rasteriser. The run fails if no
+carving was generated, if too few carved nodes were resident, if carved terrain
+was never drawn, if the shallow leg drew none, or if none of the round-tripped
+chunks was carved.
 
 **The flight starts over water, and that is load-bearing.** The autopilot flies
 along X from a fixed start; on seed `soak` the line `z = 0` is dry for all
@@ -495,12 +633,20 @@ trip, or on any page error.
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit     | Phase 3a measured (over water)  |
-| ----------------------------- | --------- | ------------------------------- |
-| live triangles                | 2,100,000 | 1,229,124 peak                  |
-| live vertices                 | 1,040,000 | 610,917 peak                    |
-| draw calls                    | 500       | 292 peak (199 terrain + 93 water) |
-| chunk payload bytes           | 100 MB    | 92.5 MB peak                    |
+| Budget                        | Limit     | 3a measured | 3b measured                   |
+| ----------------------------- | --------- | ----------- | ----------------------------- |
+| live triangles                | 2,100,000 | 1,229,124   | 1,225,890 peak                |
+| live vertices                 | 1,040,000 | 610,917     | 610,035 peak                  |
+| draw calls                    | 500       | 292         | 288 peak (196 terrain + 92 water) |
+| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB peak                  |
+
+**Phase 3b breached none of them and re-derived none of them.** Rivers are
+carved into the terrain mesh every node already had, so they add no draw call
+and no vertex; the only way they *can* add one is an estuary turning a dry node
+into a water-bearing one, and 0.56% of dry ground going under is not enough to
+show. This is the first phase since 2a that left all four limits alone, and that
+is the expected outcome for anything that modifies the height field rather than
+adding geometry.
 
 The first three are the Phase 3a peaks with roughly 1.7x headroom, measured on
 a flight whose shallow-pitch leg crosses 3.5 km of open sea. They are still far

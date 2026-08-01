@@ -7,8 +7,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { generateChunk } from './chunk-gen';
-import { createTierContext, type ChunkCoord } from './contracts';
+import { chunkTierContext, generateChunk } from './chunk-gen';
+import { type ChunkCoord } from './contracts';
 import { WorkerPool } from './worker-pool';
 import type { WorkerLike, WorkerRequest, WorkerResponse } from './worker-protocol';
 
@@ -38,7 +38,7 @@ class FakeWorker implements WorkerLike {
   finishOldest(): void {
     const request = this.received[this.answered++];
     if (request === undefined) throw new Error('nothing to finish');
-    const data = generateChunk(request.coord, createTierContext(request.worldSeed, 'chunk'));
+    const data = generateChunk(request.coord, chunkTierContext(request.worldSeed));
     this.onMessage({ kind: 'chunk', id: request.id, data, elapsedMs: 0.5 });
   }
 

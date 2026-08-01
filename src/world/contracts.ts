@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 3;
+export const CHUNK_DATA_VERSION = 4;
 
 /**
  * The result of generating one chunk.
@@ -287,6 +287,18 @@ export interface ChunkData {
   readonly waterColors: Float32Array;
   /** Triangle indices into `waterPositions`. */
   readonly waterIndices: Uint32Array;
+  /**
+   * Surface vertices this node's terrain was measurably LOWERED at by a Phase
+   * 3b river channel. Zero on a node no river passes near, which is most.
+   *
+   * A scalar, not a buffer, so it changes nothing about the transfer list. It
+   * exists because rivers are carved into the same terrain mesh as everything
+   * else: without a count there is no way to tell "no river here" from "river
+   * carving silently stopped working", and every river check in the soak and in
+   * the screenshot harness would keep passing while proving nothing. That trap
+   * has caught this project five times; see PROGRESS.md.
+   */
+  readonly riverVertices: number;
   /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.

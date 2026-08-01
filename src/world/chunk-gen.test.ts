@@ -20,6 +20,7 @@ import {
   VERTEX_COUNT,
   VERTS_PER_EDGE,
   chunkColor,
+  chunkTierContext,
   generateChunk,
   hslToRgb,
   skirtDepthOf,
@@ -31,7 +32,7 @@ import {
   WATER_ALPHA_MAX,
   waterColor,
 } from './chunk-gen';
-import { SEA_LEVEL, sampleHeight } from './height-field';
+import { baseHeight, SEA_LEVEL, sampleHeight, worldRiverField } from './height-field';
 import {
   CHUNK_DATA_VERSION,
   CHUNK_SIZE,
@@ -42,8 +43,12 @@ import {
 } from './contracts';
 
 const SEED = 0xc0ffee;
-const context = (seed = SEED): ReturnType<typeof createTierContext> =>
-  createTierContext(seed, 'chunk');
+/**
+ * A chunk context WITH its Region-tier river data, which is what
+ * `generateChunk` now requires (RULE 3: rivers span chunks, so they are decided
+ * at the tier that contains them and arrive as coarse data).
+ */
+const context = (seed = SEED): ReturnType<typeof createTierContext> => chunkTierContext(seed);
 
 /**
  * Seed 99 and three nodes on it, one of each kind. They are shared with
@@ -222,6 +227,92 @@ describe('sampleHeight parity with generated vertices', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Rivers (Phase 3b)
+// ---------------------------------------------------------------------------
+
+describe('rivers reach chunk generation through the tier context', () => {
+  it('refuses a chunk context with no Region-tier river data (RULE 3)', () => {
+    // The plumbing is load-bearing, not decorative: without the region record
+    // this generator would have to reach around the tier system and ask
+    // `rivers.ts` itself, and the day a chunk did that for something that is
+    // NOT globally memoised, two neighbours would disagree about the ground.
+    expect(() =>
+      generateChunk({ x: 0, z: 0, lod: 0 }, createTierContext(SEED, 'chunk')),
+    ).toThrow(/Region-tier river data/);
+  });
+
+  it('refuses region data belonging to a different seed', () => {
+    const wrong = createTierContext(SEED, 'chunk', { region: worldRiverField(SEED + 1) });
+    expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, wrong)).toThrow(/but this chunk is seed/);
+  });
+
+  it('carves some nodes and leaves others completely alone', () => {
+    // ANTI-VACUITY. Every river check in this suite, in the soak and in the
+    // screenshot harness is worthless if the world contains no rivers, and a
+    // count of zero looks exactly like "no river near this chunk". So: prove
+    // both kinds of node exist, by looking.
+    let carved = 0;
+    let untouched = 0;
+    let carvedVertices = 0;
+    for (let i = 0; i < 60; i++) {
+      const data = generateChunk({ x: 40 + i, z: 12 + i, lod: 0 }, context());
+      if (data.riverVertices > 0) {
+        carved++;
+        carvedVertices += data.riverVertices;
+      } else {
+        untouched++;
+      }
+    }
+    expect(carved).toBeGreaterThan(0);
+    expect(untouched).toBeGreaterThan(0);
+    expect(carvedVertices).toBeGreaterThan(100);
+  });
+
+  it('counts exactly the vertices baseHeight and sampleHeight disagree about', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const data = generateChunk(coord, context());
+    let expected = 0;
+    for (let row = 0; row <= SEGMENTS; row++) {
+      for (let col = 0; col <= SEGMENTS; col++) {
+        const x = vertexWorldX(coord, col);
+        const z = vertexWorldZ(coord, row);
+        if (baseHeight(x, z, SEED) - sampleHeight(x, z, SEED) >= 0.25) expected++;
+      }
+    }
+    expect(data.riverVertices).toBe(expected);
+  });
+
+  it('lowers the ground it says it carved, and only that', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const data = generateChunk(coord, context());
+    expect(data.riverVertices).toBeGreaterThan(0);
+    const side = VERTS_PER_EDGE;
+    let lowered = 0;
+    for (let row = 0; row < side; row++) {
+      for (let col = 0; col < side; col++) {
+        const stored = data.positions[(row * side + col) * 3 + 1] as number;
+        const base = baseHeight(vertexWorldX(coord, col), vertexWorldZ(coord, row), SEED);
+        expect(stored).toBeLessThanOrEqual(base + 1e-3);
+        if (base - stored > 0.25) lowered++;
+      }
+    }
+    expect(lowered).toBe(data.riverVertices);
+  });
+
+  it('regenerates a carved node byte-identically', () => {
+    const coord: ChunkCoord = { x: 54, z: 20, lod: 0 };
+    const first = generateChunk(coord, context());
+    // Unrelated work in between, including on another seed, which evicts the
+    // region memo -- the cache must be invisible (RULE 2).
+    generateChunk({ x: 3, z: 3, lod: 2 }, context());
+    generateChunk({ x: 54, z: 20, lod: 0 }, context(SEED + 7));
+    const again = generateChunk(coord, context());
+    expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
+    expect(again.riverVertices).toBe(first.riverVertices);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Surface colour
 // ---------------------------------------------------------------------------
 
@@ -394,7 +485,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(3);
+    expect(CHUNK_DATA_VERSION).toBe(4);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
