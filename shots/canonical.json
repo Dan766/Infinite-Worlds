@@ -1,0 +1,31 @@
+{
+  "$comment": "Canonical viewpoints captured by `npm run shots` and diffed by `npm run shots:check`. Every entry is forced to hud=0&panel=0&freeze=1, because a visible HUD shows fps and heap and could never match between runs. Add a view per phase; never remove one without saying why in PROGRESS.md.",
+  "viewport": { "width": 1280, "height": 720 },
+  "views": [
+    {
+      "name": "cube-default",
+      "params": "?time=3",
+      "expect": "Default seed, three seconds of sim. The baseline every phase is compared against."
+    },
+    {
+      "name": "cube-t0",
+      "params": "?time=0",
+      "expect": "Sim tick zero, cube unrotated. Proves ?time= seeks rather than just pausing."
+    },
+    {
+      "name": "cube-seed-alpha",
+      "params": "?seed=alpha&time=3",
+      "expect": "Different seed, visibly different cube colour. Proves seed plumbing reaches content."
+    },
+    {
+      "name": "cube-wireframe",
+      "params": "?time=3&wireframe=1",
+      "expect": "Wireframe mode on from the URL."
+    },
+    {
+      "name": "cube-far",
+      "params": "?time=3&pos=8,5,10&look=38.7,-21.3",
+      "expect": "Camera placed entirely from the URL, far from the default framing."
+    }
+  ]
+}
