@@ -1094,10 +1094,12 @@ Every change is explained by water appearing where the ground is below zero:
   staircase of node squares.
 - `chunks-aerial-seed-beta` -- seed `beta`'s origin is deep ocean, so this view
   is now almost entirely sea (40 distinct colours, still comfortably past the
-  blank-frame guard). It is a **weakened canary**: it still differs from
-  `chunks-aerial`, so it still proves the seed reaches the generator, but it no
-  longer shows a grid of distinct chunk colours. Noted, not fixed -- editing a
-  canonical viewpoint destroys the only history the harness has.
+  blank-frame guard). It became a **weakened canary**: it still differs from
+  `chunks-aerial`, but it no longer shows a grid of distinct chunk colours, and
+  a total seed-plumbing failure could shift a few pixels of blue and still pass
+  it. **Superseded by `seed-canary-inland` (see below); retained unedited for
+  history**, because editing a canonical viewpoint destroys the only record the
+  harness has of what it used to show.
 - `chunks-radius-edge`, `cube-seed-alpha`, `lod-rings-wireframe` -- a coastline
   entered the frame at the edge.
 - **Unchanged, byte for byte:** `terrain-mountain-profile`,
@@ -1357,7 +1359,21 @@ are in the table in `ARCHITECTURE.md`.
   route reasons rather than leak reasons -- judgement call 8. It is the thinnest
   margin of any hard budget in the project and it is the one to fix first if a
   later phase makes it fire.
-- **`chunks-aerial-seed-beta` is a weakened canary**, as described above.
+- **The seed canary was rebuilt after 3a weakened it.** `chunks-aerial-seed-beta`
+  degraded into a nearly featureless blue field once sea level existed, because
+  seed `beta`'s origin is deep ocean. `seed-canary-inland` replaces it in that
+  role: `?seed=beta&pos=4000,600,4500&look=0,-72`, a position chosen by searching
+  the height field for ground that is dry with real relief on **both** the
+  default seed and `beta`. Their height ranges there do not overlap at all
+  (default 15-120 m, beta 107-232 m), so the two seeds could never be confused,
+  and the view carries 88 distinct colours of terrain structure against the old
+  one's 40 of flat sea. The old view is kept unedited for history.
+
+  This is the fifth time this project has caught a check that kept passing after
+  it stopped proving anything -- after the blank screenshots in Phase 0, the
+  soak's false leak alarm in 2a, the unfireable draw-call budget before 2b, and
+  the dry soak route in 3a. Worth re-reading the canonical `expect` strings at
+  the start of every phase, not just when something fails.
 - **Popping at a level switch is still quantified but unobserved**, unchanged
   from 2b, and water does not make it worse: the water surface is at the same
   height at every level, so a switch moves no water vertex at all.

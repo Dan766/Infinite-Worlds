@@ -96,6 +96,11 @@
       "name": "water-bay-wireframe",
       "params": "?time=3&pos=3400,800,1800&look=-90,-30&wireframe=1",
       "expect": "Phase 3a. The same bay in wireframe: the structural view of which nodes carry water at all. Water triangles are only emitted over ground below sea level, so the dense water grid stops at the coastline and inland nodes show terrain wireframe alone -- that is the discipline the whole phase's draw-call budget rests on, and it is invisible in every shaded view. Also catches a change to the water grid's resolution, which is deliberately the terrain's."
+    },
+    {
+      "name": "seed-canary-inland",
+      "params": "?seed=beta&time=3&pos=4000,600,4500&look=0,-72",
+      "expect": "THE SEED CANARY, and it replaces `chunks-aerial-seed-beta` in that role. That view proved the seed reaches the chunk generator inside the worker by showing the same grid in entirely different colours -- but Phase 3a put sea level into the world, and on seed beta the origin turned out to be deep ocean, so it degraded into a nearly featureless blue field that a total seed-plumbing failure could shift by a few pixels and still pass. This position is dry on BOTH the default seed and beta, with real relief on each and height ranges that do not even overlap (default 15-120m, beta 107-232m), so terrain structure is the subject and the two seeds could never be confused. If the world seed ever stops reaching the generator, this image changes. Kept aerial at -72 degrees to mirror `chunks-aerial`'s framing."
     }
   ]
 }
