@@ -49,8 +49,10 @@ const SPEED = arg('speed', 45);
 const SEED = String(arg('seed', 'soak'));
 const SKIP_BUILD = process.argv.includes('--no-build');
 
-/** Fraction of the run discarded before the heap trend is fitted. */
+/** Minimum fraction of the run discarded before the heap trend is fitted. */
 const WARMUP_FRACTION = 0.25;
+/** Samples needed after warm-up before a heap trend means anything. */
+const MIN_TREND_SAMPLES = 6;
 /** Fail above this. Over a 5-minute run that is ~30MB of unexplained growth. */
 const MAX_HEAP_SLOPE_MB_PER_MIN = 6;
 /** The project's hard budget. */
@@ -158,6 +160,12 @@ const url =
 let exitCode = 0;
 const failures = [];
 const warnings = [];
+/**
+ * Whether this run was long enough to judge the heap trend at all. Reported in
+ * the final line, so a short run can never be mistaken for a leak check that
+ * passed -- the soak's headline purpose.
+ */
+let heapTrendJudged = false;
 
 console.log('');
 console.log(`soak: ${SECONDS}s at ${SPEED} m/s, seed "${SEED}", sampling every ${INTERVAL}s`);
@@ -241,9 +249,27 @@ try {
   const liveTris = samples.map((s) => s.chunkTriangles);
   const liveVerts = samples.map((s) => s.chunkVertices);
   const chunkBytes = samples.map((s) => s.chunkBytes);
-  const warmupCount = Math.floor(samples.length * WARMUP_FRACTION);
+  // Where the heap trend window starts.
+  //
+  // The heap ramps while the LRU cache fills toward its cap, and that fill takes
+  // a fixed wall-clock time set by generation throughput -- NOT a fixed fraction
+  // of the run. Discarding a fraction alone works at the default 300s and
+  // silently fits the trend straight through the ramp at 90s, reporting a leak
+  // that is not there. Steady state is observable rather than guessable: it
+  // begins once the cache has saturated and eviction is recycling entries.
+  const byFraction = Math.floor(samples.length * WARMUP_FRACTION);
+  const firstEviction = samples.findIndex((s) => s.evictedChunks > 0);
+  const saturated = firstEviction >= 0;
+  const warmupCount = saturated ? Math.max(byFraction, firstEviction) : byFraction;
+
   const trendSamples = samples.slice(warmupCount);
   const heapSlopeMbPerMin = slope(trendSamples.map((s) => [s.t / 60, s.heapMb]));
+
+  // A trend fitted before the cache saturates measures the cache filling, not a
+  // leak. Say so instead of accusing the code of leaking -- a check that cries
+  // wolf on a short run is a check people stop reading.
+  const trendJudgeable = saturated && trendSamples.length >= MIN_TREND_SAMPLES;
+  heapTrendJudged = trendJudgeable;
 
   const firstThird = heaps.slice(warmupCount, warmupCount + Math.ceil(trendSamples.length / 3));
   const lastThird = heaps.slice(-Math.ceil(trendSamples.length / 3));
@@ -255,6 +281,12 @@ try {
   console.log(`  min / mean / max ${min(heaps).toFixed(1)} / ${mean(heaps).toFixed(1)} / ${max(heaps).toFixed(1)} MB`);
   console.log(`  early / late avg ${mean(firstThird).toFixed(1)} MB -> ${mean(lastThird).toFixed(1)} MB (post-warmup)`);
   console.log(`  trend            ${heapSlopeMbPerMin >= 0 ? '+' : ''}${heapSlopeMbPerMin.toFixed(2)} MB/min (limit ${MAX_HEAP_SLOPE_MB_PER_MIN})`);
+  if (!trendJudgeable) {
+    console.log(
+      `  trend NOT judged  the chunk cache never saturated in ${SECONDS}s, so the ` +
+        'figure above is the cache filling, not a leak. Use the default 300s.',
+    );
+  }
 
   console.log('');
   console.log('chunks');
@@ -322,10 +354,16 @@ try {
     failures.push('the camera barely moved; the autopilot did not run');
   }
 
-  if (heapSlopeMbPerMin > MAX_HEAP_SLOPE_MB_PER_MIN) {
+  if (trendJudgeable && heapSlopeMbPerMin > MAX_HEAP_SLOPE_MB_PER_MIN) {
     failures.push(
       `heap grew ${heapSlopeMbPerMin.toFixed(2)} MB/min after warm-up, over the ` +
         `${MAX_HEAP_SLOPE_MB_PER_MIN} MB/min limit. That is a leak, not noise.`,
+    );
+  }
+  if (!trendJudgeable) {
+    warnings.push(
+      `the heap trend was NOT checked: the chunk cache did not saturate within ` +
+        `${SECONDS}s. This run cannot detect a leak. Re-run at the default 300s.`,
     );
   }
   if (max(heaps) > MAX_HEAP_MB) {
@@ -391,6 +429,12 @@ for (const failure of failures) console.error(`FAIL  ${failure}`);
 if (failures.length > 0) exitCode = 1;
 
 console.log('');
-console.log(exitCode === 0 ? 'soak OK' : 'soak FAILED');
+if (exitCode !== 0) {
+  console.log('soak FAILED');
+} else if (heapTrendJudged) {
+  console.log('soak OK');
+} else {
+  console.log('soak OK -- but the heap trend was NOT judged; this run cannot detect a leak');
+}
 console.log('');
 process.exit(exitCode);
