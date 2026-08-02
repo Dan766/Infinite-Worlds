@@ -1994,16 +1994,14 @@ All run on 2026-08-02 in the dev container, software rendering (SwiftShader).
 | `npm test`               | 385 passed, 17 files (334 -> 385)                                   |
 | `npm run build`          | clean `tsc --noEmit`; `dist/` 607.3 kB + a 23.5 kB worker chunk      |
 | `npm run shots`          | all 30 views captured and inspected by eye (see the screenshots section) |
-| `npm run shots:check`    | **RUNNING AT THE TIME OF THIS COMMIT** -- see the note below         |
-| `npm run verify:subpath` | **RUNNING AT THE TIME OF THIS COMMIT**                              |
+| `npm run shots:check`    | all 30 views byte-identical, run twice                              |
+| `npm run verify:subpath` | app ready, zero failed requests, 3 workers from the nested mount, 256 chunks streamed |
 | `npm run soak`           | 300s, unexplained heap trend **+2.40 MB/min**, **25/25 geometry hashes identical** |
 
-**The last two rows are honest rather than aspirational.** `shots:check` now
-takes around ten minutes a run under software rendering and `verify:subpath`
-several more, and they had not finished when this was committed. They are a
-determinism re-run of baselines that were just captured and inspected, not a
-new claim about the world; if either fails, the fix is a follow-up commit that
-says so. Nothing else in this table is reported without having been run.
+`shots:check` now takes around ten minutes a run under software rendering, which
+is why the phase's own commit history has it landing after the code: it was
+still running when the code was committed, and this row was filled in once it
+had passed twice. Nothing in this table is reported without having been run.
 
 Full 5-minute soak, 45 m/s, seed `soak`, new start `(-7500, -3600)`:
 
