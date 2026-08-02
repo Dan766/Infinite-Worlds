@@ -399,10 +399,18 @@ describe('carving', () => {
     // Carving is one-directional by construction. If it could lift terrain it
     // could lift a sea floor out of the water and Phase 3a's shoreline would
     // disagree with the mesh about where the coast is.
+    //
+    // ASSERTED ON THE CARVE, NOT ON `sampleHeight`, SINCE PHASE 4a. It used to
+    // compare `sampleHeight` against `baseHeight`, which was the same statement
+    // while rivers were the only thing that moved terrain. Road grading fills as
+    // well as cuts, so that form now fails on any point near a road -- correctly.
+    // The property this test exists for is unchanged and is stated directly:
+    // `riverDrop` is never negative.
     for (let i = 0; i < 4000; i++) {
       const x = i * 37.3 - 6000;
       const z = i * -23.9 + 4000;
-      expect(sampleHeight(x, z, SEED)).toBeLessThanOrEqual(baseHeight(x, z, SEED));
+      const base = baseHeight(x, z, SEED);
+      expect(riverDrop(WORLD, SEED, x, z, base)).toBeGreaterThanOrEqual(0);
     }
   });
 
@@ -421,12 +429,19 @@ describe('carving', () => {
     // The cheap statement that carving is a channel and not a global offset. If
     // this ever drops much below "most", the bank has been widened into a
     // world-scale smoothing filter.
+    //
+    // ASSERTED ON THE CARVE, NOT ON `sampleHeight`, SINCE PHASE 4a, for the same
+    // reason as "never raises the ground" above: comparing `sampleHeight`
+    // against `baseHeight` was the same statement only while rivers were the
+    // only thing that moved terrain. Road grading now moves it too, so that form
+    // would fail here whenever the sweep happened to cross a road -- which would
+    // be a road working correctly, not a river carving too widely.
     let untouched = 0;
     const total = 3000;
     for (let i = 0; i < total; i++) {
       const x = i * 91.7 - 5000;
       const z = i * 57.1 - 3000;
-      if (sampleHeight(x, z, SEED) === baseHeight(x, z, SEED)) untouched++;
+      if (riverDrop(WORLD, SEED, x, z, baseHeight(x, z, SEED)) === 0) untouched++;
     }
     expect(untouched / total).toBeGreaterThan(0.7);
   });

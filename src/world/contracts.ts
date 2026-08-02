@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 4;
+export const CHUNK_DATA_VERSION = 5;
 
 /**
  * The result of generating one chunk.
@@ -299,6 +299,17 @@ export interface ChunkData {
    * has caught this project five times; see PROGRESS.md.
    */
   readonly riverVertices: number;
+  /**
+   * Surface vertices this node's terrain was measurably MOVED at by Phase 4a
+   * road or settlement grading, in either direction. Zero on a node no road
+   * passes near, which is most.
+   *
+   * A scalar, for exactly the reason `riverVertices` is one: grading is applied
+   * to the terrain mesh every node already had, so there is no submesh whose
+   * presence answers "did this happen". Without a count, "the flight never went
+   * near a road" and "grading silently returns zero" produce identical evidence.
+   */
+  readonly roadVertices: number;
   /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.

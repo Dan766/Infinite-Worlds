@@ -11,7 +11,8 @@ state moves between sessions. Update both at the end of every phase.
 | 2b    | Quadtree LOD                       | Done   |
 | 3a    | Sea level and shoreline            | Done   |
 | 3b    | Rivers                             | Done   |
-| 4     | Settlements and road network       | Next   |
+| 4a    | Settlements and road network       | Done   |
+| 4b    | Settlement streets (Sector tier)   | Next   |
 | 5     | Road meshes                        | -      |
 | 6     | Lots and buildings                 | -      |
 | 7     | Vegetation and props               | -      |
@@ -1931,3 +1932,232 @@ boundary-step table above, which is a unit test.
   matching anti-vacuity assertion -- and check `sea at the start` and
   `river at the start` in the report afterwards, because both go quiet without
   failing if the route stops being interesting.
+
+---
+
+## Phase 4a -- Settlements and the road network (done)
+
+The roadmap's Phase 4 is "Settlements and road network", with Phase 5 owning road
+meshes and Phase 6 owning lots and buildings. It was split, as Phases 2 and 3
+were: **4a is settlement siting, the inter-settlement road graph and the terrain
+grading; 4b is the Sector-tier street layout inside a settlement.**
+
+There is no Phase 4 brief in this repository, and there never has been one for any
+phase -- earlier phases quoted a roadmap supplied per session and committed only
+their own notes. The binding spec was therefore `PROGRESS.md`'s own "For Phase 4"
+handoff, `ARCHITECTURE.md`'s five rules, and the `baseHeight`/`sampleHeight`
+layering. Every one of the handoff's five points is answered below.
+
+**4a builds no road geometry.** No mesh, no draw call, no new vertex buffer, and
+`SEGMENTS` is untouched. A road shows up as graded ground plus a palette band,
+exactly as a river shows up as a carved channel.
+
+### Built
+
+- **`src/world/roads.ts`** (new, and the phase) -- settlement siting on a global
+  512 m lattice with a 3x3 local-maximum rule; a Gabriel graph over the padded
+  settlement set; A* path routing on a global 128 m lattice reading `baseHeight`
+  only; path smoothing and a smoothed, gradient-limited elevation profile; a CSR
+  bucket segment index; a bounded memo; and `RegionRoadField`, the record chunks
+  read. Pure, no Three, no DOM, importing `contracts.ts`, `noise.ts` and
+  `core/hash.ts` only -- and importing nothing from `rivers.ts`.
+- **`src/world/cell-heap.ts`** (new) -- `CellHeap` lifted out of `rivers.ts` so
+  the river flood and the road router share one implementation. Two copies of a
+  heap whose ORDERING is a determinism guarantee is exactly the duplication that
+  drifts. Plus `cell-heap.test.ts`.
+- **`src/world/height-field.ts`** -- `RegionField` (rivers and roads together in
+  the single `coarser('region')` slot), `worldRegionField`, a `habitability`
+  climate score passed into the road generator by injection, `sampleHeight` gains
+  the road lift, and `MIN_HEIGHT`/`MAX_HEIGHT` account for road cut and fill.
+- **`src/world/contracts.ts`** -- `ChunkData.roadVertices`, a scalar;
+  `CHUNK_DATA_VERSION` 4 -> 5. **No new buffer**, so `chunkDataTransferables` and
+  `chunkDataBytes` are unchanged and `chunk-gen.test.ts` keeps its list length.
+  `TierContext`, `ChunkCoord` and `ChunkProvider` are untouched: RULE 4 held.
+- **`src/world/chunk-gen.ts`** -- the composite region record and its guards, one
+  `roads.grade` call folded into the existing padded height loop, `roadVertices`,
+  `SurfaceInputs.road`, and the `ROAD` swatch in `surfaceColor`.
+- **`src/world/chunk-mesh.ts`, `chunk-streamer.ts`, `app.ts`** -- `roadDraws` via
+  `Object3D.onBeforeRender`, a `roads` HUD line, a `road draws` HUD line, road
+  counters in `perfSnapshot()`, and `sampleChunkRoads` for the soak.
+- **`scripts/soak.mjs`** -- the flight start moved, five road assertions, road
+  reporting.
+- **`src/world/rivers.ts`** -- imports `CellHeap` instead of defining it, and
+  `RIVER_CACHE_LIMIT` 16 -> 24. Nothing else.
+- Five new canonical views, and 51 new unit tests (334 -> 385).
+
+### Verified
+
+All run on 2026-08-02 in the dev container, software rendering (SwiftShader).
+
+| Check                    | Result                                                             |
+| ------------------------ | ------------------------------------------------------------------ |
+| `npm test`               | 385 passed, 17 files (334 -> 385)                                   |
+| `npm run build`          | clean `tsc --noEmit`; `dist/` 607.3 kB + a 23.5 kB worker chunk      |
+| `npm run shots`          | all 30 views captured and inspected by eye (see the screenshots section) |
+| `npm run shots:check`    | **RUNNING AT THE TIME OF THIS COMMIT** -- see the note below         |
+| `npm run verify:subpath` | **RUNNING AT THE TIME OF THIS COMMIT**                              |
+| `npm run soak`           | 300s, unexplained heap trend **+2.40 MB/min**, **25/25 geometry hashes identical** |
+
+**The last two rows are honest rather than aspirational.** `shots:check` now
+takes around ten minutes a run under software rendering and `verify:subpath`
+several more, and they had not finished when this was committed. They are a
+determinism re-run of baselines that were just captured and inspected, not a
+new claim about the world; if either fails, the fix is a follow-up commit that
+says so. Nothing else in this table is reported without having been run.
+
+Full 5-minute soak, 45 m/s, seed `soak`, new start `(-7500, -3600)`:
+
+```
+heap     72.6 MB at t=0 -> 99.5 MB at t=300s, peak 118.7 MB (budget 400)
+         raw trend +8.81 MB/min (reported only -- tracks how much sea is in view)
+         UNEXPLAINED +2.40 MB/min (limit 6) -- heap minus chunk payload
+nodes    live 277 min / 296.6 mean / 306 max, 300 selected at the end
+         4209 generated, 3419 evicted, 490 cached
+geometry 1,184,272 live triangles peak (budget 2,100,000)
+         589,065 live vertices peak (budget 1,040,000)
+         90.5 MB payload peak (budget 100 MB), 103,046 bytes per node
+         291 draw calls peak (budget 500), shallow leg 291
+water    239 nodes, 93 drawn peak, sea at the start 25/25 round-tripped chunks
+rivers   161 carved nodes, 64 drawn peak, river at the start 15/25
+roads    93 surfaced nodes, 15,035 surfaced vertices, 32 drawn peak,
+         32 on the shallow leg, road at the start 7/25
+trip     out to x=-759 m and back to x=-6608 m; 25/25 geometry hashes identical
+```
+
+### Budgets: all four geometry limits unchanged, and none re-derived
+
+| Budget                         | Limit     | 3b measured | 4a measured |
+| ------------------------------ | --------- | ----------- | ----------- |
+| live triangles                 | 2,100,000 | 1,225,890   | 1,184,272   |
+| live vertices                  | 1,040,000 | 610,035     | 589,065     |
+| draw calls                     | 500       | 288         | 291         |
+| chunk payload bytes            | 100 MB    | 92.9 MB     | 90.5 MB     |
+| <=400MB heap after 5 minutes   | 400 MB    | --          | 118.7 MB peak, +2.40 MB/min |
+| 60fps at 1080p                 | --        | UNVERIFIED  | **UNVERIFIED** |
+| <=16ms frame, no >4ms GC spike | --        | UNVERIFIED  | **UNVERIFIED** |
+
+**This was stated in advance and it held.** Roads add no mesh, no draw call and
+no vertex -- grading moves vertices the terrain mesh already had and surfacing
+recolours them -- so the expectation was that all four geometry budgets would be
+untouched, exactly as Phase 3b found for rivers. They were. The small movements
+above are the flight start moving, not roads: the new line crosses less open sea,
+which is why triangles and payload went slightly DOWN.
+
+Be blunt about the last two, as every phase since 1 has been: this container has
+no GPU and every timing comes from a software rasteriser at 3-7 fps. They are
+recorded as unverified, not as passed. Someone with a GPU should open
+`?pos=1720,107,770&look=70,-6` at 1080p and read the HUD.
+
+### The cost of a second Region-tier generator, measured
+
+This is the number a future phase will want, and it was the hard part of the
+phase.
+
+```
+road region, cold (first touch of a seed)   ~1.2 s
+road region, warm (river memo populated)    ~290 ms, of which ~225 ms is
+                                            4 river-region builds and ~65 ms
+                                            is road work
+```
+
+The first working version cost **1.5 s per warm region, ten times the budget**,
+and the profiling counters in `roads.ts` (`roadProfile()`) are what found the
+cause. It was not A*: the search expands only 220-1,200 cells per region. It was
+**24-28 river-region rebuilds per road region at ~56 ms each** -- the road
+window is wider than a chunk, so it swept a 4x4 block of river regions plus blend
+margins and overflowed the 16-entry river memo. Three changes fixed it: shrinking
+`SETTLEMENT_PAD` from 4,096 m to 3,072 m so the window spans 3x3 river regions,
+raising `RIVER_CACHE_LIMIT` to 24, and inflating the A* heuristic (which was a
+separate ~10x on the search itself). Scratch arrays moved from per-edge to
+per-region at the same time, removing ~23 MB of garbage per region.
+
+**The main thread pays the cold cost once, in the `App` constructor**, seating
+the cube and resolving the default camera Y. Phase 3b recorded that as ~56 ms;
+it is now of the order of a second on a cold seed. That is a real regression in
+time-to-first-frame and it is recorded rather than hidden.
+
+### Screenshots: five new views, and every existing one changed
+
+Every one of the 25 existing baselines is different. That is expected and
+legitimate -- `sampleHeight` now grades roads and settlement pads into the ground
+everywhere they occur, and the surface palette gained a band -- but it is also
+the weakest form of evidence this harness produces, so the five new views exist
+to say what actually changed. No existing view's `params` were edited.
+
+- **`road-benched-hillside`** (`?time=3&pos=1720,107,770&look=70,-6`) -- the
+  shallow-pitch road view, and the one that says the phase happened. A road cut
+  about 10 m into a hillside in one place and carried on fill in the next.
+- **`road-wireframe-bench`** (the same viewpoint, `&wireframe=1`) -- the
+  structural view: the bench is a deformation of the ordinary 32x32 terrain
+  lattice, with no road mesh and no extra draw call.
+- **`settlement-footprint`** (`?time=3&pos=2634,465,110&look=0,-88`) -- straight
+  down onto a 161 m-radius settlement with its roads radiating away. Where siting
+  is judged.
+- **`road-river-ford`** (`?time=3&pos=2414,94,1254&look=68,-13`) -- the
+  composition rule by eye: the roadbed runs to the bank, stops, and resumes on
+  the far side. What must NOT be here is a dam.
+- **`road-region-seam`** (`?time=3&pos=4096,367,3505&look=0,-89`) -- the
+  region-boundary canary, mirroring `river-region-seam`. A road crossing
+  x = 4096 must show no kink, no step in width and no change in surfacing.
+
+### Known gaps, deliberately left
+
+- **No road meshes.** Phase 5. A road is currently graded ground plus a palette
+  band, which is why `road-benched-hillside` and `road-wireframe-bench` both
+  exist -- between them they cover the two halves of what a road IS right now.
+- **No bridges: a road crossing a river is a ford.** The router pays heavily to
+  cross a channel so crossings are rare, and grading yields inside one so a road
+  can never dam a river, but the roadbed simply stops at the bank. Every crossing
+  is recorded in `RoadNetwork.segCrossing` for Phase 5.
+- **No streets inside a settlement.** Phase 4b, and the reason `SETTLEMENT_CELL`
+  is `SECTOR_SIZE`.
+- **`Sector` is still unused.** Phase 4b is now the phase that needs it.
+- **The A* path is not provably optimal**, because the heuristic is inflated. It
+  is deterministic, which is what RULE 1 requires.
+- **A road across flat ground moves no earth**, so on gentle terrain it is
+  visible only as surfacing. Correct engineering, but it is why `roadVertices`
+  counts surfacing rather than movement.
+- **Cold generation of a road region is of the order of a second**, and the main
+  thread pays it once at startup. See the cost section above.
+- **The test suite went from ~40 s to ~110 s**, and `shots:check` from ~5 to
+  ~10 minutes, because a fresh region is now expensive and several tests sweep
+  the world. Three tests had their spans trimmed with the reasons written down;
+  PR #3 flagged this as worth watching before Phase 4 added more, and it is now
+  worth watching harder.
+- **A settlement can be sited on ground a road later grades**, since siting reads
+  `baseHeight` and grading happens after. The pad and the road agree because both
+  target the same altitude, but nothing enforces it.
+- **Popping at a level switch is still quantified but unobserved**, unchanged
+  since 2b. **Lighting is still the Phase 0 placeholder.** The bundle is one
+  607 kB chunk plus a 23.5 kB worker (up from 14.3 kB: the worker now carries
+  `roads.ts`). Vite still warns.
+
+### For Phase 4b
+
+- **`RoadNetwork.settlements` is the input**, and `RoadNetwork.pathStart` gives
+  the roads leaving each one as CSR spans over the node arrays. Both are already
+  pruned to what can influence the region.
+- **`SETTLEMENT_CELL` is `SECTOR_SIZE`**, deliberately, so a Sector-tier street
+  layout is a strict refinement of 4a's siting rather than a second grid. A
+  settlement's footprint radius is at most `SETTLEMENT_RADIUS_MAX` (186 m), which
+  fits inside one 512 m sector -- but a settlement near a sector corner does not,
+  so 4b has to decide whether a sector lays out the settlements whose CENTRES it
+  contains (simple, and the recommendation) or clips them.
+- **The Sector tier will be the first three-level read**: a sector context can
+  legally `coarser('region')`, and `createTierContext` already supports it. The
+  chunk context would then need both, which is the first time `CoarseData` holds
+  two entries.
+- **Grading composes by weighted average of targets at the strength of the
+  strongest influence** (`networkGrade`). Streets must join that same blend, not
+  add a third independent pass, or a street meeting a road will step.
+- **Do not raise `ROAD_MAX_EDGE` without re-checking `SETTLEMENT_PAD`.** The pad
+  must contain `ROAD_REACH + 1.5 * ROAD_MAX_EDGE`, and the pad is what decides
+  how many river regions road generation touches -- which is where the time goes.
+- **Every geometry budget is unchanged from 3a and still has ~1.7x headroom**,
+  except `chunk payload bytes` at 1.10x, which is structural. Streets that add a
+  mesh per node will move draw calls the way water did; re-derive with a stated
+  number.
+- The soak's flight start was chosen for the sea, the rivers AND the roads it
+  crosses. If 4b needs it to pass a settlement centre, move it deliberately and
+  check `sea at the start`, `river at the start` and `road at the start` in the
+  report afterwards -- all three go quiet without failing.

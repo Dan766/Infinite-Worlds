@@ -77,6 +77,7 @@
  * strict `>`, so there is no dependence on insertion order anywhere.
  */
 
+import { CellHeap } from './cell-heap';
 import { createTierContext, REGION_SIZE, type RegionCoord, type TierContext } from './contracts';
 import { clamp, lerp, smoothstep } from './noise';
 
@@ -219,8 +220,18 @@ export const RIVER_DEPTH_MAX = 20;
  */
 export const RIVER_MAX_CUT = 45;
 
-/** Region networks held at once, per JS context. See the memo note above. */
-export const RIVER_CACHE_LIMIT = 16;
+/**
+ * Region networks held at once, per JS context. See the memo note above.
+ *
+ * Raised from 16 in Phase 4a. 16 was sized for chunk generation, which reads
+ * rivers within one chunk and so touches at most four networks at a time. Road
+ * routing reads them over a 3x3 block of river regions plus blend margins, which
+ * overflowed the old cap and thrashed: 24-28 rebuilds per road region at ~56 ms
+ * each. This is a working-set number, not a taste one -- if a later phase widens
+ * what reads rivers again, measure `riverCacheStats().builds` before assuming it
+ * still fits.
+ */
+export const RIVER_CACHE_LIMIT = 24;
 
 /**
  * Metres per bucket in the per-network segment index.
@@ -271,80 +282,6 @@ export interface RiverNetwork {
   readonly bucketSeg: Int32Array;
   /** Nodes whose chain reaches `terrain.seaLevel` inside this window. */
   readonly nodesReachingSea: number;
-}
-
-// ---------------------------------------------------------------------------
-// A deterministic min-heap over cell indices
-// ---------------------------------------------------------------------------
-
-/**
- * Binary min-heap ordered by `(key[i], i)`.
- *
- * The index tie-break is not tidiness: a flooded plateau produces thousands of
- * cells at exactly the same altitude, and without a total order the pop
- * sequence would depend on the heap's internal shuffling -- which is stable in
- * practice but is not a property anything guarantees. RULE 1 does not accept
- * "stable in practice".
- */
-class CellHeap {
-  private readonly items: Int32Array;
-  private size = 0;
-
-  constructor(
-    capacity: number,
-    private readonly key: Float64Array,
-  ) {
-    this.items = new Int32Array(capacity);
-  }
-
-  get length(): number {
-    return this.size;
-  }
-
-  private before(a: number, b: number): boolean {
-    const ka = this.key[a] as number;
-    const kb = this.key[b] as number;
-    return ka < kb || (ka === kb && a < b);
-  }
-
-  push(cell: number): void {
-    let i = this.size++;
-    this.items[i] = cell;
-    while (i > 0) {
-      const parent = (i - 1) >> 1;
-      if (!this.before(this.items[i] as number, this.items[parent] as number)) break;
-      const swap = this.items[i] as number;
-      this.items[i] = this.items[parent] as number;
-      this.items[parent] = swap;
-      i = parent;
-    }
-  }
-
-  pop(): number {
-    const top = this.items[0] as number;
-    this.size--;
-    if (this.size > 0) {
-      this.items[0] = this.items[this.size] as number;
-      let i = 0;
-      for (;;) {
-        const left = i * 2 + 1;
-        const right = left + 1;
-        let best = i;
-        if (left < this.size && this.before(this.items[left] as number, this.items[best] as number)) {
-          best = left;
-        }
-        if (right < this.size && this.before(this.items[right] as number, this.items[best] as number)) {
-          best = right;
-        }
-        if (best === i) break;
-        const swap = this.items[i] as number;
-        this.items[i] = this.items[best] as number;
-        this.items[best] = swap;
-        i = best;
-      }
-    }
-    return top;
-  }
 }
 
 // ---------------------------------------------------------------------------

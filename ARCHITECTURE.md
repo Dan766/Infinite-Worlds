@@ -74,6 +74,8 @@ src/
     noise.ts            gradient noise, fBm, ridged multifractal, domain warp
     height-field.ts     baseHeight + sampleHeight + SEA_LEVEL + the biome fields. THE terrain.
     rivers.ts           Region-tier flow accumulation and the channel carve
+    roads.ts            Region-tier settlement siting, road graph, routing, grading
+    cell-heap.ts        deterministic (key, index)-ordered min-heap, shared by both
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
     chunk-worker.ts     the Web Worker entry point
     worker-protocol.ts  the main-thread <-> worker message contract
@@ -199,7 +201,23 @@ Two things make this a real use of the tier system rather than a decorative one:
   call from inside `generateRegionRivers` throws. RULE 3 is enforced by the
   context, not by review.
 
-`Sector` is still unused. Phase 4 is expected to be what needs it.
+**Phase 4a adds a SECOND Region-tier generator, and that is what the single
+`coarser('region')` slot had to absorb.** `CoarseData` is keyed by tier NAME, so
+there is exactly one entry per tier however many generators live there. Rivers
+and roads therefore travel together in one `RegionField` record
+(`height-field.ts`) rather than as two coarse reads -- which is also the right
+shape, since a chunk vertex needs both at the same point.
+
+Roads read rivers. They cannot do it through `coarser('region')`, because that
+throws for the generator's own tier, so the river field is an ARGUMENT to
+`generateRegionRoads` -- the same injection discipline `RiverTerrain` already
+uses. `roads.ts` imports nothing from `rivers.ts`; `height-field.ts` wires them
+together. Rivers never read roads, so the graph stays acyclic.
+
+`Sector` is still unused. **Phase 4b** -- street layout inside a settlement --
+is expected to be what needs it, and Phase 4a's settlement lattice is
+deliberately `SECTOR_SIZE` so that 4b is a strict refinement of it rather than a
+second, differently-aligned grid.
 
 ### `baseHeight` and `sampleHeight`: the layer everything after Phase 3 sits on
 
@@ -209,10 +227,33 @@ that modifies the ground:
 
 ```
 baseHeight()    pure terrain, exactly Phase 3a's sampleHeight body.
-                The ONLY thing routing may read.
-sampleHeight()  baseHeight blended toward the carved channel profile.
+                The ONLY thing routing may read -- rivers AND roads.
+sampleHeight()  baseHeight, carved by rivers, then graded by roads.
                 What EVERYTHING downstream reads.
 ```
+
+Phase 4a's roads compose into the same split, in a stated order:
+
+```
+base   = baseHeight(x, z)
+drop   = rivers.drop(x, z, base)          // >= 0, one-directional
+carved = base - drop
+lift   = roads.lift(x, z, carved, drop)   // SIGNED: cuts and fills
+final  = carved + lift
+```
+
+**Rivers are applied first and roads yield to them.** Grading weight is
+multiplied by `1 - smoothstep(0, ROAD_RIVER_YIELD, drop)`, so inside a carved
+channel a road moves no ground at all. Without that, a fill across a channel
+raises the bed above the Phase 3a water surface -- which is built from this very
+height grid -- and the river visibly runs over the top of the dam.
+
+Phase 3b's handoff note guessed the two would combine as a `max` or a sum of
+drops. Neither works: both assume a road's effect is a downward cut, and a road
+that can only cut cannot cross a dip. Grading is a signed blend toward a target
+altitude, so it composes rather than accumulates. **`MIN_HEIGHT` gains
+`ROAD_MAX_CUT` and `MAX_HEIGHT` gains `ROAD_MAX_FILL` -- road grading is the
+first thing in the project that can RAISE the ground.**
 
 **Nothing upstream of the carve may read `sampleHeight`.** If routing saw its own
 output the answer would depend on how many times it had been evaluated, and RULE
@@ -270,6 +311,76 @@ whose catchment reaches more than 1.5 km past a boundary is under-measured by th
 downstream region. Because the field is continuous and combined by max, that
 shows as a channel that is slightly *shallower* for a stretch, never one that
 stops.
+
+### Roads: a Gabriel graph, A* routing, and no cross-region blend
+
+Phase 4a is the second piece of content that spans chunks, and it is decided at
+the Region tier for the same reason rivers are. Per region:
+
+1. score a settlement candidate in every cell of a **global** 512 m lattice,
+   from position-pure fields only, jittered inside its cell by `hash2i`;
+2. keep a candidate iff it is a strict local maximum of that score over its
+   **3x3 neighbourhood** -- which is what guarantees spacing without a global
+   pass, and what makes two regions agree about every settlement they share;
+3. connect the settlements with a **Gabriel graph** capped at `ROAD_MAX_EDGE`;
+4. route each edge with **A\*** on a global 128 m lattice, reading `baseHeight`
+   only, paying a squared slope penalty and a heavy river-crossing penalty;
+5. smooth the path, then give it a **gradient-limited elevation profile**;
+6. index the segments into buckets, recording where a road crosses a channel.
+
+**Why a Gabriel graph and not a minimum spanning tree.** The graph has to be
+decidable from local information, because two neighbouring regions must agree
+about every road near their shared boundary or there is a 4 km seam through the
+world. An MST is not local: adding one settlement at the far edge of a region's
+view can re-route edges arbitrarily far away, and no amount of padding fixes
+that, because the dependency is global by definition. A Gabriel edge `(a, b)`
+exists iff no third settlement lies in the disc having `ab` as its diameter,
+which is decided entirely by settlements near `a` and `b`. `SETTLEMENT_PAD` is
+sized to contain that disc, so the answer is exact rather than approximate.
+
+**Why there is no cross-region blend, unlike rivers.** `rivers.ts` consults up
+to four networks per query and combines them by a weighted maximum, because a
+region's flow ACCUMULATION is truncated at its window edge: neighbouring regions
+genuinely disagree about how big a river is, and the blend is what stops that
+disagreement being a step. Roads have no such quantity. A road's geometry is a
+pure function of its two endpoints, every region routes every edge whose
+corridor comes within `ROAD_REACH` of its square, and **each edge is routed
+inside a window derived from the EDGE, never from the region**, so its path is
+identical whichever region computes it. A query point lies inside exactly one
+region square, and that region has routed everything that can reach it -- so
+**one** region answers each query, a quarter of the lookup cost rivers pay in
+their overlap bands, and continuity across a boundary is exact rather than
+blended. A unit test asserts that two regions produce bit-identical node
+positions for the roads either side of their shared edge.
+
+**The A\* heuristic is deliberately inflated.** Straight-line distance is
+admissible but a very weak bound once the slope penalty is in play, so plain
+A\* degenerated toward Dijkstra and swept the whole search rectangle: 1.5 s per
+region, ten times what this can afford. `HEURISTIC_WEIGHT` gives up the
+guarantee that the path found is the globally cheapest one and buys back about
+an order of magnitude. That is the right trade here and would not be everywhere:
+a road's cost function is a statement of preference, not of correctness, and
+nothing downstream can tell the cheapest route from one a few percent worse.
+What is still guaranteed is what RULE 1 needs -- the search is a deterministic
+function of its inputs, so the same edge yields the same path every time and
+from every region. The frontier is keyed on ENTRIES rather than on cells, since
+`CellHeap` reads its key array at comparison time and lowering an in-heap cell's
+score would silently corrupt the ordering.
+
+**A road crossing a river is a ford, not a bridge, and that is Phase 5's job.**
+The router pays `RIVER_CROSSING_COST` per metre of carve, so crossings are rare
+and land where a channel is narrow; the grading then yields inside the channel,
+so the roadbed runs to the bank and resumes on the far side. Each crossing is
+recorded in `RoadNetwork.segCrossing` so Phase 5 can put a bridge on it.
+
+**A road on flat ground moves no earth at all, and the anti-vacuity counter had
+to account for it.** The profile is smoothed and gradient-limited, but where the
+terrain is already gentle it and the ground agree, so the lift is legitimately
+zero -- measured on one seed, the median road node moves the ground 0.00 m while
+the ninetieth percentile moves 11 m. `ChunkData.roadVertices` therefore counts
+SURFACING, not movement. Counting movement would have reported "no roads" for
+every road on gentle terrain, which is exactly the kind of quietly-passing check
+this project has been caught by five times.
 
 ### The region memo is derived data, and it is bounded
 
@@ -604,6 +715,18 @@ colours, which could only ever prove the coordinate hash was pure. Hashing the
 vertex bits proves the thing that is actually expensive to reproduce, and it is
 the direct statement of RULE 2. Keep it for every remaining phase.
 
+**Since Phase 4a the flight also has to pass a road, and the start moved a third
+time to make that true.** Roads are far sparser than rivers -- about twenty per
+4 km region against hundreds of stream channels -- and the Phase 3a/3b start at
+`(-7000, -3500)` passed EXACTLY ZERO of them in 6.75 km, with no road in any of
+the 25 round-tripped chunks. Every road assertion would have passed without ever
+meeting a road. `(-7500, -3600)` was chosen by searching the seed for a start
+that keeps all three claims real at once rather than trading one away: road
+11/25, river 14/25 and sea 15/25 of the round-tripped chunks, and 2.7 km of open
+water still along the line. `roadNodes`, `roadVertices` and `roadDrawCalls`
+mirror the river trio exactly, including the `Object3D.onBeforeRender` counter,
+because a road is not its own mesh either.
+
 **Since Phase 3b the flight also has to cross a river, and that needs its own
 guard for a reason water did not.** Water is its own submesh, so "was any sea
 drawn" is answerable by looking at the object list. A river is not a mesh -- it
@@ -633,12 +756,12 @@ trip, or on any page error.
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit     | 3a measured | 3b measured                   |
-| ----------------------------- | --------- | ----------- | ----------------------------- |
-| live triangles                | 2,100,000 | 1,229,124   | 1,225,890 peak                |
-| live vertices                 | 1,040,000 | 610,917     | 610,035 peak                  |
-| draw calls                    | 500       | 292         | 288 peak (196 terrain + 92 water) |
-| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB peak                  |
+| Budget                        | Limit     | 3a measured | 3b measured   | 4a measured   |
+| ----------------------------- | --------- | ----------- | ------------- | ------------- |
+| live triangles                | 2,100,000 | 1,229,124   | 1,225,890     | 1,184,272     |
+| live vertices                 | 1,040,000 | 610,917     | 610,035       | 589,065       |
+| draw calls                    | 500       | 292         | 288           | 291           |
+| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB       | 90.5 MB       |
 
 **Phase 3b breached none of them and re-derived none of them.** Rivers are
 carved into the terrain mesh every node already had, so they add no draw call
@@ -647,6 +770,14 @@ into a water-bearing one, and 0.56% of dry ground going under is not enough to
 show. This is the first phase since 2a that left all four limits alone, and that
 is the expected outcome for anything that modifies the height field rather than
 adding geometry.
+
+**Phase 4a breached none of them either, and said so in advance.** Roads grade
+and recolour vertices the terrain mesh already had, so like rivers they add no
+mesh, no draw call and no vertex. The small movements in the 4a column are the
+soak's flight start moving, not roads: the new line crosses less open sea, which
+is why triangles and payload went slightly DOWN. A phase whose content modifies
+the height field should expect to leave all four alone; a phase that adds
+geometry should expect to re-derive them with a stated number, as 3a did.
 
 The first three are the Phase 3a peaks with roughly 1.7x headroom, measured on
 a flight whose shallow-pitch leg crosses 3.5 km of open sea. They are still far

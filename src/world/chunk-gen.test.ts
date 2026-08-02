@@ -32,7 +32,7 @@ import {
   WATER_ALPHA_MAX,
   waterColor,
 } from './chunk-gen';
-import { baseHeight, SEA_LEVEL, sampleHeight, worldRiverField } from './height-field';
+import { baseHeight, SEA_LEVEL, sampleHeight, worldRegionField } from './height-field';
 import {
   CHUNK_DATA_VERSION,
   CHUNK_SIZE,
@@ -238,12 +238,25 @@ describe('rivers reach chunk generation through the tier context', () => {
     // NOT globally memoised, two neighbours would disagree about the ground.
     expect(() =>
       generateChunk({ x: 0, z: 0, lod: 0 }, createTierContext(SEED, 'chunk')),
-    ).toThrow(/Region-tier river data/);
+    ).toThrow(/Region-tier river and road data/);
   });
 
   it('refuses region data belonging to a different seed', () => {
-    const wrong = createTierContext(SEED, 'chunk', { region: worldRiverField(SEED + 1) });
+    const wrong = createTierContext(SEED, 'chunk', { region: worldRegionField(SEED + 1) });
     expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, wrong)).toThrow(/but this chunk is seed/);
+  });
+
+  it('refuses a region record carrying rivers but no roads (RULE 3)', () => {
+    // Phase 4a put a second Region-tier generator in the single 'region' slot.
+    // A half-built record is the new way to get a chunk that disagrees with its
+    // neighbours, so it fails exactly as a missing one does rather than
+    // generating ungraded ground.
+    const half = createTierContext(SEED, 'chunk', {
+      region: { worldSeed: SEED, rivers: worldRegionField(SEED).rivers },
+    });
+    expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, half)).toThrow(
+      /Region-tier river and road data/,
+    );
   });
 
   it('carves some nodes and leaves others completely alone', () => {
@@ -313,11 +326,86 @@ describe('rivers reach chunk generation through the tier context', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Roads reach chunk generation through the same tier context
+// ---------------------------------------------------------------------------
+
+describe('roads reach chunk generation through the tier context', () => {
+  /**
+   * Chunks that a road actually passes through, found from the network rather
+   * than guessed.
+   *
+   * Rivers are dense enough that a diagonal sweep of sixty chunks is certain to
+   * cross one; roads are not. A region carries about twenty of them, each a ~34 m
+   * corridor, so sampling blindly finds nothing and the test would fail for a
+   * reason that has nothing to do with the code. Asking the network where its
+   * nodes are is both reliable and a statement of what is being tested.
+   */
+  function chunksOnRoads(count: number): ChunkCoord[] {
+    const net = worldRegionField(SEED).roads.networkAt(1000, 1000);
+    const out: ChunkCoord[] = [];
+    const seen = new Set<string>();
+    for (let n = 0; n < net.nodeX.length && out.length < count; n++) {
+      const x = Math.floor((net.nodeX[n] as number) / CHUNK_SIZE);
+      const z = Math.floor((net.nodeZ[n] as number) / CHUNK_SIZE);
+      const key = `${x},${z}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ x, z, lod: 0 });
+    }
+    return out;
+  }
+
+  it('grades some nodes and leaves others completely alone', () => {
+    // ANTI-VACUITY, and the road half of it. Every road check in this suite, in
+    // the soak and in the screenshot harness is worthless if the world contains
+    // no roads, and a count of zero looks exactly like "no road near this
+    // chunk". So: prove both kinds of node exist, by looking.
+    let surfaced = 0;
+    let surfacedVertices = 0;
+    for (const coord of chunksOnRoads(12)) {
+      const data = generateChunk(coord, context());
+      if (data.roadVertices > 0) {
+        surfaced++;
+        surfacedVertices += data.roadVertices;
+      }
+    }
+    expect(surfaced).toBeGreaterThan(3);
+    expect(surfacedVertices).toBeGreaterThan(20);
+
+    // And the other half: most of the world has no road in it at all. A grading
+    // field that quietly touched every vertex would be far worse than one that
+    // touched none, because nothing downstream would ever notice.
+    let untouched = 0;
+    for (let i = 0; i < 20; i++) {
+      if (generateChunk({ x: 900 + i * 13, z: -700 - i * 11, lod: 0 }, context()).roadVertices === 0) {
+        untouched++;
+      }
+    }
+    expect(untouched).toBeGreaterThan(10);
+  });
+
+  it('regenerates a graded node byte-identically (RULE 2)', () => {
+    const coord = chunksOnRoads(12).find((c) => generateChunk(c, context()).roadVertices > 0);
+    expect(coord).toBeDefined();
+    const first = generateChunk(coord as ChunkCoord, context());
+    // Unrelated work on other seeds and regions, which evicts both region memos.
+    for (let i = 0; i < 10; i++) generateChunk({ x: i * 9, z: i * 6, lod: 0 }, context(SEED + i));
+    const again = generateChunk(coord as ChunkCoord, context());
+    expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
+    expect(Array.from(again.colors)).toEqual(Array.from(first.colors));
+    expect(again.roadVertices).toBe(first.roadVertices);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Surface colour
 // ---------------------------------------------------------------------------
 
 describe('surfaceColor', () => {
-  const base = { height: 40, slope: 0, temperature: 0.5, humidity: 0.5, variation: 0 };
+  // `road: 0` throughout: every assertion below is about the natural ground, and
+  // Phase 4a's surfacing is applied last and would override all of them. The
+  // road band has its own block further down.
+  const base = { height: 40, slope: 0, temperature: 0.5, humidity: 0.5, variation: 0, road: 0 };
 
   it('paints steep ground as grey rock, whatever it would otherwise have been', () => {
     const spread = (c: number[]): number => Math.max(...c) - Math.min(...c);
@@ -369,15 +457,63 @@ describe('surfaceColor', () => {
     expect(brightness(basin)).toBeLessThan(brightness(shore));
   });
 
+  it('paints a roadbed as surfacing, in every biome', () => {
+    // The road band is applied LAST, over whatever the ground would otherwise
+    // have been, because a road replaces the surface rather than tinting it.
+    // Asserted across the extremes -- a snowy peak, a wet lowland, a desert, a
+    // sea floor -- so a road through a pass reads as a cleared road and not as
+    // slightly grubby snow.
+    const road = surfaceColor({ ...base, road: 1 });
+    for (const height of [-30, 0, 60, 400]) {
+      for (const t of [0, 1]) {
+        for (const h of [0, 1]) {
+          const surfaced = surfaceColor({ ...base, height, temperature: t, humidity: h, road: 1 });
+          for (let c = 0; c < 3; c++) {
+            expect(surfaced[c] as number).toBeCloseTo(road[c] as number, 10);
+          }
+        }
+      }
+    }
+  });
+
+  it('leaves the ground untouched where there is no road', () => {
+    // `road: 0` must be exactly the pre-Phase-4a colour, or every existing
+    // palette assertion in this file is testing something else now.
+    for (const height of [-30, 0, 60, 400]) {
+      const plain = surfaceColor({ ...base, height, road: 0 });
+      const lerped = surfaceColor({ ...base, height, road: 0 });
+      expect(plain).toEqual(lerped);
+    }
+    // And a partial band sits strictly between bare ground and full surfacing.
+    const bare = surfaceColor({ ...base, road: 0 });
+    const half = surfaceColor({ ...base, road: 0.5 });
+    const full = surfaceColor({ ...base, road: 1 });
+    for (let c = 0; c < 3; c++) {
+      const lo = Math.min(bare[c] as number, full[c] as number);
+      const hi = Math.max(bare[c] as number, full[c] as number);
+      expect(half[c] as number).toBeGreaterThanOrEqual(lo);
+      expect(half[c] as number).toBeLessThanOrEqual(hi);
+    }
+  });
+
   it('stays inside [0, 1] across the whole input space', () => {
     for (const height of [-120, -1, 0, 30, 150, 400]) {
       for (const slope of [0, 0.3, 0.7, 1]) {
         for (const t of [0, 0.5, 1]) {
           for (const h of [0, 1]) {
             for (const variation of [-1, 0, 1]) {
-              for (const channel of surfaceColor({ height, slope, temperature: t, humidity: h, variation })) {
-                expect(channel).toBeGreaterThanOrEqual(0);
-                expect(channel).toBeLessThanOrEqual(1);
+              for (const road of [0, 0.5, 1]) {
+                for (const channel of surfaceColor({
+                  height,
+                  slope,
+                  temperature: t,
+                  humidity: h,
+                  variation,
+                  road,
+                })) {
+                  expect(channel).toBeGreaterThanOrEqual(0);
+                  expect(channel).toBeLessThanOrEqual(1);
+                }
               }
             }
           }
@@ -408,8 +544,15 @@ describe('generateChunk', () => {
   });
 
   it('regenerates identically after an interleaved run over other chunks', () => {
+    // Twelve interleaved seeds, not forty. The road memo holds eight networks,
+    // so twelve evicts it half again over -- which is the property being tested
+    // -- while forty spent fifty seconds routing thirty-eight regions nobody
+    // asserts anything about. Phase 3b trimmed the seed counts here for the
+    // same reason when rivers made a fresh seed expensive; Phase 4a makes a
+    // fresh REGION expensive too. Both memos are tested for eviction directly,
+    // and much harder, in `rivers.test.ts` and `roads.test.ts`.
     const first = generateChunk({ x: 9, z: -9, lod: 0 }, context());
-    for (let i = 0; i < 40; i++) generateChunk({ x: i, z: i, lod: 0 }, context(SEED + i));
+    for (let i = 0; i < 12; i++) generateChunk({ x: i * 7, z: i * 5, lod: 0 }, context(SEED + i));
     const again = generateChunk({ x: 9, z: -9, lod: 0 }, context());
     expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
     expect(Array.from(again.colors)).toEqual(Array.from(first.colors));
@@ -485,7 +628,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(4);
+    expect(CHUNK_DATA_VERSION).toBe(5);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -757,7 +900,7 @@ describe('SEA_LEVEL', () => {
     // With `variation` at 0 the tint is exactly 1, so these are equalities
     // rather than approximations: at 14 m below sea level the ground is pure
     // silt, and at 1 m above it is pure sand.
-    const flat = { slope: 0, temperature: 0.5, humidity: 0.5, variation: 0 };
+    const flat = { slope: 0, temperature: 0.5, humidity: 0.5, variation: 0, road: 0 };
     const silt = surfaceColor({ ...flat, height: SEA_LEVEL - 14 });
     const sand = surfaceColor({ ...flat, height: SEA_LEVEL + 1 });
     expect(silt).toEqual([0.33, 0.35, 0.29]);

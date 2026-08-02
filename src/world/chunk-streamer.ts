@@ -127,6 +127,10 @@ export interface ChunkStreamerStats {
   riverNodes: number;
   /** Surface vertices lowered by river carving, across the live nodes. */
   riverVertices: number;
+  /** Live nodes a Phase 4a road or settlement surfaces. Zero away from any road. */
+  roadNodes: number;
+  /** Surface vertices covered by road surfacing, across the live nodes. */
+  roadVertices: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -514,6 +518,8 @@ export class ChunkStreamer {
     let waterTriangles = 0;
     let riverNodes = 0;
     let riverVertices = 0;
+    let roadNodes = 0;
+    let roadVertices = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
@@ -525,6 +531,10 @@ export class ChunkStreamer {
       if (entry.riverVertices > 0) {
         riverNodes++;
         riverVertices += entry.riverVertices;
+      }
+      if (entry.roadVertices > 0) {
+        roadNodes++;
+        roadVertices += entry.roadVertices;
       }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
@@ -545,6 +555,8 @@ export class ChunkStreamer {
       waterTriangles,
       riverNodes,
       riverVertices,
+      roadNodes,
+      roadVertices,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -619,6 +631,18 @@ export class ChunkStreamer {
    * vertices it hashes -- but only if the round-tripped square had a river in
    * it, and over ordinary hillside it does not. The soak fails if none of the
    * chunks it round-tripped were carved.
+   */
+  sampleRoadVertices(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.roadVertices;
+    });
+  }
+
+  /**
+   * River-carved vertices in specific nodes, as above. Phase 4a's road
+   * equivalent is `sampleRoadVertices`, immediately before this.
    */
   sampleRiverVertices(coords: readonly ChunkCoord[]): (number | null)[] {
     return coords.map((coord) => {
@@ -713,6 +737,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.waterNodes} nodes / ${s.waterTriangles} tris live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'roads',
+      () => {
+        const s = this.stats();
+        return `${s.roadNodes} nodes / ${s.roadVertices} surfaced verts live`;
       },
       HudOrder.world,
     );
