@@ -131,6 +131,10 @@ export interface ChunkStreamerStats {
   roadNodes: number;
   /** Surface vertices covered by road surfacing, across the live nodes. */
   roadVertices: number;
+  /** Live nodes a Phase 4b street surfaces. Zero away from any settlement. */
+  streetNodes: number;
+  /** Surface vertices covered by street surfacing, across the live nodes. */
+  streetVertices: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -520,6 +524,8 @@ export class ChunkStreamer {
     let riverVertices = 0;
     let roadNodes = 0;
     let roadVertices = 0;
+    let streetNodes = 0;
+    let streetVertices = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
@@ -535,6 +541,10 @@ export class ChunkStreamer {
       if (entry.roadVertices > 0) {
         roadNodes++;
         roadVertices += entry.roadVertices;
+      }
+      if (entry.streetVertices > 0) {
+        streetNodes++;
+        streetVertices += entry.streetVertices;
       }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
@@ -557,6 +567,8 @@ export class ChunkStreamer {
       riverVertices,
       roadNodes,
       roadVertices,
+      streetNodes,
+      streetVertices,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -623,20 +635,34 @@ export class ChunkStreamer {
   }
 
   /**
-   * River-carved vertices in specific nodes as they are actually resident, or
+   * Road-surfaced vertices in specific nodes as they are actually resident, or
    * null where the node is not loaded.
    *
    * The same anti-vacuity role `sampleWaterTriangles` plays for the sea. The
-   * geometry hash covers carved ground automatically -- carving moves the very
-   * vertices it hashes -- but only if the round-tripped square had a river in
-   * it, and over ordinary hillside it does not. The soak fails if none of the
-   * chunks it round-tripped were carved.
+   * geometry hash covers graded ground automatically -- grading moves the very
+   * vertices it hashes -- but only if the round-tripped square had a road in it,
+   * and over ordinary hillside it does not. The soak fails if none of the chunks
+   * it round-tripped carried one.
    */
   sampleRoadVertices(coords: readonly ChunkCoord[]): (number | null)[] {
     return coords.map((coord) => {
       const key = chunkKey(coord);
       const entry = this.live.get(key) ?? this.cache.peek(key);
       return entry === undefined ? null : entry.roadVertices;
+    });
+  }
+
+  /**
+   * Street-surfaced vertices in specific nodes, as above. Phase 4b's Sector-tier
+   * equivalent of `sampleRoadVertices`, and the one with the weakest signal --
+   * a settlement is a couple of hundred metres across in a 4 km region, so a
+   * flight can cross several roads without touching a village.
+   */
+  sampleStreetVertices(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.streetVertices;
     });
   }
 
@@ -745,6 +771,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.roadNodes} nodes / ${s.roadVertices} surfaced verts live`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'streets',
+      () => {
+        const s = this.stats();
+        return `${s.streetNodes} nodes / ${s.streetVertices} surfaced verts live`;
       },
       HudOrder.world,
     );

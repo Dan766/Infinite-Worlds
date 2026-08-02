@@ -160,13 +160,31 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  *   along the 6.75 km line     road  5/140  river 19/140  sea 80/140
  *
  * Sea along the line drops from 108 samples to 80 -- still 2.7 km of open
- * water -- and the river count is essentially unchanged. Check `sea at the
- * start`, `river at the start` and `road at the start` in the report after any
- * future move: all three go quiet without failing if the route stops being
- * interesting.
+ * water -- and the river count is essentially unchanged.
+ *
+ * PHASE 4b MOVED IT A FOURTH TIME, AND THE TRAP WAS ALREADY SPRUNG. Streets
+ * exist only inside a settlement, and a settlement is a 250 m disc in a 16 km^2
+ * region -- far rarer than a road, let alone a river. Measured on the
+ * (-7500, -3600) square: sea 11/25, river 12/25, road 7/25 and street 0/25. Not
+ * one of the twenty-five round-tripped chunks contained a street, so the
+ * byte-identical-regeneration check would have said nothing whatever about the
+ * phase that had just been written.
+ *
+ * (-6749, -4140) was found by generating the real 5x5 square at every 64 m
+ * offset around every settlement within reach of the corridor and MAXIMISING
+ * THE WORST of the four counts, rather than by trading three away for the
+ * fourth. It sits just off a coastal village at y = 4.2 m:
+ *
+ *   round-tripped 5x5 square   sea 16/25   river 9/25   road 12/25   street 10/25
+ *
+ * Every one of the four is better than or comparable to what the Phase 4a start
+ * gave, and the weakest of them went from 0 to 9. Check `sea at the start`,
+ * `river at the start`, `road at the start` and `street at the start` in the
+ * report after any future move: all four go quiet without failing if the route
+ * stops being interesting.
  */
-const START_X = -7500;
-const START_Z = -3600;
+const START_X = -6749;
+const START_Z = -4140;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and
@@ -225,6 +243,27 @@ const MIN_SHALLOW_RIVER_DRAW_CALLS = 20; // measured  61 peak
 const MIN_ROAD_NODES = 25; //              measured  86 peak of 306 live
 const MIN_ROAD_DRAW_CALLS = 8; //          measured  25 peak
 const MIN_SHALLOW_ROAD_DRAW_CALLS = 8; //  measured  25 peak
+
+/**
+ * PHASE 4b: THE SAME GUARD ONCE MORE, FOR SECTOR-TIER STREETS, AND THIS IS THE
+ * SPARSEST SIGNAL IN THE FILE.
+ *
+ * A street is not a mesh either. It is also far more local than a road: roads
+ * run for kilometres between settlements, streets exist only INSIDE one, so a
+ * node carries street surfacing only while the camera is close enough for the
+ * quadtree to keep that ground at a fine level. `ChunkData.streetVertices`
+ * counts the SECTOR-tier contribution alone and not the settlement pad, which
+ * matters -- the pad already surfaces every vertex in the village, so a
+ * combined count would be non-zero with no streets in it at all.
+ *
+ * The floors are therefore small, and small is not the same as decorative: the
+ * whole point is that a run which never reaches a village has verified nothing
+ * about Phase 4b however green it looks. They are set at roughly a third of a
+ * measured run, which is the same margin the road floors use.
+ */
+const MIN_STREET_NODES = 12; //             measured  44 peak of 309 live
+const MIN_STREET_DRAW_CALLS = 4; //         measured  14 peak
+const MIN_SHALLOW_STREET_DRAW_CALLS = 4; // measured  14 peak
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -332,9 +371,15 @@ try {
   // actually expensive to reproduce -- the mesh -- is byte-identical after an
   // unload and a regeneration, which is what RULE 2 claims.
   //
-  // Anchored to the camera's real position rather than a hardcoded origin,
-  // because the page takes a moment to become ready and the autopilot is
-  // already moving by then.
+  // Anchored to the camera's real position rather than to `START_X` / `START_Z`
+  // directly, which is belt and braces: since Phase 4b the autopilot does not
+  // begin until `__worldReady`, so the two are the same point. They used not to
+  // be. The flight advanced from the first rendered frame, so by the time this
+  // ran the camera had drifted 400-900 m downrange depending on how long the
+  // world took to stream -- which meant every "at the start" claim below was
+  // about a square nobody had chosen, and could not be tuned reproducibly.
+  // Phase 4b found this by picking a start with a village in it and measuring
+  // street 0/25 in the run. See `App.renderFrame`.
   const origin = await page.evaluate(() => window.__app.perfSnapshot());
   const originX = origin.cameraX;
   const originZ = origin.cameraZ;
@@ -365,9 +410,17 @@ try {
   // the round-tripped square had a road in it.
   const roadBefore = await page.evaluate(
     ([x, z]) => window.__app.sampleChunkRoads(x, z, 2),
-    [START_X, START_Z],
+    [originX, originZ],
   );
   const roadChunksAtStart = roadBefore.filter((v) => v !== null && v > 0).length;
+
+  // ...and whether a STREET reached it. The narrowest of the four claims: the
+  // square has to be inside a village, not merely near a road.
+  const streetBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkStreets(x, z, 2),
+    [originX, originZ],
+  );
+  const streetChunksAtStart = streetBefore.filter((v) => v !== null && v > 0).length;
 
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
@@ -411,6 +464,7 @@ try {
       `water ${String(snapshot.waterDrawCalls).padStart(3)}/${String(snapshot.waterNodes).padStart(3)}  ` +
       `river ${String(snapshot.riverDrawCalls).padStart(3)}/${String(snapshot.riverNodes).padStart(3)}  ` +
       `road ${String(snapshot.roadDrawCalls).padStart(3)}/${String(snapshot.roadNodes).padStart(3)}  ` +
+      `street ${String(snapshot.streetDrawCalls).padStart(3)}/${String(snapshot.streetNodes).padStart(3)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
       `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
@@ -454,6 +508,10 @@ try {
   const roadNodes = samples.map((s) => s.roadNodes);
   const roadVerts = samples.map((s) => s.roadVertices);
   const shallowRoadDraws = shallowSamples.map((s) => s.roadDrawCalls);
+  const streetDraws = samples.map((s) => s.streetDrawCalls);
+  const streetNodes = samples.map((s) => s.streetNodes);
+  const streetVerts = samples.map((s) => s.streetVertices);
+  const shallowStreetDraws = shallowSamples.map((s) => s.streetDrawCalls);
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -597,6 +655,18 @@ try {
       ` (floor ${MIN_SHALLOW_ROAD_DRAW_CALLS})`,
   );
   console.log(`  road at the start ${roadChunksAtStart}/${roadBefore.length} round-tripped chunks`);
+
+  console.log('streets (Phase 4b, Sector tier)');
+  console.log(`  street nodes      ${max(streetNodes)} peak of ${max(lives)} live nodes (floor ${MIN_STREET_NODES})`);
+  console.log(`  street vertices   ${max(streetVerts)} peak`);
+  console.log(`  streets DRAWN     ${max(streetDraws)} peak (floor ${MIN_STREET_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowStreetDraws.length === 0 ? 'n/a' : max(shallowStreetDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_STREET_DRAW_CALLS})`,
+  );
+  console.log(
+    `  street at the start ${streetChunksAtStart}/${streetBefore.length} round-tripped chunks`,
+  );
 
   console.log('');
   console.log('frames');
@@ -771,36 +841,71 @@ try {
   }
   // ---- roads, and the vacuity guards around them ------------------------
   if (max(roadVerts) === 0) {
-    fail(
+    failures.push(
       'no road surfacing was generated at any point in the flight. Either ' +
         'grading is broken or the flight path never passed a road -- in which ' +
         'case every road check in this run passed vacuously.',
     );
   }
   if (max(roadNodes) < MIN_ROAD_NODES) {
-    fail(
+    failures.push(
       `only ${max(roadNodes)} surfaced nodes were ever resident (floor ` +
         `${MIN_ROAD_NODES}). The flight barely passed a road.`,
     );
   }
   if (max(roadDraws) < MIN_ROAD_DRAW_CALLS) {
-    fail(
+    failures.push(
       `surfaced terrain was drawn at most ${max(roadDraws)} times in a frame ` +
         `(floor ${MIN_ROAD_DRAW_CALLS}). Roads existing and roads REACHING the ` +
         'rasteriser are different claims.',
     );
   }
   if (shallowSamples.length >= 3 && max(shallowRoadDraws) < MIN_SHALLOW_ROAD_DRAW_CALLS) {
-    fail(
+    failures.push(
       `the shallow-pitch leg drew surfaced terrain at most ${max(shallowRoadDraws)} ` +
         `times in a frame (floor ${MIN_SHALLOW_ROAD_DRAW_CALLS}).`,
     );
   }
   if (roadChunksAtStart === 0) {
-    fail(
+    failures.push(
       'none of the round-tripped chunks carried a road, so the ' +
         'byte-identical-regeneration check said nothing about roads. Move the ' +
         'flight start, deliberately, rather than dropping this check.',
+    );
+  }
+  // ---- streets, and the vacuity guards around them ----------------------
+  if (max(streetVerts) === 0) {
+    failures.push(
+      'no street surfacing was generated at any point in the flight. Either ' +
+        'the Sector tier is broken or the flight never reached a settlement -- ' +
+        'in which case every street check in this run passed vacuously.',
+    );
+  }
+  if (max(streetNodes) < MIN_STREET_NODES) {
+    failures.push(
+      `only ${max(streetNodes)} street-bearing nodes were ever resident (floor ` +
+        `${MIN_STREET_NODES}). The flight barely reached a village.`,
+    );
+  }
+  if (max(streetDraws) < MIN_STREET_DRAW_CALLS) {
+    failures.push(
+      `street-surfaced terrain was drawn at most ${max(streetDraws)} times in a ` +
+        `frame (floor ${MIN_STREET_DRAW_CALLS}). Streets existing and streets ` +
+        'REACHING the rasteriser are different claims.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowStreetDraws) < MIN_SHALLOW_STREET_DRAW_CALLS) {
+    failures.push(
+      `the shallow-pitch leg drew street-surfaced terrain at most ` +
+        `${max(shallowStreetDraws)} times in a frame (floor ` +
+        `${MIN_SHALLOW_STREET_DRAW_CALLS}).`,
+    );
+  }
+  if (streetChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks carried a street, so the ' +
+        'byte-identical-regeneration check said nothing about the Sector tier. ' +
+        'Move the flight start, deliberately, rather than dropping this check.',
     );
   }
 

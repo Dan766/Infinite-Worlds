@@ -110,6 +110,16 @@ import {
   type RegionCoord,
   type TierContext,
 } from './contracts';
+import {
+  closestOnSegment,
+  GradeBlend,
+  GRADE_LIFT,
+  GRADE_OUT_LENGTH,
+  GRADE_STREET_SURFACE,
+  GRADE_SURFACE,
+  ROAD_RIVER_YIELD,
+  SURFACE_ROAD,
+} from './grading';
 import { clamp, lerp, smoothstep } from './noise';
 
 // ---------------------------------------------------------------------------
@@ -152,9 +162,11 @@ export interface RoadRivers {
 /**
  * Metres per settlement lattice cell.
  *
- * `SECTOR_SIZE`, deliberately. Phase 4b lays streets inside a settlement at the
- * Sector tier, and aligning the siting lattice to the sector grid makes that a
- * strict refinement of this rather than a second, differently-aligned grid.
+ * `SECTOR_SIZE`, deliberately, and Phase 4b cashed that in. Aligning the siting
+ * lattice to the sector grid makes `streets.ts` a strict refinement of this
+ * rather than a second, differently-aligned grid -- and because the jitter is
+ * less than half a cell, it also means a sector contains AT MOST ONE settlement
+ * centre, which is the whole basis of how street plans are owned.
  *
  * The lattice is GLOBAL -- cell index is `floor(world / SETTLEMENT_CELL)`, never
  * an offset from a region origin. That is what makes two regions agree about
@@ -275,33 +287,6 @@ export const ROAD_HALF_WIDTH_MAX = 6;
 /** Metres beyond the roadbed over which the grading tapers back to the terrain. */
 export const ROAD_SHOULDER = 11;
 
-/**
- * Hard caps on how far the grading may move the ground, in metres.
- *
- * Cut and fill are separate numbers because they fail differently: a deep cut
- * turns a hillside road into a trench, while a deep fill turns a valley crossing
- * into a dam. They bound `MIN_HEIGHT` and `MAX_HEIGHT` in `height-field.ts` the
- * way `RIVER_MAX_CUT` already does.
- */
-export const ROAD_MAX_CUT = 18;
-export const ROAD_MAX_FILL = 12;
-
-/**
- * Metres of river carve at which road grading is fully suppressed.
- *
- * THE COMPOSITION RULE, AND THE BRIDGE DEFERRAL. Rivers are applied first and
- * roads yield to them: grading weight is multiplied by
- * `1 - smoothstep(0, ROAD_RIVER_YIELD, riverDrop)`, so inside a carved channel a
- * road moves no ground at all.
- *
- * Without this a fill across a channel raises the bed above the Phase 3a water
- * surface -- which is built from this very height grid -- and the river visibly
- * runs over the top of the dam. Yielding instead leaves the roadbed running to
- * the bank and resuming on the far side, which reads as a ford. The crossing is
- * recorded on the network (`segCrossing`) so Phase 5 can put a bridge on it.
- */
-export const ROAD_RIVER_YIELD = 1.5;
-
 /** Extra A* cost, in metres, for stepping across a metre of river carve. */
 const RIVER_CROSSING_COST = 900;
 
@@ -353,8 +338,9 @@ const BUCKET_COLS = BUCKET_SPAN / BUCKET_METRES;
  * Ground coverage a settlement pad contributes to the surface palette.
  *
  * Below 1 deliberately: a village is trampled ground with the biome still
- * showing through, where a roadbed is bare surfacing. Phase 4b's streets and
- * Phase 6's lots are what make a settlement read as built rather than as cleared.
+ * showing through, where a roadbed is bare surfacing. Phase 4b's streets lay a
+ * made surface over parts of it, and Phase 6's lots are what will make a
+ * settlement read as built rather than as cleared.
  */
 const SETTLEMENT_SURFACE = 0.55;
 
@@ -1303,76 +1289,22 @@ export function regionRoads(
 // The grading
 // ---------------------------------------------------------------------------
 
-/** `out[0]` is the signed lift in metres; `out[1]` is surface coverage in [0, 1]. */
-export const GRADE_LIFT = 0;
-export const GRADE_SURFACE = 1;
-
-/**
- * Squared distance from a point to a segment, and where along it that lands.
- *
- * Returned through a caller-owned array rather than an object, because this runs
- * for every segment in a bucket for every one of ~1,200 chunk vertices, and an
- * object literal per call is millions of short-lived allocations per soak run --
- * GC pressure in exactly the frame budget this project is trying to hold.
- */
-function closestOnSegment(
-  px: number,
-  pz: number,
-  ax: number,
-  az: number,
-  bx: number,
-  bz: number,
-  out: Float64Array,
-): void {
-  const dx = bx - ax;
-  const dz = bz - az;
-  const lengthSq = dx * dx + dz * dz;
-  let t = 0;
-  if (lengthSq > 0) {
-    t = clamp(((px - ax) * dx + (pz - az) * dz) / lengthSq, 0, 1);
-  }
-  const cx = ax + dx * t - px;
-  const cz = az + dz * t - pz;
-  out[0] = cx * cx + cz * cz;
-  out[1] = t;
-}
-
 const scratch = new Float64Array(2);
 
 /**
- * The grading one region's network applies at a point.
+ * Add one region network's influence at a point to a blend.
  *
- * Writes `[lift, surface]` into `out`. `carved` is the ground AFTER rivers, and
- * `riverDrop` is how much the river took -- both come from the caller so this
- * module never has to know about `rivers.ts` or evaluate the terrain twice.
+ * ACCUMULATE, DO NOT RESOLVE. Phase 4a resolved here, because roads were the
+ * only grader; Phase 4b's streets are a second grader at the Sector tier, and
+ * the whole point of `GradeBlend` is that both land in one weighted average
+ * rather than in two independent passes. A street that resolved separately would
+ * step against the road it joins wherever their weights differed.
  *
- * Roads and settlement pads are combined by blending toward a WEIGHTED AVERAGE
- * of their target altitudes, at the strength of the strongest single influence.
- * Picking the strongest target outright is the obvious alternative and is wrong:
- * where two influences are equally strong the choice would flip between two
- * different altitudes, which is a step in the ground exactly where a road meets
- * the village it serves.
+ * The river yield is deliberately NOT applied here either -- `resolve` applies
+ * it once, to everything, so a street and its road stand down by exactly the
+ * same amount inside a channel.
  */
-function networkGrade(
-  net: RoadNetwork,
-  x: number,
-  z: number,
-  carved: number,
-  riverDrop: number,
-  out: Float64Array,
-): void {
-  out[GRADE_LIFT] = 0;
-  out[GRADE_SURFACE] = 0;
-
-  // Rivers win. Inside a channel a road moves no ground and paints nothing.
-  const yield_ = 1 - smoothstep(0, ROAD_RIVER_YIELD, riverDrop);
-  if (yield_ <= 0) return;
-
-  let weightSum = 0;
-  let targetSum = 0;
-  let strongest = 0;
-  let surface = 0;
-
+function accumulateNetwork(net: RoadNetwork, x: number, z: number, blend: GradeBlend): void {
   const col = Math.floor((x - net.minX) / BUCKET_METRES);
   const row = Math.floor((z - net.minZ) / BUCKET_METRES);
   if (col >= 0 && row >= 0 && col < BUCKET_COLS && row < BUCKET_COLS) {
@@ -1398,12 +1330,8 @@ function networkGrade(
       const weight = 1 - smoothstep(half, reach, distance);
       if (weight <= 0) continue;
       const target = lerp(net.nodeY[ai] as number, net.nodeY[bi] as number, t);
-      weightSum += weight;
-      targetSum += weight * target;
-      if (weight > strongest) strongest = weight;
       // The surfacing is the bed itself, not the shoulder that blends into it.
-      const bed = 1 - smoothstep(half * 0.6, half * 1.35, distance);
-      if (bed > surface) surface = bed;
+      blend.add(weight, target, 1 - smoothstep(half * 0.6, half * 1.35, distance), SURFACE_ROAD);
     }
   }
 
@@ -1415,18 +1343,8 @@ function networkGrade(
     if (distance >= s.radius) continue;
     const weight = 1 - smoothstep(s.radius * 0.55, s.radius, distance);
     if (weight <= 0) continue;
-    weightSum += weight;
-    targetSum += weight * s.y;
-    if (weight > strongest) strongest = weight;
-    const pad = weight * SETTLEMENT_SURFACE;
-    if (pad > surface) surface = pad;
+    blend.add(weight, s.y, weight * SETTLEMENT_SURFACE, SURFACE_ROAD);
   }
-
-  if (weightSum <= 0) return;
-  const target = targetSum / weightSum;
-  const move = clamp(target - carved, -ROAD_MAX_CUT, ROAD_MAX_FILL);
-  out[GRADE_LIFT] = strongest * yield_ * move;
-  out[GRADE_SURFACE] = surface * yield_;
 }
 
 /**
@@ -1439,13 +1357,29 @@ function networkGrade(
 export interface RegionRoadField {
   readonly terrain: RoadTerrain;
   readonly worldSeed: number;
-  /** Writes `[lift, surface]` into `out`. See `GRADE_LIFT` / `GRADE_SURFACE`. */
+  /**
+   * Add this tier's influence at a point to a blend. THE COMPOSABLE ONE, and
+   * the only one anything downstream of Phase 4b should call: `streets.ts` adds
+   * to the same blend before it is resolved, so a street and the road it joins
+   * share one weighted average instead of grading the ground twice.
+   */
+  accumulate(x: number, z: number, blend: GradeBlend): void;
+  /**
+   * Roads and settlement pads ALONE, resolved. Writes `[lift, surface,
+   * streetSurface]` into `out`, with the last always 0.
+   *
+   * Kept for the tests, which assert the Region tier's own behaviour, and for
+   * anything that legitimately wants the road network without the streets on it.
+   * It is NOT what decides the height of the ground -- see `gradeSurface` in
+   * `height-field.ts`, which is the one composition every renderer and every
+   * collision query goes through.
+   */
   grade(x: number, z: number, carved: number, riverDrop: number, out: Float64Array): void;
-  /** Signed metres to add to the river-carved height. Positive fills, negative cuts. */
+  /** Signed metres to add to the river-carved height, roads alone. */
   lift(x: number, z: number, carved: number, riverDrop: number): number;
   /** Roadbed and settlement-ground coverage at a point, in [0, 1]. */
   surface(x: number, z: number, riverDrop: number): number;
-  /** The network covering a point. Exposed for tests and for Phase 4b. */
+  /** The network covering a point. Exposed for tests and for `streets.ts`. */
   networkAt(x: number, z: number): RoadNetwork;
 }
 
@@ -1475,22 +1409,38 @@ export function regionRoadField(
       Math.floor(z / REGION_SIZE),
     );
 
+  // One blend for the convenience wrappers below. They are off the hot path --
+  // tests and the odd main-thread query -- so a shared instance is enough, and
+  // it keeps them provably identical to what `accumulate` + `resolve` produces.
+  const solo = new GradeBlend();
+  const soloOut = new Float64Array(GRADE_OUT_LENGTH);
+  const accumulate = (x: number, z: number, blend: GradeBlend): void => {
+    accumulateNetwork(networkAt(x, z), x, z, blend);
+  };
+  const resolveSolo = (x: number, z: number, carved: number, riverDrop: number): void => {
+    solo.reset();
+    accumulate(x, z, solo);
+    solo.resolve(carved, riverDrop, soloOut);
+  };
+
   return {
     terrain,
     worldSeed: seed,
     networkAt,
+    accumulate,
     grade(x, z, carved, riverDrop, out) {
-      networkGrade(networkAt(x, z), x, z, carved, riverDrop, out);
+      resolveSolo(x, z, carved, riverDrop);
+      out[GRADE_LIFT] = soloOut[GRADE_LIFT] as number;
+      out[GRADE_SURFACE] = soloOut[GRADE_SURFACE] as number;
+      out[GRADE_STREET_SURFACE] = soloOut[GRADE_STREET_SURFACE] as number;
     },
     lift(x, z, carved, riverDrop) {
-      const out = new Float64Array(2);
-      networkGrade(networkAt(x, z), x, z, carved, riverDrop, out);
-      return out[GRADE_LIFT] as number;
+      resolveSolo(x, z, carved, riverDrop);
+      return soloOut[GRADE_LIFT] as number;
     },
     surface(x, z, riverDrop) {
-      const out = new Float64Array(2);
-      networkGrade(networkAt(x, z), x, z, 0, riverDrop, out);
-      return out[GRADE_SURFACE] as number;
+      resolveSolo(x, z, 0, riverDrop);
+      return soloOut[GRADE_SURFACE] as number;
     },
   };
 }

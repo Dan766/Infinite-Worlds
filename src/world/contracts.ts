@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 5;
+export const CHUNK_DATA_VERSION = 6;
 
 /**
  * The result of generating one chunk.
@@ -310,6 +310,19 @@ export interface ChunkData {
    * near a road" and "grading silently returns zero" produce identical evidence.
    */
   readonly roadVertices: number;
+  /**
+   * Surface vertices covered by a Phase 4b SECTOR-tier street, as opposed to a
+   * Region-tier road or settlement pad. Zero on a node no village reaches.
+   *
+   * A THIRD scalar rather than a wider definition of `roadVertices`, and that is
+   * the whole point of it. A village pad already surfaces its own ground, so
+   * `roadVertices` is non-zero across an entire settlement before a single
+   * street exists -- "the flight passed a village" and "street layout silently
+   * returns nothing" would produce identical evidence, which is exactly the
+   * quietly-passing check this project has been caught by five times. This
+   * counts only the street corridors themselves.
+   */
+  readonly streetVertices: number;
   /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.

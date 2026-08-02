@@ -21,9 +21,11 @@ import { ChunkStreamer } from './world/chunk-streamer';
 import {
   resetRiverDraws,
   resetRoadDraws,
+  resetStreetDraws,
   resetWaterDraws,
   riverDrawsSinceReset,
   roadDrawsSinceReset,
+  streetDrawsSinceReset,
   waterDrawsSinceReset,
 } from './world/chunk-mesh';
 import { sampleHeight } from './world/height-field';
@@ -79,6 +81,12 @@ export class App {
    * road is not its own mesh either. See `chunk-mesh.ts`.
    */
   private roadDrawCalls = 0;
+  /**
+   * Terrain meshes carrying Phase 4b street surfacing actually rasterised in the
+   * last frame. The third of the same guard; a village is a handful of nodes in
+   * a 4 km region, so this is the one most likely to be quietly zero.
+   */
+  private streetDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -232,6 +240,10 @@ export class App {
       roadNodes: chunks.roadNodes,
       roadVertices: chunks.roadVertices,
       roadDrawCalls: this.roadDrawCalls,
+      // Phase 4b, the Sector tier, mirroring the trio above once more.
+      streetNodes: chunks.streetNodes,
+      streetVertices: chunks.streetVertices,
+      streetDrawCalls: this.streetDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -326,6 +338,17 @@ export class App {
     return this.streamer.sampleRoadVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * Street-surfaced vertices in the chunks around a world position, as actually
+   * resident. `null` where the chunk is not loaded.
+   *
+   * The Phase 4b counterpart, and the narrowest of the four: the round-tripped
+   * square has to be inside a village, not merely near a road.
+   */
+  sampleChunkStreets(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleStreetVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -333,7 +356,20 @@ export class App {
 
   private renderFrame(wallDt: number): void {
     this.rig.update(wallDt);
-    if (this.autopilot.active) {
+    // THE FLIGHT DOES NOT START UNTIL THE WORLD IS READY, and that is a Phase 4b
+    // correctness fix rather than a tidy-up. The autopilot used to advance from
+    // the first rendered frame, so it was already moving while the world
+    // streamed in -- on this container that is 8-20 seconds at 45 m/s, i.e. the
+    // soak's flight began anywhere from 400 m to 900 m downrange of `?pos=`, by
+    // an amount that depends on how loaded the machine is.
+    //
+    // Everything the soak says "at the start" is a claim about the chunks around
+    // wherever the camera had drifted to, so choosing a start that crosses a
+    // river, a road and a village was not reproducible: Phase 4b's chosen start
+    // measured street 10/25 in the square it names and 0/25 in the square the
+    // run actually sampled, 760 m away. Holding the flight until
+    // `__worldReady` makes the origin exactly `?pos=`, on every machine.
+    if (this.autopilot.active && window.__worldReady === true) {
       const p = this.rig.position;
       this.rig.setPosition(this.autopilot.advance(wallDt, p.x), p.y, p.z);
     }
@@ -342,10 +378,12 @@ export class App {
     resetWaterDraws();
     resetRiverDraws();
     resetRoadDraws();
+    resetStreetDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
     this.roadDrawCalls = roadDrawsSinceReset();
+    this.streetDrawCalls = streetDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -391,6 +429,7 @@ export class App {
     hud.register('water draws', () => this.waterDrawCalls, HudOrder.render);
     hud.register('river draws', () => this.riverDrawCalls, HudOrder.render);
     hud.register('road draws', () => this.roadDrawCalls, HudOrder.render);
+    hud.register('street draws', () => this.streetDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

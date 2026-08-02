@@ -48,6 +48,13 @@
  */
 
 import { hash2i, hashCombine } from '../core/hash';
+import {
+  GradeBlend,
+  GRADE_LIFT,
+  GRADE_OUT_LENGTH,
+  ROAD_MAX_CUT,
+  ROAD_MAX_FILL,
+} from './grading';
 import { clamp, fbm2, hashUnit, lerp, ridged2, smoothstep, unitToZeroOne, warp2 } from './noise';
 import {
   RIVER_MAX_CUT,
@@ -57,13 +64,12 @@ import {
   type RiverTerrain,
 } from './rivers';
 import {
-  ROAD_MAX_CUT,
-  ROAD_MAX_FILL,
   regionRoadField,
   type RegionRoadField,
   type RoadRivers,
   type RoadTerrain,
 } from './roads';
+import { sectorStreetField, type SectorStreetField } from './streets';
 
 // ---------------------------------------------------------------------------
 // Sea level
@@ -192,7 +198,8 @@ const DETAIL_AMPLITUDE = 13;
  * deepest possible basin is the lowest ground the world can produce. Phase 4a
  * adds `ROAD_MAX_CUT` below and `ROAD_MAX_FILL` above, because road grading is
  * the first thing in the project that can RAISE the ground -- a river only ever
- * cuts, so until now nothing pushed the ceiling.
+ * cuts, so until then nothing pushed the ceiling. Phase 4b's streets add
+ * nothing here: they share the same caps, because they share the same blend.
  */
 export const MIN_HEIGHT =
   SHELF_FLOOR - HILL_AMPLITUDE - DETAIL_AMPLITUDE - RIVER_MAX_CUT - ROAD_MAX_CUT;
@@ -474,45 +481,94 @@ export function worldRegionField(worldSeed: number): RegionField {
 }
 
 /**
- * The road field this module's own `sampleHeight` grades with.
+ * Everything the SECTOR tier produces, in the second slot `TierContext` gives it.
  *
- * Built once per seed and held, rather than rebuilt per call: the memo inside
- * `roads.ts` is keyed on the terrain by reference, and the river field this
- * closes over must also stay stable, or the main thread would re-route a region
- * on every call.
+ * Phase 4b, and the first time `CoarseData` holds two entries at once. A sector
+ * record is not one sector's data any more than the region record is one
+ * region's: it is a whole-world accessor that memoises per sector behind
+ * `streets.ts`, exactly as `RegionRoadField` does per region. That is what lets
+ * a single object serve a chunk whose padded sample grid straddles a sector
+ * boundary, and a coarse quadtree node that spans sixteen of them.
  */
-let mainRoadSeed = -1;
-let mainRoadField: RegionRoadField | undefined;
+export type SectorField = SectorStreetField;
 
-function worldRoadField(worldSeed: number): RegionRoadField {
-  if (mainRoadField === undefined || mainRoadSeed !== worldSeed) {
-    mainRoadSeed = worldSeed;
-    mainRoadField = regionRoadField(
-      WORLD_TERRAIN,
-      roadRivers(regionRiverField(WORLD_TERRAIN, worldSeed)),
-      habitability,
-      worldSeed,
-    );
+/**
+ * The Region- and Sector-tier records this module's own `sampleHeight` grades
+ * with, built once per seed and held.
+ *
+ * Rebuilding them per call would be a correctness problem, not just a slow one:
+ * both memos are keyed on the terrain by REFERENCE, and the sector field closes
+ * over the region record, so a fresh object per call would re-route a region on
+ * the main thread every time anything asked for the height of the ground.
+ */
+let mainSeed = -1;
+let mainRegion: RegionField | undefined;
+let mainSectors: SectorField | undefined;
+
+function mainFields(worldSeed: number): { region: RegionField; sectors: SectorField } {
+  if (mainRegion === undefined || mainSectors === undefined || mainSeed !== worldSeed) {
+    mainSeed = worldSeed;
+    mainRegion = worldRegionField(worldSeed);
+    mainSectors = sectorStreetField(mainRegion, worldSeed);
   }
-  return mainRoadField;
+  return { region: mainRegion, sectors: mainSectors };
 }
+
+/**
+ * THE COMPOSITION, IN ONE PLACE. Everything that grades the ground contributes
+ * to one blend, which is then resolved once.
+ *
+ * There is deliberately no second copy of this: `sampleHeight` below calls it on
+ * the main thread and `chunk-gen.ts` calls it per vertex inside the worker, and
+ * `chunk-gen.test.ts` asserts the two agree with `===`. The moment a caller
+ * resolves roads and streets separately and adds the results, a street stops
+ * meeting the road it joins -- the weighted average is not distributive, which
+ * is the whole reason it is a weighted average.
+ *
+ * `blend` and `out` are caller-owned so the per-vertex path allocates nothing.
+ */
+export function gradeSurface(
+  region: RegionField,
+  sectors: SectorField,
+  x: number,
+  z: number,
+  carved: number,
+  riverDrop: number,
+  blend: GradeBlend,
+  out: Float64Array,
+): void {
+  blend.reset();
+  region.roads.accumulate(x, z, blend);
+  sectors.accumulate(x, z, blend);
+  blend.resolve(carved, riverDrop, out);
+}
+
+/** One scratch pair for the main thread's own `sampleHeight`. Never re-entered. */
+const mainBlend = new GradeBlend();
+const mainOut = new Float64Array(GRADE_OUT_LENGTH);
 
 /**
  * Ground height in metres at a world-space point.
  *
  * THE single source of truth, and still the only name any caller needs: since
- * Phase 3b it is `baseHeight` with river channels carved into it, and since
- * Phase 4a with road and settlement grading on top of that, so every existing
- * caller -- chunk vertices, normals, the water surface, the cube's seating, the
- * camera's ground-relative default Y -- sees both without changing a line.
+ * Phase 3b it is `baseHeight` with river channels carved into it, since Phase 4a
+ * with road and settlement grading on top of that, and since Phase 4b with
+ * Sector-tier streets in the same blend -- so every existing caller (chunk
+ * vertices, normals, the water surface, the cube's seating, the camera's
+ * ground-relative default Y) sees all three without changing a line.
  *
  * THE ORDER IS THE COMPOSITION RULE, AND IT IS DELIBERATE. Rivers are applied
- * first and roads yield to them (`ROAD_RIVER_YIELD` in `roads.ts`), so a road
- * can never fill a channel and dam the river running through it. The handoff
- * note for this phase guessed the two would combine as a `max` or a sum of
- * drops; neither works, because both assume the road's effect is a downward cut,
- * and a road that can only cut cannot cross a dip. Grading is a signed blend
- * toward a target altitude, so it composes rather than accumulates.
+ * first and everything else yields to them (`ROAD_RIVER_YIELD` in `grading.ts`),
+ * so a road can never fill a channel and dam the river running through it. The
+ * Phase 3b handoff guessed the two would combine as a `max` or a sum of drops;
+ * neither works, because both assume the road's effect is a downward cut, and a
+ * road that can only cut cannot cross a dip. Grading is a signed blend toward a
+ * target altitude, so it composes rather than accumulates.
+ *
+ * ROADS AND STREETS ARE ONE BLEND, NOT TWO STEPS. They are different tiers, but
+ * `gradeSurface` above accumulates both before resolving once, because a
+ * weighted average is not distributive: resolving each and adding the lifts
+ * would put a step exactly where a street meets the road it joins.
  *
  * If this and the rendered mesh ever disagree, the bug is in whoever duplicated
  * it, not here.
@@ -522,5 +578,7 @@ export function sampleHeight(x: number, z: number, worldSeed: number): number {
   const base = baseHeight(x, z, seed);
   const drop = riverDrop(WORLD_TERRAIN, seed, x, z, base);
   const carved = base - drop;
-  return carved + worldRoadField(seed).lift(x, z, carved, drop);
+  const fields = mainFields(seed);
+  gradeSurface(fields.region, fields.sectors, x, z, carved, drop, mainBlend, mainOut);
+  return carved + (mainOut[GRADE_LIFT] as number);
 }

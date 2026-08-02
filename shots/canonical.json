@@ -154,6 +154,26 @@
       "name": "road-region-seam",
       "params": "?time=3&pos=4096,367,3505&look=0,-89",
       "expect": "Phase 4a. THE REGION-BOUNDARY CANARY, mirroring `river-region-seam`, and the most likely visual failure of any Region-tier phase. Straight down from 300 m onto the point where two roads meet at a junction and cross x = 4096 -- a REGION boundary, 4 km of world -- so the boundary is the vertical centre line of the frame. Roads are routed per region; unlike rivers they take NO cross-region blend at all, because each edge is routed in a window derived from the EDGE rather than the region, so one region answers each query and agreement is exact rather than approximate. The roads must cross the centre line with no kink, no step in width and no change in surfacing. A unit test asserts the same thing in bytes; this is the version a human can check."
+    },
+    {
+      "name": "settlement-streets",
+      "params": "?time=3&pos=2634,350,110&look=0,-88",
+      "expect": "Phase 4b, AND THE VIEW THAT SAYS THE PHASE HAPPENED. Straight down from 305 m onto the same settlement `settlement-footprint` frames from 830 m, close enough that the Sector-tier street plan is legible: an irregular ring at 0.58 of the footprint radius, spokes running in to the centre, and dead-end lanes running out to 0.78 of it. The road from the south-west crosses the ring and continues to the middle, and there is deliberately NO lane lying along it -- a candidate street within about 37 degrees of a road leaving the same settlement is dropped, which is what makes a street plan a refinement of the road network rather than a second corridor on top of it. Two failures show here first: a perfectly regular cartwheel means the angular jitter has been lost, and a lane running down the same line as the road means the clearance rule has."
+    },
+    {
+      "name": "settlement-streets-shallow",
+      "params": "?time=3&pos=2470,60,110&look=-90,-6",
+      "expect": "Phase 4b. THE SHALLOW-PITCH STREET VIEW, standing inside the village about 15 m above its own graded altitude and looking east across it to the sea. Every geometry budget in this project is decided near the horizon, because a steeply pitched camera measures frustum culling rather than the world, so the phase needs at least one street view at that pitch. It is also the angle at which the grading is visible AS grading: the ring crosses the frame as flat, surfaced ground carrying the settlement's altitude out past the flat core of the pad, with the shoulder tapering back into the grass either side. If streets ever stop grading and become surfacing alone, this view goes flat while the aerial one barely changes."
+    },
+    {
+      "name": "settlement-streets-wireframe",
+      "params": "?time=3&pos=2380,200,110&look=-90,-32&wireframe=1",
+      "expect": "Phase 4b. The structural view, and the one that says what a street IS right now. The village is the patch of lod-0 lattice in the middle distance, and the street plan is a deformation of that ordinary 32x32 grid -- there is no street mesh, no extra draw call and no new buffer, exactly as a river channel and a road bench are deformations of the same lattice. The quadtree's level rings are visible around it, which is the other half of the point: the streets are only resolvable where the ground is fine, so `streetVertices` is a near-camera quantity and the soak's floors are set accordingly. If a later phase gives streets their own geometry, this is the view that will show it."
+    },
+    {
+      "name": "settlement-sector-seam",
+      "params": "?time=3&pos=2560,300,110&look=0,-89",
+      "expect": "Phase 4b. THE SECTOR-BOUNDARY CANARY, mirroring `river-region-seam` and `road-region-seam` one tier down, and the most likely visual failure of the phase. Straight down onto x = 2560, a SECTOR boundary, so the boundary is the vertical centre line of the frame -- and this settlement's centre is only 74 m east of it, so its western lane and part of its ring lie in the sector NEXT DOOR, which owns no settlement at all. A sector lays out only the settlement whose centre it contains, so the ground west of the centre line is graded by a record belonging to the sector east of it; if a query ever read only its own sector, the village would be sliced off along this line. Nothing may change across it: no break in the ring, no step in the pad, no change in surfacing."
     }
   ]
 }

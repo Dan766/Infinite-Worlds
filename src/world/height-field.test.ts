@@ -27,7 +27,7 @@ import {
   sampleHeight,
   temperature,
 } from './height-field';
-import { ROAD_MAX_FILL } from './roads';
+import { ROAD_MAX_FILL } from './grading';
 
 const SEED = hashString('height-field-test');
 const OTHER = hashString('a different world');

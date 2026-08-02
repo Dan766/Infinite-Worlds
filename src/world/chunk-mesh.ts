@@ -166,10 +166,6 @@ export function resetRiverDraws(): void {
   riverDraws = 0;
 }
 
-const countRiverDraw = (): void => {
-  riverDraws++;
-};
-
 /**
  * Terrain meshes carrying Phase 4a road surfacing, actually rasterised since
  * the last reset.
@@ -191,15 +187,44 @@ export function resetRoadDraws(): void {
   roadDraws = 0;
 }
 
-const countRoadDraw = (): void => {
-  roadDraws++;
-};
+/**
+ * Terrain meshes carrying Phase 4b street surfacing, actually rasterised since
+ * the last reset. The third of the same guard, and the one with the weakest
+ * signal to protect: a village is a handful of nodes in a 4 km region.
+ */
+let streetDraws = 0;
 
-/** Both counters on one mesh, so a node with a road AND a river reports both. */
-const countRiverAndRoadDraw = (): void => {
-  riverDraws++;
-  roadDraws++;
-};
+/** Street-bearing terrain meshes drawn since `resetStreetDraws`. Read straight after a render. */
+export function streetDrawsSinceReset(): number {
+  return streetDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetStreetDraws(): void {
+  streetDraws = 0;
+}
+
+/**
+ * One `onBeforeRender` callback per combination of features a node can carry.
+ *
+ * Phase 4a hand-wrote the two single counters and the one pair, which is fine
+ * for two features and is eight functions for three. A table indexed by a
+ * feature mask is built once at module load instead: still allocation-free, and
+ * a fourth feature is one more bit rather than eight more hand-written
+ * combinations.
+ *
+ * Index 0 is deliberately absent: a node with no feature at all gets no
+ * `onBeforeRender` hook, so the common case pays nothing per draw.
+ */
+const FEATURE_RIVER = 1;
+const FEATURE_ROAD = 2;
+const FEATURE_STREET = 4;
+
+const FEATURE_COUNTERS: readonly (() => void)[] = Array.from({ length: 8 }, (_, mask) => () => {
+  if ((mask & FEATURE_RIVER) !== 0) riverDraws++;
+  if ((mask & FEATURE_ROAD) !== 0) roadDraws++;
+  if ((mask & FEATURE_STREET) !== 0) streetDraws++;
+});
 
 /**
  * Phase 3a: the water surface material.
@@ -366,6 +391,8 @@ export interface ChunkMesh {
   readonly riverVertices: number;
   /** Surface vertices Phase 4a road surfacing covers. Zero on most nodes. */
   readonly roadVertices: number;
+  /** Surface vertices Phase 4b street surfacing covers. Zero on almost all nodes. */
+  readonly streetVertices: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -382,16 +409,15 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
   mesh.matrixAutoUpdate = false;
   mesh.updateMatrix();
   // Only on a node that actually carries carved or surfaced ground, so the
-  // counters mean "a river/road reached the screen" rather than "terrain reached
-  // the screen". `onBeforeRender` is a single slot, so a node carrying both gets
-  // the combined callback rather than silently losing one of the two.
-  if (data.riverVertices > 0 && data.roadVertices > 0) {
-    mesh.onBeforeRender = countRiverAndRoadDraw;
-  } else if (data.riverVertices > 0) {
-    mesh.onBeforeRender = countRiverDraw;
-  } else if (data.roadVertices > 0) {
-    mesh.onBeforeRender = countRoadDraw;
-  }
+  // counters mean "a river/road/street reached the screen" rather than "terrain
+  // reached the screen". `onBeforeRender` is a single slot, so a node carrying
+  // several features gets the one callback that counts all of them rather than
+  // silently losing the rest.
+  const features =
+    (data.riverVertices > 0 ? FEATURE_RIVER : 0) |
+    (data.roadVertices > 0 ? FEATURE_ROAD : 0) |
+    (data.streetVertices > 0 ? FEATURE_STREET : 0);
+  if (features !== 0) mesh.onBeforeRender = FEATURE_COUNTERS[features] as () => void;
 
   const waterGeometry = createWaterGeometry(data);
   let waterMesh: THREE.Mesh | null = null;
@@ -441,6 +467,7 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     waterTriangles: data.waterIndices.length / 3,
     riverVertices: data.riverVertices,
     roadVertices: data.roadVertices,
+    streetVertices: data.streetVertices,
   };
 }
 

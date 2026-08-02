@@ -20,6 +20,7 @@
 import { describe, expect, it } from 'vitest';
 import { hashString } from '../core/hash';
 import { createTierContext, REGION_SIZE } from './contracts';
+import { ROAD_MAX_CUT, ROAD_MAX_FILL, ROAD_RIVER_YIELD } from './grading';
 import { baseHeight, SEA_LEVEL, sampleHeight, worldRegionField } from './height-field';
 import { regionRiverField } from './rivers';
 import {
@@ -34,11 +35,8 @@ import {
   ROAD_CACHE_LIMIT,
   ROAD_CELL,
   ROAD_HALF_WIDTH_MAX,
-  ROAD_MAX_CUT,
   ROAD_MAX_EDGE,
-  ROAD_MAX_FILL,
   ROAD_MAX_GRADE,
-  ROAD_RIVER_YIELD,
   ROAD_SHOULDER,
   SETTLEMENT_CELL,
   SETTLEMENT_MIN_ALTITUDE,

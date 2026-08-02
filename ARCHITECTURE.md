@@ -57,6 +57,14 @@ No game engine, no React, no state library.
    after 5 minutes of continuous movement; <=16ms main-thread frame time with no
    GC spikes above 4ms.
 
+   **The two frame budgets were unverifiable from Phase 1 to Phase 4a** -- the
+   dev container has no GPU -- and were measured on real hardware after 4a
+   landed: 60 fps at 1080p on an Intel Arc 140V, p99 main-thread work 6.5 ms,
+   worst main-thread GC 5.45 ms. The first two pass; **the GC limit does not**,
+   and is recorded as missed in `PROGRESS.md`. See "Measuring the frame budgets"
+   under Verification for how, and for the two ways of measuring this that give
+   a confident wrong answer.
+
 ## Module map
 
 ```
@@ -75,6 +83,8 @@ src/
     height-field.ts     baseHeight + sampleHeight + SEA_LEVEL + the biome fields. THE terrain.
     rivers.ts           Region-tier flow accumulation and the channel carve
     roads.ts            Region-tier settlement siting, road graph, routing, grading
+    streets.ts          Sector-tier street layout inside a settlement
+    grading.ts          the one weighted-average blend everything that moves ground joins
     cell-heap.ts        deterministic (key, index)-ordered min-heap, shared by both
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
     chunk-worker.ts     the Web Worker entry point
@@ -153,6 +163,9 @@ placeholder `chunks` and `worker queue` lines without editing `app.ts`.
 contracts.ts    types only       importable from a worker and from Node
 noise.ts        pure functions   no Three, no DOM, built on core/hash.ts
 rivers.ts       pure functions   Region tier; imports contracts + noise ONLY
+grading.ts      pure functions   the blend rule; imports noise ONLY
+roads.ts        pure functions   Region tier; imports contracts + grading + noise
+streets.ts      pure functions   Sector tier; imports contracts + grading + roads
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
@@ -214,10 +227,11 @@ throws for the generator's own tier, so the river field is an ARGUMENT to
 uses. `roads.ts` imports nothing from `rivers.ts`; `height-field.ts` wires them
 together. Rivers never read roads, so the graph stays acyclic.
 
-`Sector` is still unused. **Phase 4b** -- street layout inside a settlement --
-is expected to be what needs it, and Phase 4a's settlement lattice is
-deliberately `SECTOR_SIZE` so that 4b is a strict refinement of it rather than a
-second, differently-aligned grid.
+**Phase 4b fills the hole in the middle: `Region -> Sector -> Chunk` is now all
+three.** Street layout inside a settlement is decided at the Sector tier, a
+sector context legally calls `coarser('region')` -- the first three-level read in
+the project -- and `chunkTierContext` is the first place `CoarseData` holds two
+entries at once. See "Streets" below.
 
 ### `baseHeight` and `sampleHeight`: the layer everything after Phase 3 sits on
 
@@ -382,6 +396,89 @@ SURFACING, not movement. Counting movement would have reported "no roads" for
 every road on gentle terrain, which is exactly the kind of quietly-passing check
 this project has been caught by five times.
 
+### Streets: the Sector tier, and one blend for everything that moves ground
+
+Phase 4b is the first content decided at the **Sector** tier, which had been
+declared since Phase 1 and read by nothing. Per sector:
+
+1. find the settlement whose **centre** the sector contains -- there is at most
+   one, and this is exact rather than approximate: `SETTLEMENT_CELL` **is**
+   `SECTOR_SIZE`, both lattices are global and anchored at the origin, and
+   `SETTLEMENT_JITTER` (190 m) is less than half a cell (256 m), so a candidate
+   can never leave the cell that owns it. `generateSectorStreets` throws if it
+   ever finds two, because that would mean the alignment had broken;
+2. take the **bearings of the roads leaving** that settlement, from the Region
+   record read through `coarser('region')`;
+3. lay a **ring** at 0.58 of the footprint radius, jittered radially and
+   angularly so it is a village and not a cartwheel;
+4. hang **lanes** outward to 0.78 of the radius and **spokes** inward to the
+   centre off alternating ring nodes, dropping any whose bearing is within about
+   37 degrees of a road -- so a street never duplicates a road;
+5. give every node the settlement's own altitude as its grading target.
+
+**A sector lays out the settlement whose centre it contains; it does not clip.**
+Clipping was the alternative and is rejected on the same grounds the Gabriel
+graph was chosen on in Phase 4a: a street plan is a whole-settlement structure,
+so two sectors each owning half of one would each need the other half's
+information to decide its own.
+
+**The consequence is that a query reads up to four sectors, and there is no
+blend.** A settlement's streets overhang its sector by up to `STREET_REACH`
+(derived, ~116 m, deliberately under half a sector), so a point consults every
+sector whose square inflated by that contains it: one normally, four near a
+corner. That is the shape `rivers.ts` uses, not the shape `roads.ts` uses -- but
+unlike rivers there is nothing to reconcile, because two sectors never both own a
+settlement, so what they contribute is **disjoint** and the union is exact.
+
+**One region per sector, and it is the right one.** A sector lies entirely inside
+one region, and so does the settlement whose centre it contains -- and the region
+containing a settlement is guaranteed to have routed every Gabriel edge incident
+to it (the edge's bounding box contains the settlement, which is inside the
+region). So the roads a street plan avoids are read from the one region that has
+all of them, and every sector needing that settlement reads the same region.
+
+**Everything that moves the ground joins ONE weighted average, in `grading.ts`.**
+Phase 4a had a single grader and kept the blend inside `roads.ts`; Phase 4b adds
+a second at a different tier, and two copies of a rule whose whole job is making
+two influences meet without a step is exactly the duplication that drifts --
+`cell-heap.ts` was lifted out of `rivers.ts` for the same reason. `GradeBlend`
+accumulates `(weight, target, surface)` from both tiers and resolves once:
+
+```
+target = sum(weight * target) / sum(weight)
+lift   = strongest * yield * clamp(target - carved, -ROAD_MAX_CUT, +ROAD_MAX_FILL)
+```
+
+Resolving each tier separately and adding the lifts is the obvious alternative
+and is wrong: a weighted average is not distributive, so the ledge would appear
+exactly where a street meets the road it joins. Taking the SUM of the weights as
+the strength is the other obvious alternative and is also wrong: two roads side
+by side would grade harder than either alone and a crossroads would punch a hole.
+The river yield is applied once, in `resolve`, so a street and its road stand
+down by exactly the same amount inside a channel.
+
+**Every street node targets the settlement's own altitude** -- the same target
+the pad uses, and the same one a road leaving the settlement is pinned to at its
+first node. That is what makes the junction step-free by construction rather than
+by tuning, and it is also the visible content of the phase: the pad grades a disc
+flat, the streets carry that altitude out along a ring and its lanes, so a
+settlement's graded footprint becomes a wheel rather than a circle. The street
+shoulder is 8 m rather than the 5 m first tried, because at 5 m the resulting
+bench at the end of a lane was measurably steeper than anything the roads and the
+pad produce on their own.
+
+**No trigonometry, and that is a determinism requirement rather than a style.** A
+street node's position decides a vertex's altitude, and `Math.sin` / `Math.cos`
+are only approximated by the ECMAScript spec. `ringDirection` walks the L1 unit
+diamond -- pure linear arithmetic -- and normalises each point onto the unit
+circle with one `Math.sqrt`, which IEEE-754 requires to be correctly rounded.
+
+**`ChunkData.streetVertices` is a THIRD counter, not a wider `roadVertices`.** A
+settlement pad already surfaces every vertex in a village, so a combined number
+is non-zero across a whole settlement with no street in it at all -- "the flight
+never reached a village" and "street layout silently returns nothing" would
+produce identical evidence. This counts the Sector-tier contribution alone.
+
 ### The region memo is derived data, and it is bounded
 
 Every chunk vertex needs river influence; a chunk is ~1,200 vertices and hundreds
@@ -439,6 +536,11 @@ bounds it to about 300 for 4 km of terrain where a flat lod-0 disc would need
 
 Do not lower `SEGMENTS` because the dev container renders slowly. The container
 has no GPU; its numbers come from SwiftShader and are a measurement artifact.
+
+**Phase 4a's measurement on the same Arc 140V settles this.** With rivers, roads
+and water all in the scene the app holds 60 fps at 1080p with p99 main-thread
+work of 6.5 ms. The 2a profile's conclusion held for four more phases: frame
+time is still not the problem, and `SEGMENTS` is still not the thing to cut.
 
 Three properties hold this together:
 
@@ -727,6 +829,23 @@ water still along the line. `roadNodes`, `roadVertices` and `roadDrawCalls`
 mirror the river trio exactly, including the `Object3D.onBeforeRender` counter,
 because a road is not its own mesh either.
 
+**Since Phase 4b the flight also has to reach a SETTLEMENT, and the start moved
+a fourth time -- because the trap had already been sprung.** Streets exist only
+inside a settlement, which is a 250 m disc in a 16 km^2 region, so they are far
+rarer than a road let alone a river. Measured on the Phase 4a start
+`(-7500, -3600)`: sea 11/25, river 12/25, road 7/25 and **street 0/25**. Not one
+of the twenty-five round-tripped chunks contained a street, so the
+byte-identical-regeneration check would have said nothing whatever about the
+phase that had just been written. `(-6749, -4140)` was found by generating the
+real 5x5 square at every 64 m offset around every settlement within reach of the
+corridor and **maximising the worst of the four counts** rather than trading
+three away for the fourth: sea 16/25, river 9/25, road 12/25, street 10/25. The
+weakest of the four went from 0 to 9. `streetNodes`, `streetVertices` and
+`streetDrawCalls` mirror the road trio exactly, and `ChunkData.streetVertices`
+counts the SECTOR-tier contribution alone -- a settlement pad already surfaces
+every vertex in a village, so a combined number would be non-zero with no street
+in it at all.
+
 **Since Phase 3b the flight also has to cross a river, and that needs its own
 guard for a reason water did not.** Water is its own submesh, so "was any sea
 drawn" is answerable by looking at the object list. A river is not a mesh -- it
@@ -756,12 +875,12 @@ trip, or on any page error.
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit     | 3a measured | 3b measured   | 4a measured   |
-| ----------------------------- | --------- | ----------- | ------------- | ------------- |
-| live triangles                | 2,100,000 | 1,229,124   | 1,225,890     | 1,184,272     |
-| live vertices                 | 1,040,000 | 610,917     | 610,035       | 589,065       |
-| draw calls                    | 500       | 292         | 288           | 291           |
-| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB       | 90.5 MB       |
+| Budget                        | Limit     | 3a measured | 3b measured | 4a measured | 4b measured |
+| ----------------------------- | --------- | ----------- | ----------- | ----------- | ----------- |
+| live triangles                | 2,100,000 | 1,229,124   | 1,225,890   | 1,184,272   | 1,144,318   |
+| live vertices                 | 1,040,000 | 610,917     | 610,035     | 589,065     | 567,869     |
+| draw calls                    | 500       | 292         | 288         | 291         | 290         |
+| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB     | 90.5 MB     | 84.8 MB     |
 
 **Phase 3b breached none of them and re-derived none of them.** Rivers are
 carved into the terrain mesh every node already had, so they add no draw call
@@ -778,6 +897,24 @@ soak's flight start moving, not roads: the new line crosses less open sea, which
 is why triangles and payload went slightly DOWN. A phase whose content modifies
 the height field should expect to leave all four alone; a phase that adds
 geometry should expect to re-derive them with a stated number, as 3a did.
+
+**Phase 4b breached none of them either, for the third phase running.** Streets
+are graded and surfaced into the terrain mesh every node already had. The 4b
+column moved for two reasons that are not streets: the flight start moved again,
+and the autopilot now waits for `__worldReady`, so the run measures a different
+6.75 km of world from the one 4a measured. **Phase 5's road meshes are the first
+thing since 2b that should expect to move these numbers**, and the instruction is
+unchanged: re-derive with a stated number rather than raising a limit quietly.
+
+**One caveat on the screenshot baselines, found in Phase 4b.** The committed PNGs
+are specific to the machine that captured them, not just to SwiftShader: the set
+committed from the Linux dev container does not reproduce on Windows, and a view
+this project's own code had not touched came back with a different hash there.
+The baselines in `shots/` are now the Windows set. Whichever platform a phase
+runs on, the way to tell a real change from a platform one is to capture the same
+view twice on the SAME machine, once from the previous commit's source -- which
+is how 4b established that it changed 19 of the 30 existing views and left 11
+alone.
 
 The first three are the Phase 3a peaks with roughly 1.7x headroom, measured on
 a flight whose shallow-pitch leg crosses 3.5 km of open sea. They are still far
@@ -827,6 +964,38 @@ default speed takes about 40 seconds. Judge the trend on a full-length run.
 
 Re-run this at every subsequent phase. A leak introduced in Phase 6 is far
 cheaper to find in Phase 6 than in Phase 11.
+
+### Measuring the frame budgets
+
+The soak reports fps and frame time but does not fail on them, because every
+number it produces in the dev container comes from SwiftShader. RULE 5's two
+frame budgets can only be judged on a machine with a GPU, and were first
+measured that way after Phase 4a. There is **no committed command for this yet**
+-- worth adding as `npm run perf:gpu`.
+
+Four things make the measurement mean something, and the first two are how a
+careful attempt still gets it wrong:
+
+- **Never measure frame cost from `requestAnimationFrame` deltas.** They are
+  vsync-locked, so on a 60 Hz panel 16.7 ms is the floor and the app can never
+  read better than the budget however much headroom it has. Measured this way,
+  an app sitting comfortably at vsync reports "48% of frames over 16.7 ms".
+  Main-thread cost comes from `RunTask` events on the `CrRendererMain` thread in
+  a Chrome trace, taken over CDP.
+- **The trace needs the `toplevel` category** for those events to exist at all.
+  `devtools.timeline` alone yields GC events but zero tasks -- and a percentile
+  over an empty set reads as a comfortable pass. Assert the task count is
+  non-zero, in the same spirit as the `shots:check` anti-vacuity guards.
+- **Attribute GC to a thread.** The generation workers allocate far more than the
+  renderer does and their collections cannot drop a frame; counting all threads
+  together inflated the worst pause from 5.45 ms to 24.58 ms and the count of
+  pauses over 4 ms from 3 to 52. Only `CrRendererMain` collections count.
+- **Measure while moving, not parked.** The budget says "continuous movement"
+  because that is when chunks stream, meshes upload and the allocator is busy.
+
+Measure the production build served statically, not the dev server, and check
+the reported WebGL renderer string before trusting anything: if it names
+SwiftShader the run is worthless.
 
 ## Commands
 

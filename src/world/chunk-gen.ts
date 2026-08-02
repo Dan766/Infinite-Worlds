@@ -19,15 +19,24 @@
 
 import { rngAt2i } from '../core/hash';
 import {
+  gradeSurface,
   humidity,
   SEA_LEVEL,
   sampleHeight,
   temperature,
   worldRegionField,
   type RegionField,
+  type SectorField,
 } from './height-field';
+import {
+  GradeBlend,
+  GRADE_LIFT,
+  GRADE_OUT_LENGTH,
+  GRADE_STREET_SURFACE,
+  GRADE_SURFACE,
+} from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
-import { GRADE_LIFT, GRADE_SURFACE } from './roads';
+import { sectorStreetField } from './streets';
 import {
   CHUNK_DATA_VERSION,
   createTierContext,
@@ -38,22 +47,33 @@ import {
 } from './contracts';
 
 /**
- * The tier context a chunk generator needs: a world seed plus the REGION-tier
- * record, which is what decides where rivers and roads go.
+ * The tier context a chunk generator needs: a world seed, the REGION-tier record
+ * that decides where rivers and roads go, and since Phase 4b the SECTOR-tier
+ * record that decides where the streets inside a settlement go.
  *
- * RULE 3 in one function. Rivers and roads span hundreds of chunks, so no chunk
- * may decide where one runs; the routing happens at the Region tier and arrives
- * here as coarse data. `generateChunk` reads it through `coarser('region')` and
- * throws if it is missing, rather than reaching around the tier system and
- * calling `rivers.ts` or `roads.ts` itself -- which would work, and would
- * quietly make the tier plumbing decorative.
+ * RULE 3 in one function. Rivers, roads and street plans all span more ground
+ * than a chunk, so no chunk may decide where one runs; each is decided at the
+ * tier that contains it and arrives here as coarse data. `generateChunk` reads
+ * both through `coarser()` and throws if either is missing, rather than reaching
+ * around the tier system and calling `rivers.ts`, `roads.ts` or `streets.ts`
+ * itself -- which would work, and would quietly make the tier plumbing
+ * decorative.
  *
- * `CoarseData` has one slot per tier NAME, so both generators travel in a single
- * `RegionField`. Both are memoised behind it, so building a context per chunk
- * costs a couple of objects.
+ * THIS IS WHERE `CoarseData` FINALLY HOLDS TWO ENTRIES. It has one slot per tier
+ * NAME, so rivers and roads still travel together in a single `RegionField`
+ * however many Region-tier generators there are; what is new is a second TIER.
+ * The sector record is built FROM the region record rather than beside it, so
+ * the two share one memo chain and a sector's road lookups are hits.
+ *
+ * Everything behind both is memoised, so building a context per chunk costs a
+ * handful of objects.
  */
 export function chunkTierContext(worldSeed: number): TierContext {
-  return createTierContext(worldSeed, 'chunk', { region: worldRegionField(worldSeed) });
+  const region = worldRegionField(worldSeed);
+  return createTierContext(worldSeed, 'chunk', {
+    region,
+    sector: sectorStreetField(region, worldSeed),
+  });
 }
 
 /**
@@ -77,6 +97,18 @@ const RIVER_VERTEX_MIN_CUT = 0.25;
  * Surfacing is present wherever a road is, flat or not.
  */
 const ROAD_VERTEX_MIN_SURFACE = 0.25;
+
+/**
+ * Street coverage below which a vertex is not counted as "on a street".
+ *
+ * The same threshold as the road one, on a DIFFERENT quantity: this is the
+ * Sector-tier contribution alone. A settlement pad surfaces its whole disc at
+ * `SETTLEMENT_SURFACE`, so every vertex in a village already passes the road
+ * test before a street is laid; without a separate number, "the flight never
+ * reached a village" and "street layout silently returns nothing" would be
+ * indistinguishable. See `ChunkData.streetVertices`.
+ */
+const STREET_VERTEX_MIN_SURFACE = 0.25;
 
 /**
  * Convert HSL to RGB. Hand-rolled rather than borrowed from Three.js because
@@ -702,11 +734,11 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
 
   const worldSeed = context.worldSeed;
 
-  // RULE 3: the river network and the road network are Region-tier data and
-  // arrive through the tier context. Missing is a hard error rather than a
-  // silent fall-back to ungraded terrain, which would render a chunk that
-  // disagrees with its neighbours about where the ground is. Use
-  // `chunkTierContext`.
+  // RULE 3: the river and road networks are Region-tier data and the street
+  // plans are Sector-tier data, and all of it arrives through the tier context.
+  // Missing is a hard error rather than a silent fall-back to ungraded terrain,
+  // which would render a chunk that disagrees with its neighbours about where
+  // the ground is. Use `chunkTierContext`.
   const region = context.coarser<RegionField>('region');
   if (region === undefined || region.rivers === undefined || region.roads === undefined) {
     throw new Error(
@@ -719,8 +751,19 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
       `Region data is for seed ${region.worldSeed} but this chunk is seed ${worldSeed}`,
     );
   }
+  const sectors = context.coarser<SectorField>('sector');
+  if (sectors === undefined) {
+    throw new Error(
+      'generateChunk needs Sector-tier street data on its TierContext. ' +
+        'Build the context with chunkTierContext(worldSeed).',
+    );
+  }
+  if (sectors.worldSeed !== worldSeed) {
+    throw new Error(
+      `Sector data is for seed ${sectors.worldSeed} but this chunk is seed ${worldSeed}`,
+    );
+  }
   const rivers = region.rivers;
-  const roads = region.roads;
   const side = VERTS_PER_EDGE;
   const size = chunkSizeAt(coord.lod);
   const step = size / SEGMENTS;
@@ -733,11 +776,14 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   // Heights on a grid padded by one cell, so every interior normal has both
   // neighbours available and border normals match the adjacent chunk exactly.
   //
-  // Heights come from the Region-tier record, spelled out as
+  // Heights come from the coarse records, spelled out as
   // `baseHeight - drop + lift` rather than through `sampleHeight`, so the carve
   // depth and the grading are available for the statistics below without paying
-  // for a second `baseHeight` evaluation. It is the identical arithmetic
-  // `sampleHeight` performs -- `chunk-gen.test.ts` asserts that with `===`,
+  // for a second `baseHeight` evaluation. The composition itself is NOT spelled
+  // out -- `gradeSurface` is the one implementation both this and `sampleHeight`
+  // call, because roads and streets land in a single weighted average and
+  // resolving them separately here would put a step at every village. It is the
+  // identical arithmetic `sampleHeight` performs -- `chunk-gen.test.ts` asserts that with `===`,
   // which is what keeps the worker and the main thread on the same ground.
   //
   // The road surface coverage is kept as well, because the palette needs it a
@@ -746,11 +792,14 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   const padded = side + 2;
   const heights = new Float64Array(padded * padded);
   const surfacing = new Float64Array(padded * padded);
-  // One scratch pair for the whole chunk. `grade` writes into it rather than
-  // returning an object, so ~1,200 vertices cost zero allocations.
-  const grade = new Float64Array(2);
+  // One blend and one scratch triple for the whole chunk. `gradeSurface` writes
+  // into them rather than returning an object, so ~1,200 vertices cost zero
+  // allocations.
+  const blend = new GradeBlend();
+  const grade = new Float64Array(GRADE_OUT_LENGTH);
   let riverVertices = 0;
   let roadVertices = 0;
+  let streetVertices = 0;
   for (let row = -1; row <= SEGMENTS + 1; row++) {
     const worldZ = vertexWorldZ(coord, row);
     for (let col = -1; col <= SEGMENTS + 1; col++) {
@@ -758,14 +807,16 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
       const base = rivers.terrain.height(worldX, worldZ, worldSeed);
       const drop = rivers.drop(worldX, worldZ, base);
       const carved = base - drop;
-      roads.grade(worldX, worldZ, carved, drop, grade);
+      gradeSurface(region, sectors, worldX, worldZ, carved, drop, blend, grade);
       const lift = grade[GRADE_LIFT] as number;
       const at = (row + 1) * padded + (col + 1);
       heights[at] = carved + lift;
       surfacing[at] = grade[GRADE_SURFACE] as number;
       const inside = col >= 0 && col <= SEGMENTS && row >= 0 && row <= SEGMENTS;
-      if (drop >= RIVER_VERTEX_MIN_CUT && inside) riverVertices++;
-      if ((grade[GRADE_SURFACE] as number) >= ROAD_VERTEX_MIN_SURFACE && inside) roadVertices++;
+      if (!inside) continue;
+      if (drop >= RIVER_VERTEX_MIN_CUT) riverVertices++;
+      if ((grade[GRADE_SURFACE] as number) >= ROAD_VERTEX_MIN_SURFACE) roadVertices++;
+      if ((grade[GRADE_STREET_SURFACE] as number) >= STREET_VERTEX_MIN_SURFACE) streetVertices++;
     }
   }
   const heightAt = (col: number, row: number): number =>
@@ -926,6 +977,7 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     waterIndices: water.indices,
     riverVertices,
     roadVertices,
+    streetVertices,
     color: chunkColor(coord, worldSeed),
     minY,
     maxY,

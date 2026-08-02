@@ -246,6 +246,18 @@ describe('rivers reach chunk generation through the tier context', () => {
     expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, wrong)).toThrow(/but this chunk is seed/);
   });
 
+  it('refuses a chunk context with no Sector-tier street data (RULE 3)', () => {
+    // Phase 4b. The Sector tier is a SECOND coarse entry, and a chunk built
+    // without it would grade roads but not the streets inside a settlement --
+    // ungraded ground next to graded ground, i.e. a step at every village that
+    // straddles a chunk boundary. Missing is an error, exactly as for the
+    // region record.
+    const regionOnly = createTierContext(SEED, 'chunk', { region: worldRegionField(SEED) });
+    expect(() => generateChunk({ x: 0, z: 0, lod: 0 }, regionOnly)).toThrow(
+      /Sector-tier street data/,
+    );
+  });
+
   it('refuses a region record carrying rivers but no roads (RULE 3)', () => {
     // Phase 4a put a second Region-tier generator in the single 'region' slot.
     // A half-built record is the new way to get a chunk that disagrees with its
@@ -394,6 +406,51 @@ describe('roads reach chunk generation through the tier context', () => {
     expect(Array.from(again.positions)).toEqual(Array.from(first.positions));
     expect(Array.from(again.colors)).toEqual(Array.from(first.colors));
     expect(again.roadVertices).toBe(first.roadVertices);
+  });
+
+  it('counts STREET vertices separately from road ones (Phase 4b)', () => {
+    // THE ANTI-VACUITY THAT MATTERS MOST IN 4b, and the reason `streetVertices`
+    // is a third scalar rather than a wider `roadVertices`. A settlement pad
+    // surfaces its whole disc, so every vertex in a village already passes the
+    // road test before a single street exists: "the chunk is in a village" and
+    // "street layout works" would otherwise be the same observation.
+    const settlement = worldRegionField(SEED)
+      .roads.networkAt(1000, 1000)
+      .settlements.slice()
+      .sort((a, b) => b.radius - a.radius)[0];
+    expect(settlement).toBeDefined();
+    const cx = Math.floor((settlement as { x: number }).x / CHUNK_SIZE);
+    const cz = Math.floor((settlement as { z: number }).z / CHUNK_SIZE);
+
+    let streeted = 0;
+    let streetVertices = 0;
+    let roadOnly = 0;
+    for (let dz = -2; dz <= 2; dz++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const data = generateChunk({ x: cx + dx, z: cz + dz, lod: 0 }, context());
+        expect(data.streetVertices).toBeLessThanOrEqual(data.roadVertices);
+        if (data.streetVertices > 0) {
+          streeted++;
+          streetVertices += data.streetVertices;
+        } else if (data.roadVertices > 0) {
+          roadOnly++;
+        }
+      }
+    }
+    expect(streeted).toBeGreaterThan(2);
+    expect(streetVertices).toBeGreaterThan(50);
+    // The pad reaches further than the streets do, so the village edge is
+    // road-surfaced without being street-surfaced. If that never happened, the
+    // two counters would be measuring the same thing.
+    expect(roadOnly).toBeGreaterThan(0);
+
+    // Most of the world is not a village at all.
+    let untouched = 0;
+    for (let i = 0; i < 20; i++) {
+      const data = generateChunk({ x: 900 + i * 13, z: -700 - i * 11, lod: 0 }, context());
+      if (data.streetVertices === 0) untouched++;
+    }
+    expect(untouched).toBe(20);
   });
 });
 
@@ -628,7 +685,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(5);
+    expect(CHUNK_DATA_VERSION).toBe(6);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);

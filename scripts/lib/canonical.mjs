@@ -7,7 +7,7 @@
  * apart in how they capture.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -30,9 +30,18 @@ export function loadCanonical() {
 /**
  * Always rebuild before capturing. A stale `dist/` producing green baselines is
  * the single most expensive failure mode this harness could have.
+ *
+ * `execSync` rather than `execFileSync`, and that is a portability fix rather
+ * than a preference. `npm` is `npm.cmd` on Windows: `execFileSync('npm', ...)`
+ * cannot resolve the extension (ENOENT), and since Node 20.12 it refuses to
+ * spawn a `.cmd` at all without a shell (EINVAL, part of the fix for argument
+ * injection on Windows). Either way the whole capture died before a single view
+ * was taken, which is how `npm run shots` came to be unrunnable outside the dev
+ * container. The command is a compile-time constant, so nothing a caller
+ * controls reaches the interpreter.
  */
 export function buildProject() {
-  execFileSync('npm', ['run', 'build'], { cwd: PROJECT_ROOT, stdio: 'inherit' });
+  execSync('npm run build', { cwd: PROJECT_ROOT, stdio: 'inherit' });
 }
 
 /**
