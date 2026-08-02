@@ -171,6 +171,37 @@ const countRiverDraw = (): void => {
 };
 
 /**
+ * Terrain meshes carrying Phase 4a road surfacing, actually rasterised since
+ * the last reset.
+ *
+ * Exactly the same guard as `riverDraws`, and for exactly the same reason: a
+ * road is not a mesh either, it is surfacing and grading applied to the terrain
+ * mesh every node already had. Without this, "the flight never passed a road"
+ * and "grading silently returns zero" are the same observation.
+ */
+let roadDraws = 0;
+
+/** Road-bearing terrain meshes drawn since `resetRoadDraws`. Read straight after a render. */
+export function roadDrawsSinceReset(): number {
+  return roadDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetRoadDraws(): void {
+  roadDraws = 0;
+}
+
+const countRoadDraw = (): void => {
+  roadDraws++;
+};
+
+/** Both counters on one mesh, so a node with a road AND a river reports both. */
+const countRiverAndRoadDraw = (): void => {
+  riverDraws++;
+  roadDraws++;
+};
+
+/**
  * Phase 3a: the water surface material.
  *
  * `transparent` with a four-component vertex colour is the entire depth-fade
@@ -333,6 +364,8 @@ export interface ChunkMesh {
   readonly waterTriangles: number;
   /** Surface vertices a Phase 3b river channel lowered. Zero on most nodes. */
   readonly riverVertices: number;
+  /** Surface vertices Phase 4a road surfacing covers. Zero on most nodes. */
+  readonly roadVertices: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -348,9 +381,17 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
   mesh.renderOrder = chunkRenderOrder(data.coord);
   mesh.matrixAutoUpdate = false;
   mesh.updateMatrix();
-  // Only on a node that actually carries carved ground, so the counter means
-  // "a river reached the screen" rather than "terrain reached the screen".
-  if (data.riverVertices > 0) mesh.onBeforeRender = countRiverDraw;
+  // Only on a node that actually carries carved or surfaced ground, so the
+  // counters mean "a river/road reached the screen" rather than "terrain reached
+  // the screen". `onBeforeRender` is a single slot, so a node carrying both gets
+  // the combined callback rather than silently losing one of the two.
+  if (data.riverVertices > 0 && data.roadVertices > 0) {
+    mesh.onBeforeRender = countRiverAndRoadDraw;
+  } else if (data.riverVertices > 0) {
+    mesh.onBeforeRender = countRiverDraw;
+  } else if (data.roadVertices > 0) {
+    mesh.onBeforeRender = countRoadDraw;
+  }
 
   const waterGeometry = createWaterGeometry(data);
   let waterMesh: THREE.Mesh | null = null;
@@ -399,6 +440,7 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     vertices: (data.positions.length + data.waterPositions.length) / 3,
     waterTriangles: data.waterIndices.length / 3,
     riverVertices: data.riverVertices,
+    roadVertices: data.roadVertices,
   };
 }
 

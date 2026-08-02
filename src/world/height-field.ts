@@ -56,6 +56,14 @@ import {
   type RegionRiverField,
   type RiverTerrain,
 } from './rivers';
+import {
+  ROAD_MAX_CUT,
+  ROAD_MAX_FILL,
+  regionRoadField,
+  type RegionRoadField,
+  type RoadRivers,
+  type RoadTerrain,
+} from './roads';
 
 // ---------------------------------------------------------------------------
 // Sea level
@@ -181,10 +189,15 @@ const DETAIL_AMPLITUDE = 13;
  * terrain sits well inside them; they are a guarantee, not a description.
  *
  * The floor drops by `RIVER_MAX_CUT` from Phase 3b: a channel carved into the
- * deepest possible basin is the lowest ground the world can produce.
+ * deepest possible basin is the lowest ground the world can produce. Phase 4a
+ * adds `ROAD_MAX_CUT` below and `ROAD_MAX_FILL` above, because road grading is
+ * the first thing in the project that can RAISE the ground -- a river only ever
+ * cuts, so until now nothing pushed the ceiling.
  */
-export const MIN_HEIGHT = SHELF_FLOOR - HILL_AMPLITUDE - DETAIL_AMPLITUDE - RIVER_MAX_CUT;
-export const MAX_HEIGHT = SHELF_CEILING + MOUNTAIN_AMPLITUDE + HILL_AMPLITUDE + DETAIL_AMPLITUDE;
+export const MIN_HEIGHT =
+  SHELF_FLOOR - HILL_AMPLITUDE - DETAIL_AMPLITUDE - RIVER_MAX_CUT - ROAD_MAX_CUT;
+export const MAX_HEIGHT =
+  SHELF_CEILING + MOUNTAIN_AMPLITUDE + HILL_AMPLITUDE + DETAIL_AMPLITUDE + ROAD_MAX_FILL;
 
 // ---------------------------------------------------------------------------
 // The biome fields
@@ -379,7 +392,7 @@ export function baseHeight(x: number, z: number, worldSeed: number): number {
  * REFERENCE when it looks in its memo, so a fresh object literal per call would
  * turn every cache hit into a 56 ms miss.
  */
-const WORLD_TERRAIN: RiverTerrain = {
+const WORLD_TERRAIN: RiverTerrain & RoadTerrain = {
   id: 'height-field',
   seaLevel: SEA_LEVEL,
   height: baseHeight,
@@ -397,14 +410,109 @@ export function worldRiverField(worldSeed: number): RegionRiverField {
   return regionRiverField(WORLD_TERRAIN, worldSeed);
 }
 
+// ---------------------------------------------------------------------------
+// Roads and settlements
+// ---------------------------------------------------------------------------
+
+/**
+ * How habitable the climate is at a point, in [0, 1].
+ *
+ * Passed into the road generator rather than imported by it, because
+ * `roads.ts` must not depend on this module -- see the layering note there.
+ * Wet temperate ground scores highest; a desert and a tundra both score low,
+ * which is what keeps settlements out of the extremes without a biome table.
+ */
+function habitability(x: number, z: number, worldSeed: number): number {
+  const warmth = 1 - Math.abs(temperature(x, z, worldSeed) - 0.62) * 2.4;
+  const wet = smoothstep(0.25, 0.62, humidity(x, z, worldSeed));
+  return clamp(warmth, 0, 1) * (0.35 + 0.65 * wet);
+}
+
+/**
+ * The road generator's view of the rivers, bound to one seed.
+ *
+ * A module-level factory per seed, held by `worldRegionField`, so the object
+ * identity is stable for the life of a region record. `roads.ts` only ever asks
+ * for the carve depth -- where a crossing is expensive, and where grading must
+ * stand down.
+ */
+function roadRivers(rivers: RegionRiverField): RoadRivers {
+  return { drop: (x, z, base) => rivers.drop(x, z, base) };
+}
+
+/**
+ * Everything the Region tier produces, in the single slot `TierContext` gives it.
+ *
+ * `CoarseData` is keyed by tier NAME, so there is exactly one `'region'` entry
+ * however many generators live at that tier. Rivers and roads therefore travel
+ * together in one record rather than as two coarse reads -- which is also the
+ * right shape, since a chunk vertex needs both at the same point and would
+ * otherwise pay two lookups to say so.
+ */
+export interface RegionField {
+  readonly worldSeed: number;
+  readonly rivers: RegionRiverField;
+  readonly roads: RegionRoadField;
+}
+
+/**
+ * The Region-tier record for this world, for a chunk generator to read through
+ * `TierContext.coarser('region')`.
+ *
+ * The road field is handed the SAME `WORLD_TERRAIN` constant the river field
+ * uses, for the same reason: both memos compare terrain by reference, so a
+ * fresh literal per call would turn every cache hit into a rebuild.
+ */
+export function worldRegionField(worldSeed: number): RegionField {
+  const seed = worldSeed >>> 0;
+  const rivers = regionRiverField(WORLD_TERRAIN, seed);
+  return {
+    worldSeed: seed,
+    rivers,
+    roads: regionRoadField(WORLD_TERRAIN, roadRivers(rivers), habitability, seed),
+  };
+}
+
+/**
+ * The road field this module's own `sampleHeight` grades with.
+ *
+ * Built once per seed and held, rather than rebuilt per call: the memo inside
+ * `roads.ts` is keyed on the terrain by reference, and the river field this
+ * closes over must also stay stable, or the main thread would re-route a region
+ * on every call.
+ */
+let mainRoadSeed = -1;
+let mainRoadField: RegionRoadField | undefined;
+
+function worldRoadField(worldSeed: number): RegionRoadField {
+  if (mainRoadField === undefined || mainRoadSeed !== worldSeed) {
+    mainRoadSeed = worldSeed;
+    mainRoadField = regionRoadField(
+      WORLD_TERRAIN,
+      roadRivers(regionRiverField(WORLD_TERRAIN, worldSeed)),
+      habitability,
+      worldSeed,
+    );
+  }
+  return mainRoadField;
+}
+
 /**
  * Ground height in metres at a world-space point.
  *
  * THE single source of truth, and still the only name any caller needs: since
- * Phase 3b it is `baseHeight` with river channels carved into it, so every
- * existing caller -- chunk vertices, normals, the water surface, the cube's
- * seating, the camera's ground-relative default Y -- sees rivers without
- * changing a line.
+ * Phase 3b it is `baseHeight` with river channels carved into it, and since
+ * Phase 4a with road and settlement grading on top of that, so every existing
+ * caller -- chunk vertices, normals, the water surface, the cube's seating, the
+ * camera's ground-relative default Y -- sees both without changing a line.
+ *
+ * THE ORDER IS THE COMPOSITION RULE, AND IT IS DELIBERATE. Rivers are applied
+ * first and roads yield to them (`ROAD_RIVER_YIELD` in `roads.ts`), so a road
+ * can never fill a channel and dam the river running through it. The handoff
+ * note for this phase guessed the two would combine as a `max` or a sum of
+ * drops; neither works, because both assume the road's effect is a downward cut,
+ * and a road that can only cut cannot cross a dip. Grading is a signed blend
+ * toward a target altitude, so it composes rather than accumulates.
  *
  * If this and the rendered mesh ever disagree, the bug is in whoever duplicated
  * it, not here.
@@ -412,5 +520,7 @@ export function worldRiverField(worldSeed: number): RegionRiverField {
 export function sampleHeight(x: number, z: number, worldSeed: number): number {
   const seed = worldSeed >>> 0;
   const base = baseHeight(x, z, seed);
-  return base - riverDrop(WORLD_TERRAIN, seed, x, z, base);
+  const drop = riverDrop(WORLD_TERRAIN, seed, x, z, base);
+  const carved = base - drop;
+  return carved + worldRoadField(seed).lift(x, z, carved, drop);
 }

@@ -129,6 +129,31 @@
       "name": "river-region-seam",
       "params": "?time=3&pos=8192,560,9760&look=0,-89",
       "expect": "Phase 3b. THE REGION-BOUNDARY CANARY, and the single most likely visual failure of the phase. Straight down from 560 m onto the point where a strong river crosses x = 8192 -- a REGION boundary, 4 km of world -- so the boundary is the vertical centre line of the frame and the channel crosses it diagonally at the middle. Rivers are routed per region; a river routed only inside its own region stops dead at the edge, and at 4 km scale that reads as a wall across the world. Here the channel must run through the centre line with no change of width, depth or direction. Nothing else in the harness looks at a region boundary at all."
+    },
+    {
+      "name": "road-benched-hillside",
+      "params": "?time=3&pos=2384,66,1104&look=-135.0,-9",
+      "expect": "Phase 4a. THE SHALLOW-PITCH ROAD VIEW, and the one that says the phase happened. A road runs away from the camera up a shallow rise, its packed-earth surfacing following a bench cut into the slope, with the shoulder visible either side as a darker taper back into the grass. Every geometry budget in this project is judged near the horizon, because a steeply pitched camera measures frustum culling rather than the world, so the phase needs at least one road view at that pitch. Two failures show here first: a road that stopped being graded reads as a stripe painted over undisturbed relief, and a road that stopped being surfaced disappears into the grass while the bench remains."
+    },
+    {
+      "name": "road-wireframe-bench",
+      "params": "?time=3&pos=2384,66,1104&look=-135.0,-9&wireframe=1",
+      "expect": "Phase 4a. The same road in wireframe: the structural view. Two things are only visible here. First, the grading lives in the ORDINARY terrain vertex grid -- there is no road mesh, no extra draw call, and the bench is a deformation of the same 32x32 lattice every node has had since Phase 2a, exactly as a river channel is. Second, how few vertices a road actually occupies: the corridor is about 12 m of flat bed plus an 11 m shoulder, which at 2 m resolution is a handful of cells wide. If a later phase gives roads their own geometry, this is the view that will show it."
+    },
+    {
+      "name": "settlement-footprint",
+      "params": "?time=3&pos=2634,880,110&look=0,-88",
+      "expect": "Phase 4a. Straight down from 830 m onto a large settlement (radius 161 m) 2.6 km east of the origin, with a road leaving it to the south-west, a river system to the east and the sea in the corner. The footprint is a pad graded flat to the site's own altitude and surfaced as trampled ground -- deliberately weaker surfacing than a roadbed, because a village is cleared ground and a road is a made surface. This is where settlement SITING is judged: the pad must sit on gentle ground well above water, near fresh water but not in the channel. Phase 4b lays streets inside this pad and Phase 6 puts buildings on them, so this is the before picture for both, and it is expected to look sparse until then."
+    },
+    {
+      "name": "road-river-ford",
+      "params": "?time=3&pos=-2296,72,4728&look=-135.0,-16",
+      "expect": "Phase 4a. THE COMPOSITION RULE, BY EYE: a road meeting a river channel 16 m deep. Rivers are applied first and roads yield to them, so the graded, surfaced roadbed climbs from the foreground, STOPS at the near bank, and the road resumes as a faint trace on the far side -- a ford. What must NOT be here is a dam: if grading ever stopped yielding inside a channel, the fill would raise the bed above the water surface and the river would visibly run over the top of it, which is the worst-looking failure this phase can produce. The crossing is recorded in the network so Phase 5 can put a bridge on it; there is deliberately no bridge yet, and the gap is the honest picture of that."
+    },
+    {
+      "name": "road-region-seam",
+      "params": "?time=3&pos=4096,367,3505&look=0,-89",
+      "expect": "Phase 4a. THE REGION-BOUNDARY CANARY, mirroring `river-region-seam`, and the most likely visual failure of any Region-tier phase. Straight down from 300 m onto the point where two roads meet at a junction and cross x = 4096 -- a REGION boundary, 4 km of world -- so the boundary is the vertical centre line of the frame. Roads are routed per region; unlike rivers they take NO cross-region blend at all, because each edge is routed in a window derived from the EDGE rather than the region, so one region answers each query and agreement is exact rather than approximate. The roads must cross the centre line with no kink, no step in width and no change in surfacing. A unit test asserts the same thing in bytes; this is the version a human can check."
     }
   ]
 }

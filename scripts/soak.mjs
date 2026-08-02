@@ -142,15 +142,31 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  * passed by never encountering any, and the phase would have shipped green
  * having verified nothing.
  *
- * (-7000, -3500) is 3.5 km of open sea on that seed, with a coastline at
- * x = -3400 and mountains beyond it, so a single flight crosses deep water,
- * a shoreline and dry land. The 5x5 square of lod-0 chunks around the start is
- * submerged, which is what makes the round-trip geometry check a statement
- * about water. `MIN_WATER_*` below turn all of that from an intention into an
- * assertion.
+ * (-7000, -3500) was 3.5 km of open sea on that seed, with a coastline and
+ * mountains beyond it, so a single flight crossed deep water, a shoreline and
+ * dry land, and the 5x5 square of lod-0 chunks around the start was submerged
+ * and carved.
+ *
+ * PHASE 4a MOVED IT AGAIN, AND FOR THE THIRD TIME THE REASON IS THE SAME TRAP.
+ * Roads are far sparser than rivers -- about twenty per 4 km region against
+ * hundreds of stream channels -- and the (-7000, -3500) line passed EXACTLY
+ * ZERO of them in 6.75 km, with no road in any of the 25 round-tripped chunks.
+ * Every road assertion below would have passed without ever meeting a road.
+ *
+ * (-7500, -3600) was chosen by searching the seed for a start that keeps all
+ * three claims real at once, rather than by trading one away:
+ *
+ *   round-tripped 5x5 square   road 11/25   river 14/25   sea 15/25
+ *   along the 6.75 km line     road  5/140  river 19/140  sea 80/140
+ *
+ * Sea along the line drops from 108 samples to 80 -- still 2.7 km of open
+ * water -- and the river count is essentially unchanged. Check `sea at the
+ * start`, `river at the start` and `road at the start` in the report after any
+ * future move: all three go quiet without failing if the route stops being
+ * interesting.
  */
-const START_X = -7000;
-const START_Z = -3500;
+const START_X = -7500;
+const START_Z = -3600;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and
@@ -187,6 +203,28 @@ const MIN_SHALLOW_WATER_DRAW_CALLS = 25; // measured 93 peak
 const MIN_RIVER_NODES = 60; //              measured 174 peak of 318 live
 const MIN_RIVER_DRAW_CALLS = 20; //         measured  64 peak
 const MIN_SHALLOW_RIVER_DRAW_CALLS = 20; // measured  61 peak
+
+/**
+ * PHASE 4a: THE SAME GUARD AGAIN, FOR ROADS.
+ *
+ * A road is not a mesh either -- it is surfacing and grading applied to the
+ * terrain mesh every node already had -- so it needs its own counter for
+ * exactly the reason rivers do.
+ *
+ * ROADS ARE MUCH SPARSER THAN RIVERS, AND THE FLOORS SAY SO. A region carries
+ * about twenty roads in 16 km^2 against hundreds of stream channels, so a
+ * flight crosses far fewer of them and the floors here are a fraction of the
+ * river ones. They are still floors, not decoration: a run that touches no road
+ * at all has verified nothing about Phase 4a, however green it looks.
+ *
+ * `roadNodes` is surfaced terrain that is resident; `roadDrawCalls` comes from
+ * `Object3D.onBeforeRender`, so it measures surfaced ground that reached the
+ * rasteriser. Both are needed, and the shallow leg is checked separately
+ * because that is the leg the geometry budgets are decided on.
+ */
+const MIN_ROAD_NODES = 25; //              measured  86 peak of 306 live
+const MIN_ROAD_DRAW_CALLS = 8; //          measured  25 peak
+const MIN_SHALLOW_ROAD_DRAW_CALLS = 8; //  measured  25 peak
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -322,6 +360,15 @@ try {
   );
   const riverChunksAtStart = riverBefore.filter((v) => v !== null && v > 0).length;
 
+  // ...and whether a road reached it. Same role again: grading and surfacing
+  // move and recolour vertices the geometry hash already covers, but only if
+  // the round-tripped square had a road in it.
+  const roadBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkRoads(x, z, 2),
+    [START_X, START_Z],
+  );
+  const roadChunksAtStart = roadBefore.filter((v) => v !== null && v > 0).length;
+
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
   await page.evaluate(() => window.__app.resetFrameStats());
@@ -363,6 +410,7 @@ try {
       `draws ${String(snapshot.drawCalls).padStart(4)}  ` +
       `water ${String(snapshot.waterDrawCalls).padStart(3)}/${String(snapshot.waterNodes).padStart(3)}  ` +
       `river ${String(snapshot.riverDrawCalls).padStart(3)}/${String(snapshot.riverNodes).padStart(3)}  ` +
+      `road ${String(snapshot.roadDrawCalls).padStart(3)}/${String(snapshot.roadNodes).padStart(3)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
       `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
@@ -402,6 +450,10 @@ try {
   const riverNodes = samples.map((s) => s.riverNodes);
   const riverVerts = samples.map((s) => s.riverVertices);
   const shallowRiverDraws = shallowSamples.map((s) => s.riverDrawCalls);
+  const roadDraws = samples.map((s) => s.roadDrawCalls);
+  const roadNodes = samples.map((s) => s.roadNodes);
+  const roadVerts = samples.map((s) => s.roadVertices);
+  const shallowRoadDraws = shallowSamples.map((s) => s.roadDrawCalls);
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -535,6 +587,16 @@ try {
       ` (floor ${MIN_SHALLOW_RIVER_DRAW_CALLS})`,
   );
   console.log(`  river at the start ${riverChunksAtStart}/${riverBefore.length} round-tripped chunks`);
+
+  console.log('roads (Phase 4a)');
+  console.log(`  surfaced nodes    ${max(roadNodes)} peak of ${max(lives)} live nodes (floor ${MIN_ROAD_NODES})`);
+  console.log(`  surfaced vertices ${max(roadVerts)} peak`);
+  console.log(`  surfaced DRAWN    ${max(roadDraws)} peak (floor ${MIN_ROAD_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowRoadDraws.length === 0 ? 'n/a' : max(shallowRoadDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_ROAD_DRAW_CALLS})`,
+  );
+  console.log(`  road at the start ${roadChunksAtStart}/${roadBefore.length} round-tripped chunks`);
 
   console.log('');
   console.log('frames');
@@ -707,6 +769,41 @@ try {
         'decided on that leg, so it was measured without this phase in it.',
     );
   }
+  // ---- roads, and the vacuity guards around them ------------------------
+  if (max(roadVerts) === 0) {
+    fail(
+      'no road surfacing was generated at any point in the flight. Either ' +
+        'grading is broken or the flight path never passed a road -- in which ' +
+        'case every road check in this run passed vacuously.',
+    );
+  }
+  if (max(roadNodes) < MIN_ROAD_NODES) {
+    fail(
+      `only ${max(roadNodes)} surfaced nodes were ever resident (floor ` +
+        `${MIN_ROAD_NODES}). The flight barely passed a road.`,
+    );
+  }
+  if (max(roadDraws) < MIN_ROAD_DRAW_CALLS) {
+    fail(
+      `surfaced terrain was drawn at most ${max(roadDraws)} times in a frame ` +
+        `(floor ${MIN_ROAD_DRAW_CALLS}). Roads existing and roads REACHING the ` +
+        'rasteriser are different claims.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowRoadDraws) < MIN_SHALLOW_ROAD_DRAW_CALLS) {
+    fail(
+      `the shallow-pitch leg drew surfaced terrain at most ${max(shallowRoadDraws)} ` +
+        `times in a frame (floor ${MIN_SHALLOW_ROAD_DRAW_CALLS}).`,
+    );
+  }
+  if (roadChunksAtStart === 0) {
+    fail(
+      'none of the round-tripped chunks carried a road, so the ' +
+        'byte-identical-regeneration check said nothing about roads. Move the ' +
+        'flight start, deliberately, rather than dropping this check.',
+    );
+  }
+
   if (riverChunksAtStart === 0) {
     failures.push(
       'none of the round-tripped chunks was carved by a river, so the ' +

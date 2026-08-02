@@ -27,6 +27,7 @@ import {
   sampleHeight,
   temperature,
 } from './height-field';
+import { ROAD_MAX_FILL } from './roads';
 
 const SEED = hashString('height-field-test');
 const OTHER = hashString('a different world');
@@ -184,19 +185,29 @@ describe('sampleHeight', () => {
   });
 
   it('does not depend on evaluation order or on unrelated work', () => {
-    // The unrelated work uses a handful of OTHER seeds, not 500 of them.
-    // Phase 3b made a first call on a new seed route that seed's rivers -- a
-    // few hundred milliseconds -- so 500 distinct seeds turned this into a
-    // three-minute test. Three is enough to evict the region memo several
-    // times over and demand the original answer back, which is the property
-    // being asserted; `rivers.test.ts` tests eviction directly.
+    // The unrelated work is deliberately small, and it has been trimmed TWICE
+    // for the same reason. Phase 3b made a first call on a new seed route that
+    // seed's rivers, so 500 distinct seeds became a three-minute test and the
+    // seed count came down to three. Phase 4a makes a first call in a new
+    // REGION route that region's roads as well -- and unlike the seed, the
+    // region changes as the points march across the world, so it was the 500
+    // scattered points that had become expensive, not the seeds.
+    //
+    // 60 points over a 5 km span still crosses several regions on three seeds,
+    // which evicts both memos many times over and demands the original answer
+    // back. That is the property under test; `rivers.test.ts` and
+    // `roads.test.ts` each test eviction directly and much harder.
     const before = sampleHeight(412.5, -913.25, SEED);
-    for (const [i, [x, z]] of points(500).entries()) sampleHeight(x, z, SEED ^ (i % 3));
+    for (const [i, [x, z]] of points(60, 83.7).entries()) sampleHeight(x, z, SEED ^ (i % 3));
     expect(sampleHeight(412.5, -913.25, SEED)).toBe(before);
   });
 
   it('stays inside the advertised bounds', () => {
-    for (const [x, z] of points(6000, 27.3)) {
+    // 2,500 points still sweep 68 km and seventeen regions, which is what makes
+    // this a claim about the world rather than about one valley. It was 6,000
+    // (164 km) until Phase 4a, where routing each newly visited region put the
+    // test at twenty seconds on its own.
+    for (const [x, z] of points(2500, 27.3)) {
       const h = sampleHeight(x, z, SEED);
       expect(h).toBeGreaterThanOrEqual(MIN_HEIGHT);
       expect(h).toBeLessThanOrEqual(MAX_HEIGHT);
@@ -205,12 +216,14 @@ describe('sampleHeight', () => {
   });
 
   it('produces real relief rather than a plane', () => {
-    const values = points(4000, 53.7).map(([x, z]) => sampleHeight(x, z, SEED));
+    // 64 km of sweep crosses several biomes, which is all this needs; see the
+    // note on the bounds test above for why the span was cut.
+    const values = points(1200, 53.7).map(([x, z]) => sampleHeight(x, z, SEED));
     expect(Math.max(...values) - Math.min(...values)).toBeGreaterThan(80);
   });
 
   it('produces both ground below zero and ground well above it', () => {
-    const values = points(4000, 53.7).map(([x, z]) => sampleHeight(x, z, SEED));
+    const values = points(1200, 53.7).map(([x, z]) => sampleHeight(x, z, SEED));
     expect(Math.min(...values)).toBeLessThan(0);
     expect(Math.max(...values)).toBeGreaterThan(60);
   });
@@ -289,9 +302,20 @@ describe('baseHeight and sampleHeight', () => {
     expect(points(200).map(([x, z]) => baseHeight(x, z, SEED))).toEqual(before);
   });
 
-  it('sampleHeight is never above baseHeight: carving only cuts down', () => {
+  it('only road grading can raise the ground, and only by ROAD_MAX_FILL', () => {
+    // PHASE 4a CHANGED WHAT THIS TEST CAN SAY, AND THE CHANGE IS THE POINT.
+    // Through Phase 3b `sampleHeight <= baseHeight` everywhere, because a river
+    // only ever cuts. Road grading is the first thing in the project that can
+    // RAISE terrain -- a road crossing a dip is carried on fill -- so the old
+    // form is now false by design, and asserting it would be asserting that
+    // Phase 4a did not happen.
+    //
+    // What is still guaranteed, and what `MAX_HEIGHT` depends on, is that any
+    // rise is bounded by `ROAD_MAX_FILL`. Rivers keep their own one-directional
+    // guarantee, asserted directly in `rivers.test.ts`.
     for (const [x, z] of carvePoints()) {
-      expect(sampleHeight(x, z, SEED)).toBeLessThanOrEqual(baseHeight(x, z, SEED));
+      const rise = sampleHeight(x, z, SEED) - baseHeight(x, z, SEED);
+      expect(rise).toBeLessThanOrEqual(ROAD_MAX_FILL);
     }
   });
 

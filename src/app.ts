@@ -20,8 +20,10 @@ import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
 import {
   resetRiverDraws,
+  resetRoadDraws,
   resetWaterDraws,
   riverDrawsSinceReset,
+  roadDrawsSinceReset,
   waterDrawsSinceReset,
 } from './world/chunk-mesh';
 import { sampleHeight } from './world/height-field';
@@ -71,6 +73,12 @@ export class App {
    * "carving stopped working". See `chunk-mesh.ts`.
    */
   private riverDrawCalls = 0;
+  /**
+   * Terrain meshes carrying road surfacing actually rasterised in the last
+   * frame. Same role as `riverDrawCalls`, and needed for the same reason: a
+   * road is not its own mesh either. See `chunk-mesh.ts`.
+   */
+  private roadDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -220,6 +228,10 @@ export class App {
       riverNodes: chunks.riverNodes,
       riverVertices: chunks.riverVertices,
       riverDrawCalls: this.riverDrawCalls,
+      // Phase 4a, mirroring the pair above for exactly the same reason.
+      roadNodes: chunks.roadNodes,
+      roadVertices: chunks.roadVertices,
+      roadDrawCalls: this.roadDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -302,6 +314,18 @@ export class App {
     return this.streamer.sampleRiverVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * Road-surfaced vertices in the chunks around a world position, as actually
+   * resident. `null` where the chunk is not loaded.
+   *
+   * The Phase 4a counterpart of `sampleChunkRivers`, and needed for the same
+   * reason: grading and surfacing move and recolour vertices the geometry hash
+   * already covers, but only if the round-tripped square had a road in it.
+   */
+  sampleChunkRoads(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleRoadVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -317,9 +341,11 @@ export class App {
     this.frameTimer.sample(wallDt);
     resetWaterDraws();
     resetRiverDraws();
+    resetRoadDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
+    this.roadDrawCalls = roadDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -364,6 +390,7 @@ export class App {
     hud.register('programs', () => this.renderer.stats().programs, HudOrder.render);
     hud.register('water draws', () => this.waterDrawCalls, HudOrder.render);
     hud.register('river draws', () => this.riverDrawCalls, HudOrder.render);
+    hud.register('road draws', () => this.roadDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',
