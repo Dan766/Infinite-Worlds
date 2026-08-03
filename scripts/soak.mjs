@@ -333,6 +333,34 @@ const MIN_DECK_DRAW_CALLS = 8; //          measured  24 peak
 const MIN_SHALLOW_DECK_DRAW_CALLS = 8; //  measured  24 peak
 const MIN_BRIDGE_NODES = 2; //             measured  10 over the run
 
+/**
+ * PHASE 6: THE SAME GUARD FOR BUILDINGS, AND THE THINNEST SIGNAL YET.
+ *
+ * A building exists only inside a settlement, and a settlement is a couple of
+ * hundred metres across in a 4 km region. The flight passes two of them, for a
+ * few seconds each, so this phase has the weakest evidence of any so far and
+ * needs the most care about what the numbers actually claim:
+ *
+ *  - `buildingsSeen` is CUMULATIVE, for the reason `bridgeNodes` is. Village
+ *    nodes are resident for a handful of seconds against a five-second sampling
+ *    interval, so an instantaneous peak is a coin flip and a floor on one is a
+ *    check that gets re-run until it goes green.
+ *  - `buildingDrawCalls` is what says a house REACHED THE RASTERISER. Every
+ *    other number here is satisfied by geometry sitting in a buffer nobody drew.
+ *  - `buildingsLevel` is the one that says the houses are standing on ground a
+ *    village LEVELLED rather than merely standing somewhere. It is the only
+ *    number in the run that goes to zero if the grading, `gradeTarget` or the
+ *    lot acceptance tests regress: the buildings would still be placed, still be
+ *    drawn, and still round-trip identically, half-buried in a hillside.
+ *
+ * Floors at roughly a third of a measured run, the margin every other phase's
+ * floors use.
+ */
+const MIN_BUILDING_NODES = 12; //            measured    42 peak of 309 live
+const MIN_BUILDINGS_SEEN = 3000; //          measured 12,012 over the run
+const MIN_BUILDING_DRAW_CALLS = 4; //        measured    12 peak
+const MIN_BUILDINGS_LEVEL_FRACTION = 0.6; // measured  0.96 of lod-0 building-samples
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -504,6 +532,16 @@ try {
   );
   const deckChunksAtStart = deckBefore.filter((t) => t !== null && t > 0).length;
 
+  // ...and whether a BUILDING stands in it. Phase 6 folds `buildingPositions`
+  // into the geometry hash, and the narrowest claim of the five: the square has
+  // to contain a house, not merely be inside a village. Without one, that term
+  // of the hash is the hash of an empty array on every chunk compared.
+  const buildingsBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkBuildings(x, z, 2),
+    [originX, originZ],
+  );
+  const buildingChunksAtStart = buildingsBefore.filter((b) => b !== null && b > 0).length;
+
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
   await page.evaluate(() => window.__app.resetFrameStats());
@@ -607,6 +645,16 @@ try {
   const deckTris = samples.map((s) => s.deckTriangles);
   const bridgeVerts = samples.map((s) => s.bridgeVertices);
   const shallowDeckDraws = shallowSamples.map((s) => s.deckDrawCalls);
+  const buildingDraws = samples.map((s) => s.buildingDrawCalls);
+  const buildingNodes = samples.map((s) => s.buildingNodes);
+  const buildingsLive = samples.map((s) => s.buildings);
+  const buildingTris = samples.map((s) => s.buildingTriangles);
+  // Levelness is only measured at lod 0, so the fraction is taken against
+  // `buildingsMeasured` -- the lod-0 buildings of the SAME sample -- and not
+  // against `buildings`, which counts a village resident at four levels at once.
+  const measuredBuildings = samples.reduce((sum, s) => sum + s.buildingsMeasured, 0);
+  const levelBuildings = samples.reduce((sum, s) => sum + s.buildingsLevel, 0);
+  const levelFraction = measuredBuildings === 0 ? 0 : levelBuildings / measuredBuildings;
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -777,6 +825,29 @@ try {
   console.log(`  BRIDGE nodes      ${finalSnapshot.bridgeNodes} over the run (floor ${MIN_BRIDGE_NODES})`);
   console.log(`  bridge vertices   ${max(bridgeVerts)} peak live`);
   console.log(`  deck at the start ${deckChunksAtStart}/${deckBefore.length} round-tripped chunks`);
+
+  console.log('buildings (Phase 6)');
+  console.log(
+    `  building nodes    ${max(buildingNodes)} peak of ${max(lives)} live nodes (floor ${MIN_BUILDING_NODES})`,
+  );
+  console.log(`  buildings live    ${max(buildingsLive)} peak`);
+  console.log(`  building tris     ${max(buildingTris)} peak`);
+  console.log(
+    `  buildings DRAWN   ${max(buildingDraws)} peak (floor ${MIN_BUILDING_DRAW_CALLS})`,
+  );
+  console.log(
+    `  draws without it  ${max(draws.map((d, i) => d - buildingDraws[i]))} peak building-free draw calls`,
+  );
+  console.log(
+    `  LEVEL             ${levelBuildings}/${measuredBuildings} lod-0 building-samples` +
+      ` = ${(levelFraction * 100).toFixed(0)}% (floor ${(MIN_BUILDINGS_LEVEL_FRACTION * 100).toFixed(0)}%)`,
+  );
+  console.log(
+    `  buildings SEEN    ${finalSnapshot.buildingsSeen} over the run (floor ${MIN_BUILDINGS_SEEN})`,
+  );
+  console.log(
+    `  houses at the start ${buildingChunksAtStart}/${buildingsBefore.length} round-tripped chunks`,
+  );
 
   console.log('');
   console.log('frames');
@@ -1062,6 +1133,54 @@ try {
     failures.push(
       'none of the round-tripped chunks carried a deck, so the ' +
         'byte-identical-regeneration check said nothing about the carriageway ' +
+        'geometry the hash now covers. Move the flight start, deliberately, ' +
+        'rather than dropping this check.',
+    );
+  }
+
+  // ---- buildings, and the vacuity guards around them ---------------------
+  if (max(buildingTris) === 0) {
+    failures.push(
+      'no building geometry was generated at any point in the flight. Either ' +
+        'lot siting is broken or the flight never reached a settlement -- in ' +
+        'which case every building check in this run passed vacuously.',
+    );
+  }
+  if (finalSnapshot.buildingsSeen < MIN_BUILDINGS_SEEN) {
+    failures.push(
+      `only ${finalSnapshot.buildingsSeen} buildings were generated in the whole ` +
+        `flight (floor ${MIN_BUILDINGS_SEEN}). A village is a couple of hundred ` +
+        'metres across in a 4 km region, so this is cumulative deliberately -- a ' +
+        'number this low means lot acceptance is refusing nearly everything, not ' +
+        'that the sampling missed it.',
+    );
+  }
+  if (max(buildingDraws) < MIN_BUILDING_DRAW_CALLS) {
+    failures.push(
+      `buildings were drawn at most ${max(buildingDraws)} times in a frame (floor ` +
+        `${MIN_BUILDING_DRAW_CALLS}). A building existing and a building RENDERING ` +
+        'are different claims; this run only made the first one.',
+    );
+  }
+  if (measuredBuildings === 0) {
+    failures.push(
+      'no building had its levelness measured: every village node resident at a ' +
+        'sample was coarser than lod 0. The one number that says houses stand on ' +
+        'ground a village levelled has no denominator.',
+    );
+  } else if (levelFraction < MIN_BUILDINGS_LEVEL_FRACTION) {
+    failures.push(
+      `only ${(levelFraction * 100).toFixed(0)}% of lod-0 buildings stood within ` +
+        `tolerance of their own floor (floor ${(MIN_BUILDINGS_LEVEL_FRACTION * 100).toFixed(0)}%). ` +
+        'THE ANTI-VACUITY NUMBER OF PHASE 6: the buildings would still be placed, ' +
+        'still be drawn and still round-trip identically while half-buried in a ' +
+        'hillside. Look at the grading, gradeTarget, or the lot acceptance tests.',
+    );
+  }
+  if (buildingChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks contained a building, so the ' +
+        'byte-identical-regeneration check said nothing about the building ' +
         'geometry the hash now covers. Move the flight start, deliberately, ' +
         'rather than dropping this check.',
     );

@@ -146,6 +146,22 @@ export interface ChunkStreamerStats {
    * a flight that crossed one bridge cannot be missed between two samples.
    */
   bridgeNodes: number;
+  /** Live nodes carrying a Phase 6 building submesh. One extra draw call each. */
+  buildingNodes: number;
+  /** Buildings standing in the live nodes, at every level. */
+  buildings: number;
+  /** Of those, the ones on a lod-0 node -- the denominator of `buildingsLevel`. */
+  buildingsMeasured: number;
+  /** Of THOSE, how many stand level on their own node's ground. */
+  buildingsLevel: number;
+  /** Triangles of building geometry in the live nodes. */
+  buildingTriangles: number;
+  /**
+   * Buildings generated since construction. CUMULATIVE, for the reason
+   * `bridgeNodes` is: a village is a few hundred metres across in a 4 km region,
+   * so a five-second sampling interval can step straight over one.
+   */
+  buildingsSeen: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -200,6 +216,8 @@ export class ChunkStreamer {
   private cancelledCount = 0;
   /** Nodes ever generated carrying bridge geometry. Monotone; see `requestChunk`. */
   private bridgeNodeCount = 0;
+  /** Buildings ever generated. Monotone, for `bridgeNodeCount`'s reason. */
+  private buildingsSeenCount = 0;
   private hasUpdated = false;
   private enabled = true;
   private disposed = false;
@@ -322,6 +340,7 @@ export class ChunkStreamer {
       // so "the flight generated ground with a bridge on it" cannot be missed
       // between samples.
       if (data.bridgeVertices > 0) this.bridgeNodeCount++;
+      this.buildingsSeenCount += data.buildings;
       this.arrived.push(data);
       this.arrivedKeys.add(key);
     });
@@ -550,6 +569,11 @@ export class ChunkStreamer {
     let deckNodes = 0;
     let deckTriangles = 0;
     let bridgeVertices = 0;
+    let buildingNodes = 0;
+    let buildings = 0;
+    let buildingsMeasured = 0;
+    let buildingsLevel = 0;
+    let buildingTriangles = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
@@ -574,6 +598,13 @@ export class ChunkStreamer {
         deckNodes++;
         deckTriangles += entry.deckTriangles;
         bridgeVertices += entry.bridgeVertices;
+      }
+      if (entry.buildings > 0) {
+        buildingNodes++;
+        buildings += entry.buildings;
+        buildingsMeasured += entry.buildingsMeasured;
+        buildingsLevel += entry.buildingsLevel;
+        buildingTriangles += entry.buildingTriangles;
       }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
@@ -602,6 +633,12 @@ export class ChunkStreamer {
       deckTriangles,
       bridgeVertices,
       bridgeNodes: this.bridgeNodeCount,
+      buildingNodes,
+      buildings,
+      buildingsMeasured,
+      buildingsLevel,
+      buildingTriangles,
+      buildingsSeen: this.buildingsSeenCount,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -713,6 +750,24 @@ export class ChunkStreamer {
       const key = chunkKey(coord);
       const entry = this.live.get(key) ?? this.cache.peek(key);
       return entry === undefined ? null : entry.deckTriangles;
+    });
+  }
+
+  /**
+   * Buildings in specific nodes, as above. Phase 6's equivalent of
+   * `sampleDeckTriangles`, and the one with the weakest signal of the lot.
+   *
+   * `sampleGeometryHashes` folds `buildingPositions` in, so a round trip proves
+   * a village comes back identical -- but over ground with no village in it the
+   * building half of every hash is the hash of an empty array, and the check
+   * passes having said nothing about buildings. This is what the soak reads to
+   * refuse that.
+   */
+  sampleBuildings(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.buildings;
     });
   }
 
@@ -837,6 +892,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.deckNodes} nodes / ${s.deckTriangles} tris / ${s.bridgeVertices} bridge verts live / ${s.bridgeNodes} bridge nodes seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'buildings',
+      () => {
+        const s = this.stats();
+        return `${s.buildingNodes} nodes / ${s.buildings} live (${s.buildingsLevel} of ${s.buildingsMeasured} level) / ${s.buildingTriangles} tris / ${s.buildingsSeen} seen`;
       },
       HudOrder.world,
     );

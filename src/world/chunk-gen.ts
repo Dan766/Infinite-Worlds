@@ -26,6 +26,7 @@ import {
   sampleHeight,
   temperature,
   worldRegionField,
+  worldSectorField,
   type RegionField,
   type SectorField,
 } from './height-field';
@@ -37,8 +38,8 @@ import {
   GRADE_SURFACE,
 } from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
+import { buildBuildingSurface, type BuildingPalette } from './building-mesh';
 import { buildDeckSurface, type DeckPalette } from './road-mesh';
-import { sectorStreetField } from './streets';
 import {
   CHUNK_DATA_VERSION,
   createTierContext,
@@ -62,10 +63,11 @@ import {
  * decorative.
  *
  * THIS IS WHERE `CoarseData` FINALLY HOLDS TWO ENTRIES. It has one slot per tier
- * NAME, so rivers and roads still travel together in a single `RegionField`
- * however many Region-tier generators there are; what is new is a second TIER.
- * The sector record is built FROM the region record rather than beside it, so
- * the two share one memo chain and a sector's road lookups are hits.
+ * NAME, so rivers and roads still travel together in a single `RegionField` --
+ * and, since Phase 6, streets and lots in a single `SectorField` -- however many
+ * generators live at each tier. The sector record is built FROM the region
+ * record rather than beside it, so the two share one memo chain and a sector's
+ * road lookups are hits.
  *
  * Everything behind both is memoised, so building a context per chunk costs a
  * handful of objects.
@@ -74,7 +76,7 @@ export function chunkTierContext(worldSeed: number): TierContext {
   const region = worldRegionField(worldSeed);
   return createTierContext(worldSeed, 'chunk', {
     region,
-    sector: sectorStreetField(region, worldSeed),
+    sector: worldSectorField(region, worldSeed),
   });
 }
 
@@ -317,6 +319,39 @@ const DECK_PALETTE: DeckPalette = {
     srgbToLinear(STREET_DECK[1]),
     srgbToLinear(STREET_DECK[2]),
   ],
+};
+
+/**
+ * The Phase 6 building palette, in sRGB.
+ *
+ * Two ranges rather than two colours: every building draws one point from each,
+ * so a village reads as a village and not as a row of identical sheds. The
+ * ranges are narrow and warm, and the roofs are darker than any wall, because
+ * the thing that has to be legible from the air is the ROOF PLAN -- the ridges
+ * running along the frontages are what turns a settlement from a pale disc with
+ * lanes on it into somewhere people live.
+ *
+ * They live here with the terrain and deck palettes for the reason stated above
+ * `ROAD_DECK`: this module is the single testable source of truth for what the
+ * world looks like, and `building-mesh.ts` takes the colours as an argument in
+ * LINEAR space.
+ */
+const WALL_A: readonly [number, number, number] = [0.79, 0.75, 0.67];
+const WALL_B: readonly [number, number, number] = [0.6, 0.5, 0.42];
+const ROOF_A: readonly [number, number, number] = [0.36, 0.24, 0.2];
+const ROOF_B: readonly [number, number, number] = [0.26, 0.27, 0.3];
+const PLINTH: readonly [number, number, number] = [0.31, 0.3, 0.28];
+
+function linearRgb(c: readonly [number, number, number]): [number, number, number] {
+  return [srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2])];
+}
+
+const BUILDING_PALETTE: BuildingPalette = {
+  wallA: linearRgb(WALL_A),
+  wallB: linearRgb(WALL_B),
+  roofA: linearRgb(ROOF_A),
+  roofB: linearRgb(ROOF_B),
+  plinth: linearRgb(PLINTH),
 };
 
 /** Metres ABOVE SEA LEVEL at which snow starts, before the temperature shift. */
@@ -838,7 +873,7 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
       const base = rivers.terrain.height(worldX, worldZ, worldSeed);
       const drop = rivers.drop(worldX, worldZ, base);
       const carved = base - drop;
-      gradeSurface(region, sectors, worldX, worldZ, carved, drop, blend, grade);
+      gradeSurface(region, sectors.streets, worldX, worldZ, carved, drop, blend, grade);
       const lift = grade[GRADE_LIFT] as number;
       const at = (row + 1) * padded + (col + 1);
       heights[at] = carved + lift;
@@ -1041,8 +1076,29 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   // which is safe because the loop is done and `reset` is the first thing it
   // does -- the same caller-owned discipline `GradeBlend` is built for.
   const targetAt = (worldX: number, worldZ: number): number =>
-    gradeTarget(region, sectors, worldX, worldZ, blend);
-  const deck = buildDeckSurface(coord, region.roads, sectors, groundAt, targetAt, DECK_PALETTE);
+    gradeTarget(region, sectors.streets, worldX, worldZ, blend);
+  const deck = buildDeckSurface(
+    coord,
+    region.roads,
+    sectors.streets,
+    groundAt,
+    targetAt,
+    DECK_PALETTE,
+  );
+
+  // -- the buildings ---------------------------------------------------------
+  //
+  // Also built against `groundAt`, and for a NARROWER reason than the deck's: a
+  // building's floor was fixed at the Sector tier and does not move, and this
+  // node's rendered ground decides only how far its plinth reaches down to meet
+  // it. See `building-mesh.ts` and `lots.ts`.
+  const buildings = buildBuildingSurface(
+    coord,
+    region.roads,
+    sectors.lots,
+    groundAt,
+    BUILDING_PALETTE,
+  );
 
   return {
     version: CHUNK_DATA_VERSION,
@@ -1059,6 +1115,12 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     deckNormals: deck.normals,
     deckColors: deck.colors,
     deckIndices: deck.indices,
+    buildingPositions: buildings.positions,
+    buildingNormals: buildings.normals,
+    buildingColors: buildings.colors,
+    buildingIndices: buildings.indices,
+    buildings: buildings.count,
+    buildingsLevel: buildings.level,
     riverVertices,
     roadVertices,
     streetVertices,

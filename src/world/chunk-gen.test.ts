@@ -452,6 +452,55 @@ describe('roads reach chunk generation through the tier context', () => {
     }
     expect(untouched).toBe(20);
   });
+
+  it('puts BUILDINGS in the payload of a village node and nowhere else (Phase 6)', () => {
+    // The chunk-tier half of Phase 6. `building-mesh.test.ts` asserts the
+    // geometry; this asserts that the generator actually wires it into the
+    // payload, that a building submesh costs zero bytes on the nodes that have
+    // none, and that the levelness counter is not stuck at zero.
+    const settlement = worldRegionField(SEED)
+      .roads.networkAt(1000, 1000)
+      .settlements.slice()
+      .sort((a, b) => b.radius - a.radius)[0];
+    expect(settlement).toBeDefined();
+    const cx = Math.floor((settlement as { x: number }).x / CHUNK_SIZE);
+    const cz = Math.floor((settlement as { z: number }).z / CHUNK_SIZE);
+
+    let nodes = 0;
+    let buildings = 0;
+    let level = 0;
+    for (let dz = -3; dz <= 3; dz++) {
+      for (let dx = -3; dx <= 3; dx++) {
+        const data = generateChunk({ x: cx + dx, z: cz + dz, lod: 0 }, context());
+        expect(data.buildingsLevel).toBeLessThanOrEqual(data.buildings);
+        if (data.buildings === 0) {
+          expect(data.buildingIndices).toHaveLength(0);
+          expect(data.buildingPositions).toHaveLength(0);
+          continue;
+        }
+        nodes++;
+        buildings += data.buildings;
+        level += data.buildingsLevel;
+        // Every building must stand on street-surfaced ground -- a lot is sited
+        // off a street, so a node with houses and no streets would mean the two
+        // tiers disagree about where the village is.
+        expect(data.streetVertices).toBeGreaterThan(0);
+      }
+    }
+    expect(nodes).toBeGreaterThan(2);
+    expect(buildings).toBeGreaterThan(10);
+    // THE ANTI-VACUITY COUNTER OF THE PHASE. `buildings` says houses were
+    // placed; this says they were placed on ground the village levelled, which
+    // is what breaks if the grading, `gradeTarget` or the lot tests regress.
+    expect(level).toBeGreaterThan(buildings * 0.8);
+
+    // ...and the rest of the world costs nothing for them.
+    for (let i = 0; i < 20; i++) {
+      const data = generateChunk({ x: 900 + i * 13, z: -700 - i * 11, lod: 0 }, context());
+      expect(data.buildings).toBe(0);
+      expect(data.buildingIndices).toHaveLength(0);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -685,7 +734,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(7);
+    expect(CHUNK_DATA_VERSION).toBe(8);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -697,6 +746,10 @@ describe('generateChunk', () => {
     expect(data.deckNormals).toBeInstanceOf(Float32Array);
     expect(data.deckColors).toBeInstanceOf(Float32Array);
     expect(data.deckIndices).toBeInstanceOf(Uint32Array);
+    expect(data.buildingPositions).toBeInstanceOf(Float32Array);
+    expect(data.buildingNormals).toBeInstanceOf(Float32Array);
+    expect(data.buildingColors).toBeInstanceOf(Float32Array);
+    expect(data.buildingIndices).toBeInstanceOf(Uint32Array);
     expect(data.indices.length % 3).toBe(0);
     for (const index of data.indices) {
       expect(index).toBeLessThan(data.positions.length / 3);
@@ -719,7 +772,11 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.deckNormals.buffer);
     expect(transferables).toContain(data.deckColors.buffer);
     expect(transferables).toContain(data.deckIndices.buffer);
-    expect(transferables).toHaveLength(11);
+    expect(transferables).toContain(data.buildingPositions.buffer);
+    expect(transferables).toContain(data.buildingNormals.buffer);
+    expect(transferables).toContain(data.buildingColors.buffer);
+    expect(transferables).toContain(data.buildingIndices.buffer);
+    expect(transferables).toHaveLength(15);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
@@ -731,26 +788,33 @@ describe('generateChunk', () => {
         data.deckPositions.byteLength +
         data.deckNormals.byteLength +
         data.deckColors.byteLength +
-        data.deckIndices.byteLength,
+        data.deckIndices.byteLength +
+        data.buildingPositions.byteLength +
+        data.buildingNormals.byteLength +
+        data.buildingColors.byteLength +
+        data.buildingIndices.byteLength,
     );
   });
 
-  it('lists the EMPTY water and deck buffers of a bare inland node as transferable too', () => {
+  it('lists the EMPTY water, deck and building buffers of a bare inland node as transferable too', () => {
     // A conditional transfer list is a rule with an exception, and the
     // exception is what a later phase forgets. Zero-length ArrayBuffers
     // transfer fine, so there is no exception: every bulk array, always.
     const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
     expect(data.waterIndices).toHaveLength(0);
     const transferables = chunkDataTransferables(data);
-    expect(transferables).toHaveLength(11);
-    expect(new Set(transferables).size).toBe(11);
+    expect(transferables).toHaveLength(15);
+    expect(new Set(transferables).size).toBe(15);
     expect(transferables).toContain(data.waterPositions.buffer);
     expect(transferables).toContain(data.deckPositions.buffer);
-    // ...and an empty water surface AND an empty deck must add exactly nothing
-    // to the payload. That discipline is the whole reason a deck can exist at
-    // all inside the draw-call and payload budgets: roads are sparse, so most
-    // nodes must cost nothing for them.
+    expect(transferables).toContain(data.buildingPositions.buffer);
+    // ...and an empty water surface, an empty deck AND no buildings must add
+    // exactly nothing to the payload. That discipline is the whole reason
+    // either can exist inside the draw-call and payload budgets: roads are
+    // sparse and settlements sparser, so most nodes must cost nothing for them.
     expect(data.deckIndices).toHaveLength(0);
+    expect(data.buildingIndices).toHaveLength(0);
+    expect(data.buildings).toBe(0);
     expect(chunkDataBytes(data)).toBe(74676);
   });
 

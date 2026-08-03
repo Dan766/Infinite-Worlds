@@ -19,7 +19,9 @@ import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
 import {
+  buildingDrawsSinceReset,
   deckDrawsSinceReset,
+  resetBuildingDraws,
   resetDeckDraws,
   resetRiverDraws,
   resetRoadDraws,
@@ -111,6 +113,16 @@ export class App {
    * a deck is the first thing since Phase 2b that can move the draw-call budget.
    */
   private deckDrawCalls = 0;
+
+  /**
+   * Phase 6 building submeshes actually rasterised in the last frame.
+   *
+   * The second mesh of its own after the deck, and the sparsest thing in the
+   * world: it is zero on almost every frame of a flight, and non-zero only over
+   * a settlement. That is what makes it worth measuring separately rather than
+   * folding into `deckDrawCalls`.
+   */
+  private buildingDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -277,6 +289,17 @@ export class App {
       bridgeVertices: chunks.bridgeVertices,
       bridgeNodes: chunks.bridgeNodes,
       deckDrawCalls: this.deckDrawCalls,
+      // Phase 6, and the same trio once more. `buildings` is what is resident,
+      // `buildingDrawCalls` what reached the rasteriser, and `buildingsLevel`
+      // the only one that says the houses are standing on ground a village
+      // levelled rather than merely standing somewhere.
+      buildingNodes: chunks.buildingNodes,
+      buildings: chunks.buildings,
+      buildingsMeasured: chunks.buildingsMeasured,
+      buildingsLevel: chunks.buildingsLevel,
+      buildingTriangles: chunks.buildingTriangles,
+      buildingsSeen: chunks.buildingsSeen,
+      buildingDrawCalls: this.buildingDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -394,6 +417,17 @@ export class App {
     return this.streamer.sampleDeckTriangles(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * Buildings in the chunks around a world position, as actually resident.
+   * `null` where the chunk is not loaded.
+   *
+   * The Phase 6 counterpart, and the narrowest yet: the round-tripped square has
+   * to contain a building, not merely be inside a village.
+   */
+  sampleChunkBuildings(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleBuildings(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -429,12 +463,14 @@ export class App {
     resetRoadDraws();
     resetStreetDraws();
     resetDeckDraws();
+    resetBuildingDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
     this.roadDrawCalls = roadDrawsSinceReset();
     this.streetDrawCalls = streetDrawsSinceReset();
     this.deckDrawCalls = deckDrawsSinceReset();
+    this.buildingDrawCalls = buildingDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -482,6 +518,7 @@ export class App {
     hud.register('road draws', () => this.roadDrawCalls, HudOrder.render);
     hud.register('street draws', () => this.streetDrawCalls, HudOrder.render);
     hud.register('deck draws', () => this.deckDrawCalls, HudOrder.render);
+    hud.register('building draws', () => this.buildingDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

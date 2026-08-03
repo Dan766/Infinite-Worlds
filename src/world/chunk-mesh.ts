@@ -12,6 +12,7 @@
 
 import * as THREE from 'three';
 import { hashCombine } from '../core/hash';
+import { BUILDING_LEVEL_LOD } from './building-mesh';
 import { skirtDepthOf, WATER_COLOR_COMPONENTS } from './chunk-gen';
 import { SEA_LEVEL } from './height-field';
 import { chunkDataBytes, chunkOrigin, chunkSizeAt, type ChunkCoord, type ChunkData } from './contracts';
@@ -64,6 +65,22 @@ function chunkRenderOrder(coord: ChunkCoord): number {
  * decks. The largest value is under 2^53 and therefore exact.
  */
 const DECK_RENDER_ORDER_BASE = 2 ** 48;
+
+/**
+ * Phase 6: buildings draw after every terrain mesh AND every deck.
+ *
+ * A building is not coplanar with anything, so it has none of the decal problem
+ * the deck has -- but its plinth passes THROUGH the ground and its walls meet a
+ * street deck at the setback, so in wireframe there are lines at very nearly the
+ * same depth as both. The deck's argument applies unchanged: with no explicit
+ * order the tie falls back to material id, i.e. to whichever worker finished
+ * first, and a wireframe screenshot goes intermittent.
+ *
+ * A third band rather than sharing the deck's, so a building always draws over
+ * the lane it fronts. 2^49 + 2^46 is still far inside the exactly-representable
+ * integers.
+ */
+const BUILDING_RENDER_ORDER_BASE = 2 ** 49;
 
 /**
  * Phase 2a: a lit material reading per-vertex colour.
@@ -252,6 +269,31 @@ const countDeckDraw = (): void => {
 };
 
 /**
+ * Phase 6 BUILDING submeshes actually rasterised since the last reset.
+ *
+ * `deckDraws`' guard, on the sparsest content in the project: buildings exist
+ * only inside settlements, and a settlement is a handful of nodes in a 4 km
+ * region. Every other building check the soak can make -- payload counts, the
+ * levelness count, the round trip -- is satisfied by a flight that never saw
+ * one, and this is the only one that is not.
+ */
+let buildingDraws = 0;
+
+/** Building submeshes drawn since `resetBuildingDraws`. Read straight after a render. */
+export function buildingDrawsSinceReset(): number {
+  return buildingDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetBuildingDraws(): void {
+  buildingDraws = 0;
+}
+
+const countBuildingDraw = (): void => {
+  buildingDraws++;
+};
+
+/**
  * One `onBeforeRender` callback per combination of features a node can carry.
  *
  * Phase 4a hand-wrote the two single counters and the one pair, which is fine
@@ -421,14 +463,67 @@ function createDeckGeometry(data: ChunkData): THREE.BufferGeometry | null {
   geometry.setAttribute('normal', new THREE.BufferAttribute(data.deckNormals, 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(data.deckColors, 3));
   geometry.setIndex(new THREE.BufferAttribute(data.deckIndices, 1));
+  setBoundsFromPositions(geometry, data.deckPositions);
+  return geometry;
+}
 
+// ---------------------------------------------------------------------------
+// Buildings
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 6: the building material.
+ *
+ * DELIBERATELY WITHOUT `polygonOffset`, which is the one thing that separates it
+ * from the deck's material and is worth stating rather than leaving as an
+ * omission. The deck needs it because it is coplanar with the ground by
+ * construction. A building is a box standing ON the ground: its walls are
+ * vertical and its plinth is buried, so nothing it draws is coplanar with
+ * anything, and offsetting it would only push the whole house toward the camera.
+ *
+ * Single-sided, like the terrain and the deck. A closed box is never seen from
+ * inside, and `building-mesh.ts` derives each face's winding from an outward
+ * hint rather than assuming one -- so single-sided is also the setting that
+ * makes a winding mistake VISIBLE (a hole in the house) instead of silently
+ * correct from one side and black from the other.
+ */
+function createBuildingMaterial(): THREE.MeshLambertMaterial {
+  return new THREE.MeshLambertMaterial({ vertexColors: true });
+}
+
+/**
+ * The building submesh's geometry, or `null` on a node with no building centre
+ * in it -- which is all but a handful of nodes in the world.
+ *
+ * The `null` discipline again, and this phase leans on it hardest: every node
+ * everywhere would otherwise carry an empty mesh so that a few dozen village
+ * nodes could carry a real one.
+ *
+ * Bounds from the emitted vertices, and here that is load-bearing rather than
+ * merely tidy. A building is owned by the node holding its CENTRE and is not
+ * clipped, so this submesh genuinely reaches outside the node square; bounding
+ * it by the square would cull a house exactly when half of it is on screen.
+ */
+function createBuildingGeometry(data: ChunkData): THREE.BufferGeometry | null {
+  if (data.buildingIndices.length === 0) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(data.buildingPositions, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(data.buildingNormals, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(data.buildingColors, 3));
+  geometry.setIndex(new THREE.BufferAttribute(data.buildingIndices, 1));
+  setBoundsFromPositions(geometry, data.buildingPositions);
+  return geometry;
+}
+
+/** Box and sphere bounds over an xyz position buffer. */
+function setBoundsFromPositions(geometry: THREE.BufferGeometry, p: Float32Array): void {
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
   let maxY = -Infinity;
   let minZ = Infinity;
   let maxZ = -Infinity;
-  const p = data.deckPositions;
   for (let i = 0; i < p.length; i += 3) {
     const x = p[i] as number;
     const y = p[i + 1] as number;
@@ -451,7 +546,6 @@ function createDeckGeometry(data: ChunkData): THREE.BufferGeometry | null {
     new THREE.Vector3(minX + halfX, minY + halfY, minZ + halfZ),
     Math.sqrt(halfX * halfX + halfY * halfY + halfZ * halfZ),
   );
-  return geometry;
 }
 
 /** A `normal` attribute of `count` copies of +Y. */
@@ -501,12 +595,21 @@ function hashFloats(seed: number, values: Float32Array): number {
  * they needed no new term. A deck is separate geometry: leave it out and the
  * RULE 2 check would keep passing while a road came back a different shape, in
  * a different place, or not at all.
+ *
+ * PHASE 6 FOLDS THE BUILDINGS IN, for the deck's reason and one more. Buildings
+ * are separate geometry, so they need their own term -- and they are also the
+ * first content whose PLACEMENT depends on an evaluation of the finished height
+ * field rather than on a coordinate hash alone. A lot is accepted or refused by
+ * comparing the ground against the grading target, so anything that made either
+ * order-dependent would move a house without moving a single terrain vertex,
+ * and every other term in this hash would be unchanged.
  */
 export function hashChunkGeometry(data: ChunkData): number {
   let hash = hashPositions(data.positions);
   hash = hashFloats(hash, data.waterPositions);
   hash = hashFloats(hash, data.waterColors);
   hash = hashFloats(hash, data.deckPositions);
+  hash = hashFloats(hash, data.buildingPositions);
   return hash >>> 0;
 }
 
@@ -522,6 +625,10 @@ export interface ChunkMesh {
   readonly deckMesh: THREE.Mesh | null;
   readonly deckGeometry: THREE.BufferGeometry | null;
   readonly deckMaterial: THREE.MeshLambertMaterial | null;
+  /** The Phase 6 building submesh, or null on a node with no building in it. */
+  readonly buildingMesh: THREE.Mesh | null;
+  readonly buildingGeometry: THREE.BufferGeometry | null;
+  readonly buildingMaterial: THREE.MeshLambertMaterial | null;
   /** Stable per-chunk identity colour, sRGB. Not what the surface is painted with. */
   readonly color: readonly [number, number, number];
   /** Hash of the uploaded terrain and water buffers, for the RULE 2 round trip. */
@@ -536,6 +643,23 @@ export interface ChunkMesh {
   readonly waterTriangles: number;
   /** Triangles in the deck submesh alone. Zero on a node no road reaches. */
   readonly deckTriangles: number;
+  /** Triangles in the building submesh alone. Zero on all but village nodes. */
+  readonly buildingTriangles: number;
+  /** Buildings whose centre lies in this node. Zero on all but village nodes. */
+  readonly buildings: number;
+  /**
+   * Buildings here whose levelness was actually MEASURED -- i.e. `buildings` on
+   * a lod-0 node and zero on any coarser one.
+   *
+   * The denominator `buildingsLevel` is a fraction of, and it is a separate
+   * number rather than an inference because getting it wrong is silent: a
+   * village is resident at several levels at once, so dividing by `buildings`
+   * would compare a lod-0 count against an all-levels count and report a
+   * perfectly graded village as a third level.
+   */
+  readonly buildingsMeasured: number;
+  /** Of those, how many stand level on this node's own ground. See `BUILDING_LEVEL_LOD`. */
+  readonly buildingsLevel: number;
   /** Deck stations standing clear of the ground: bridge geometry. Zero on most. */
   readonly bridgeVertices: number;
   /** Surface vertices a Phase 3b river channel lowered. Zero on most nodes. */
@@ -623,6 +747,23 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     mesh.add(deckMesh);
   }
 
+  const buildingGeometry = createBuildingGeometry(data);
+  let buildingMesh: THREE.Mesh | null = null;
+  let buildingMaterial: THREE.MeshLambertMaterial | null = null;
+  if (buildingGeometry !== null) {
+    buildingMaterial = createBuildingMaterial();
+    buildingMesh = new THREE.Mesh(buildingGeometry, buildingMaterial);
+    buildingMesh.name = `buildings ${data.coord.x},${data.coord.z},${data.coord.lod}`;
+    buildingMesh.renderOrder = BUILDING_RENDER_ORDER_BASE + chunkRenderOrder(data.coord);
+    buildingMesh.matrixAutoUpdate = false;
+    buildingMesh.updateMatrix();
+    buildingMesh.onBeforeRender = countBuildingDraw;
+    // Parented to the terrain mesh, like the water and the deck, so the
+    // streamer's existing add, remove and dispose carry it without knowing it
+    // exists.
+    mesh.add(buildingMesh);
+  }
+
   return {
     mesh,
     geometry,
@@ -633,14 +774,30 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     deckMesh,
     deckGeometry,
     deckMaterial,
+    buildingMesh,
+    buildingGeometry,
+    buildingMaterial,
     color: data.color,
     geometryHash: hashChunkGeometry(data),
     bytes: chunkDataBytes(data),
-    triangles: (data.indices.length + data.waterIndices.length + data.deckIndices.length) / 3,
+    triangles:
+      (data.indices.length +
+        data.waterIndices.length +
+        data.deckIndices.length +
+        data.buildingIndices.length) /
+      3,
     vertices:
-      (data.positions.length + data.waterPositions.length + data.deckPositions.length) / 3,
+      (data.positions.length +
+        data.waterPositions.length +
+        data.deckPositions.length +
+        data.buildingPositions.length) /
+      3,
     waterTriangles: data.waterIndices.length / 3,
     deckTriangles: data.deckIndices.length / 3,
+    buildingTriangles: data.buildingIndices.length / 3,
+    buildings: data.buildings,
+    buildingsMeasured: data.coord.lod === BUILDING_LEVEL_LOD ? data.buildings : 0,
+    buildingsLevel: data.buildingsLevel,
     bridgeVertices: data.bridgeVertices,
     riverVertices: data.riverVertices,
     roadVertices: data.roadVertices,
@@ -665,6 +822,9 @@ export function disposeChunkMesh(entry: ChunkMesh): void {
   if (entry.deckMesh !== null) entry.deckMesh.removeFromParent();
   entry.deckGeometry?.dispose();
   if (entry.deckMaterial !== null) disposeMaterial(entry.deckMaterial);
+  if (entry.buildingMesh !== null) entry.buildingMesh.removeFromParent();
+  entry.buildingGeometry?.dispose();
+  if (entry.buildingMaterial !== null) disposeMaterial(entry.buildingMaterial);
 }
 
 function disposeMaterial(material: THREE.Material): void {

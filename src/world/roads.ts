@@ -1371,6 +1371,59 @@ function accumulateNetwork(net: RoadNetwork, x: number, z: number, blend: GradeB
 }
 
 /**
+ * The distance beyond which `roadClearance` stops being able to see a road.
+ *
+ * A segment is registered in every bucket its corridor-inflated box touches,
+ * where the inflation is `halfWidth + ROAD_SHOULDER` -- so a one-bucket lookup
+ * finds every road whose GRADING reaches the point and nothing about roads
+ * further away. That is the exact range over which the answer means anything.
+ */
+export const ROAD_CLEARANCE_RANGE = ROAD_SHOULDER;
+
+/**
+ * Metres of clear ground between a point and the nearest ROADBED EDGE, or
+ * `Infinity` when no road's corridor reaches it.
+ *
+ * Phase 6 needs it and nothing before it did: a lot has to be kept off the
+ * carriageway, and "is a road within n metres" is not answerable from
+ * `RegionRoadField.surface`, which is non-zero across an entire settlement
+ * because a village pad surfaces its own ground.
+ *
+ * It reads the same one bucket `accumulateNetwork` does, so it costs the same as
+ * one grading query -- and carries the same limit, stated in
+ * `ROAD_CLEARANCE_RANGE`: an answer larger than that means "no road inside the
+ * corridor", not a measured distance. Callers must compare against a threshold
+ * below the range rather than treating the value as a distance to a far road.
+ */
+export function roadClearance(net: RoadNetwork, x: number, z: number): number {
+  const col = Math.floor((x - net.minX) / BUCKET_METRES);
+  const row = Math.floor((z - net.minZ) / BUCKET_METRES);
+  if (col < 0 || row < 0 || col >= BUCKET_COLS || row >= BUCKET_COLS) return Infinity;
+
+  const bucket = row * BUCKET_COLS + col;
+  const from = net.bucketStart[bucket] as number;
+  const to = net.bucketStart[bucket + 1] as number;
+  let best = Infinity;
+  for (let s = from; s < to; s++) {
+    const seg = net.bucketSeg[s] as number;
+    const ai = net.segNode[seg * 2] as number;
+    const bi = net.segNode[seg * 2 + 1] as number;
+    closestOnSegment(
+      x,
+      z,
+      net.nodeX[ai] as number,
+      net.nodeZ[ai] as number,
+      net.nodeX[bi] as number,
+      net.nodeZ[bi] as number,
+      scratch,
+    );
+    const clear = Math.sqrt(scratch[0] as number) - (net.nodeHalfWidth[ai] as number);
+    if (clear < best) best = clear;
+  }
+  return best;
+}
+
+/**
  * The road record a chunk generator reads through `TierContext.coarser`.
  *
  * `grade` is the hot path and writes into a caller-owned pair so a per-vertex
