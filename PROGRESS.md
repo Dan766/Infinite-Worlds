@@ -14,8 +14,9 @@ state moves between sessions. Update both at the end of every phase.
 | 4a    | Settlements and road network       | Done   |
 | 4b    | Settlement streets (Sector tier)   | Done   |
 | 5     | Road meshes                        | Done   |
-| 6     | Lots and buildings                 | Next   |
-| 7     | Vegetation and props               | -      |
+| 6     | Lots and buildings                 | Done   |
+| 7a    | Vegetation and props               | -      |
+| 7b    | Variety (villages, buildings, props) | -    |
 | 8     | Player controller and collision    | -      |
 | 9     | NPCs                               | -      |
 | 10    | Lighting and atmosphere            | -      |
@@ -2584,8 +2585,8 @@ Four new views:
 - **The plan is one shape.** Ring plus lanes plus spokes, everywhere, at every
   settlement. The jitter and the road-clearance rule make no two identical, but
   there is no linear village strung along a road, no grid town and no hilltop
-  enclosure. That is a generator, not a tweak, and it belongs with Phase 6's
-  buildings, where the difference would actually read.
+  enclosure. That is a generator, not a tweak; scheduled as **Phase 7b** (variety
+  across villages, buildings, and props) once the Phase 7a prop pipeline exists.
 - **A street never leaves the settlement footprint**, so a village's lanes stop at
   its own rim rather than running out to the fields. Deliberate: past the rim the
   pad is tapering off and the two would fight over the same ground.
@@ -3369,3 +3370,166 @@ has been since Phase 0; `npm run perf:gpu` is still not a command.
   they are now sensitive: `settlement-streets-wireframe` and
   `road-wireframe-bench` both went from "different every run" to "one hash", so a
   building appearing in them is a real signal rather than noise.
+
+## Phase 6 -- Lots and buildings (done)
+
+Phase 5 left a deck on every road and street and told Phase 6 to hang buildings
+off the street plan, batching per node because draw calls were already at 398 of
+680. Phase 6a closed the wireframe flake first. This phase is the content: Sector-
+tier lots along streets, one batched building submesh per node, floors fixed at
+the Sector tier, plinths fitted to each node's ground.
+
+### What was built
+
+- **`src/world/lots.ts`** -- Sector-tier lot siting. Candidates are spaced along
+  street polylines on both sides; geometric rejections (rim, street clearance,
+  road clearance, overlap) run before the five height-stack evaluations that
+  decide levelness. Distinct salts per property so width and depth never share a
+  stream. Memoised at `LOT_CACHE_LIMIT` 64 -- a lot record is read once per NODE
+  through settlements the region already lists, not per vertex, so the working
+  set is a handful of settlements rather than an 11x11 sector block.
+- **`src/world/building-mesh.ts`** -- one buffered submesh per node. Ownership by
+  centre, no clipping, bounds from emitted vertices. `face()` derives winding from
+  an outward hint; plinth colour is a per-corner gradient on the wall rather than
+  its own band of geometry. Floor from `SectorLots.floorY`; plinth depth from
+  `groundAt`, capped at `BUILDING_MAX_PLINTH`.
+- **`roadClearance` in `roads.ts`** -- distance from a point to the nearest
+  roadbed edge, for the lot rejection that keeps houses off the carriageway.
+- **`SectorField` became a record of `{ streets, lots }`** rather than an alias
+  for the street field. Same reason `RegionField` holds rivers and roads: one
+  slot per tier name. Lots are built from an already-built street field so the
+  dependency stays one-way.
+- **`LotGround` injection** -- `height` and `target` wrap `composeHeight` /
+  `gradeTarget` with a private `GradeBlend`, so `lots.ts` never imports
+  `height-field.ts` and never shares the main thread's scratch blend with a
+  worker mid-generation.
+- **`ChunkData` v8** -- `buildingPositions/Normals/Colors/Indices`, `buildings`,
+  `buildingsLevel`; transfer list and `chunkDataBytes` updated. Geometry hash
+  folds `buildingPositions`.
+- **`chunk-mesh.ts`** -- building material (no `polygonOffset`: a box is not a
+  decal), third `renderOrder` band at `2^49`, `buildingDraws` counter, disposal.
+- **Streamer / app / soak** -- residency stats, HUD line, `sampleChunkBuildings`,
+  cumulative `buildingsSeen`, lod-0 `buildingsMeasured` denominator for the
+  levelness fraction. Soak floors from a measured 300 s run.
+
+### Judgment calls
+
+- **Floor LOD-independent, plinth per node -- not the deck's `max(target,
+  ground)` on the whole house.** Fitting the floor to each lattice would make an
+  8 m building jump every time the quadtree changed level. The plinth absorbs the
+  disagreement the way a deck's buried apron does for a ribbon.
+- **Ownership by centre, no clipping.** Clipping a box to a node square and
+  closing the cut costs more than a house that overhangs a boundary. The deck
+  clips because it is hundreds of metres long; a building is not.
+- **One mesh per node is not deferred.** At 398/680 draw calls, one mesh per
+  house would put fifty draws on a village node that currently costs three.
+- **Levelness measured at lod 0 only.** Same argument as `BRIDGE_COUNT_LOD`: a
+  coarse lattice cannot describe an 8 m footprint, so the statistic would become
+  a statement about mesh resolution.
+- **Rejected: extending `SectorStreets` with lots.** Mixing graders and readers
+  in one type would force the generator to evaluate ground while still deciding
+  what the ground is. Two fields in one `SectorField` keeps the order honest.
+- **Rejected: a third terrain colour for "under a building".** Buildings are
+  additive geometry; not one terrain vertex moves. Canonical views without a
+  house in frame stay byte-identical to Phase 5 for that reason -- until a
+  building enters the frustum.
+
+### What was measured
+
+`npm test`: **475 tests in 23 files**, all green (was 446/21). New coverage in
+`lots.test.ts`, `building-mesh.test.ts`, and a village-payload test in
+`chunk-gen.test.ts`. `npx tsc --noEmit`: clean.
+
+**Screenshots.** Three new views (`settlement-buildings`, `-shallow`,
+`-wireframe`) were first proven stable with `shots:repeat --repeat=3` (one hash
+each over three passes in one process), then all 40 baselines were re-captured
+and `shots:check` reported **all 40 canonical views byte-identical**. Settlement
+views that previously framed an empty pad now show the roof plan; several older
+views also moved because buildings entered their frustum or the wireframe band
+gained a third mesh. Views with no village in frame were re-baselined only where
+the capture differed — the harness is green against the new set.
+
+Full 5-minute soak, 45 m/s, seed `soak`, start `(-6749, -4140)` unchanged:
+
+| Budget | Limit | 5 / 6a measured | 6 measured | headroom |
+| ------ | ----- | --------------- | ---------- | -------- |
+| live triangles | 2,100,000 | 1,368,596 / 1,201,194 | 1,224,448 | 1.72x |
+| live vertices | 1,040,000 | 673,805 / 592,964 | 642,794 | 1.62x |
+| draw calls | 680 | 398 / 357 | 301 | 2.26x |
+| chunk payload bytes | 100 MB | 86.8 / 87.6 MB | 91.1 MB | 1.10x |
+
+Unexplained heap trend **+1.24 MB/min against a limit of 6**. Round trip: 25/25
+re-resident, **25/25 geometry hashes identical**. Six "at the start" counters
+real: sea 16/25, river 9/25, road 12/25, street 10/25, deck 10/25, **houses
+9/25**.
+
+Buildings on that run: **12,012 seen**, 42 peak nodes, 1,823 peak live, 25,522
+peak tris, **12 peak drawn**, **96% of lod-0 building-samples level**. Peak draw
+calls *without* buildings 295 -- so the phase cost about +12 at the busiest
+frame, not a rewrite of the budget. **No budget was raised.** Draw calls came in
+lower than Phase 5's 398 for the same reason 6a's did: the flight's peak sample
+landed somewhere cheaper; the route is a subset, not a different corridor.
+
+### Known gaps, deliberately left
+
+- **No doors, windows, chimneys, or yard props.** A gabled box with a tinted roof
+  is enough to make a village read as inhabited from the air; facade detail and
+  yard clutter belong with Phase 7a's props.
+- **One street plan and one building archetype.** Ring + lanes + spokes
+  everywhere; every house is a parameterized gabled box. Layout families
+  (linear, grid, hilltop) and building kinds (cottage, barn, hall, …) are
+  Phase 7b -- variety applied after the prop pipeline exists, not before.
+- **No building-to-building occlusion or interiors.** Batching forbids per-house
+  culling; nothing walks inside a house until Phase 8.
+- **Lots do not grade the ground.** A building sits on what the village already
+  levelled. A phase that wants a cellar or a raised pad grades first and then
+  re-sites.
+- **`LOT_CACHE_LIMIT` 64 was chosen from the settlement lattice, not measured
+  under a root-level node the way streets were.** If a later builder sweeps lots
+  per vertex, re-measure before guessing.
+- **The deck's coincident interior end caps are still there** (~16 wasted tris
+  per segment). Still a cleanup, still not a flake.
+- **`npm run perf:gpu` is still not a command.** Frame budgets remain
+  SwiftShader numbers.
+
+### For Phase 7a
+
+- **Buildings are the model for anything dense and placed.** Per-node batching,
+  ownership by centre, LOD-independent pose, per-node contact with the ground,
+  zero-length arrays elsewhere. Vegetation that is one mesh per tree will blow
+  the draw-call budget the way one mesh per house would have.
+- **`buildingsLevel` / `buildingsMeasured` is the pattern for "content sits on
+  ground the world actually made".** A prop floating a metre over grass needs the
+  same anti-vacuity half, not only a count of how many were placed.
+- **The three new canonical views** (`settlement-buildings`,
+  `-shallow`, `-wireframe`) are the ones that judge this phase; the older
+  settlement views now show buildings as a side effect and were re-baselined with
+  it.
+- **Draw calls have headroom again at the measured peak**, but denser content
+  than a village ring is what Phase 7a is. Batch early.
+- **Ship one coherent prop / vegetation pipeline first.** Species, facade bits
+  and yard clutter can be sparse in 7a; Phase 7b is where variety is layered on
+  every placed thing, including the street plan and building kinds deferred from
+  4b/6.
+
+### For Phase 7b
+
+Phase 7b is the variety pass. It runs after 7a's placement and batching exist,
+and it applies to **every prop class the world already has** -- not a third
+placement system.
+
+- **Village layouts.** Alternate Sector-tier generators beyond ring + lanes +
+  spokes: linear villages along a road, grid towns, hilltop enclosures. Same
+  contracts (`SectorStreets`, CSR polylines, grading targets); different plans.
+  Chosen from `(worldSeed, settlement)` so two regions still agree.
+- **Building kinds.** Distinct footprints and meshes (cottage, barn, hall, …)
+  selected per lot from the same salts `lots.ts` already uses, still batched per
+  node. Facade / chimney / door detail can land here or as denser 7a props --
+  either way they stay LOD-independent pose + per-node plinth.
+- **Prop and vegetation variety.** Species, size classes, clustering rules and
+  palette bands for everything 7a places, driven the same way settlement score
+  already drives radius: pure functions of seed and place, not a second world
+  state.
+- **Anti-vacuity per family.** Each layout family and each building/prop kind
+  needs a positive check *and* a "the flight actually saw one" half, or the soak
+  will green-pass on a world that only ever emitted the original ring cottage.

@@ -1146,6 +1146,12 @@ try {
         'which case every building check in this run passed vacuously.',
     );
   }
+  if (max(buildingNodes) < MIN_BUILDING_NODES) {
+    failures.push(
+      `only ${max(buildingNodes)} building-bearing nodes were ever resident (floor ` +
+        `${MIN_BUILDING_NODES}). The flight barely reached a village with houses.`,
+    );
+  }
   if (finalSnapshot.buildingsSeen < MIN_BUILDINGS_SEEN) {
     failures.push(
       `only ${finalSnapshot.buildingsSeen} buildings were generated in the whole ` +

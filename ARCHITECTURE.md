@@ -84,7 +84,9 @@ src/
     rivers.ts           Region-tier flow accumulation and the channel carve
     roads.ts            Region-tier settlement siting, road graph, routing, grading
     streets.ts          Sector-tier street layout inside a settlement
+    lots.ts             Sector-tier building lots along streets
     road-mesh.ts        the road and street DECK: carriageway geometry, per chunk
+    building-mesh.ts    batched building geometry, per chunk
     grading.ts          the one weighted-average blend everything that moves ground joins
     cell-heap.ts        deterministic (key, index)-ordered min-heap, shared by both
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
@@ -178,7 +180,9 @@ rivers.ts       pure functions   Region tier; imports contracts + noise ONLY
 grading.ts      pure functions   the blend rule; imports noise ONLY
 roads.ts        pure functions   Region tier; imports contracts + grading + noise
 streets.ts      pure functions   Sector tier; imports contracts + grading + roads
+lots.ts         pure functions   Sector tier; imports contracts + grading + roads + streets
 road-mesh.ts    pure functions   deck geometry; imports contracts + roads + streets
+building-mesh.ts pure functions  building geometry; imports contracts + lots + roads
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
@@ -567,6 +571,56 @@ only where a settlement centre is, and the region records already list every
 settlement that can reach the node, so the sectors worth visiting are known
 exactly: none normally, one over a village.
 
+### Lots and buildings: Sector-tier content that reads the finished ground
+
+Phase 6. The second Sector-tier generator, and the second mesh of its own after
+the deck. Streets decide where a village's lanes go; lots decide what fronts onto
+them. Buildings are the first content in the project whose placement is decided
+by evaluating the *finished* height field rather than by routing from
+`baseHeight` and then moving the ground.
+
+**Everything a building is is fixed at the Sector tier.** Position, footprint,
+facing, eaves, ridge, wall and roof tint, and the altitude of the floor are all
+pure functions of `(worldSeed, sector)`. `building-mesh.ts` places geometry and
+decides nothing. That is a deliberate departure from the deck: a ribbon hundreds
+of metres long must follow each node's own lattice or it sinks into a coarse
+hillside; an eight-metre house that followed the lattice would jump vertically
+every time the quadtree changed level under it. What varies per node is only how
+far the plinth reaches down to meet *this* node's rendered ground.
+
+**A lot is refused where the village failed to level the ground.** Acceptance
+requires the rendered surface within `LOT_UNLEVEL_MAX` of `gradeTarget` at the
+centre, and less than `LOT_SPREAD_MAX` of variation across the four corners.
+Those two numbers subsume the river test, the steep-hillside test and the
+outside-the-pad test without naming any of them: grading yields inside a channel,
+so a river through the village refuses every lot that would sit in it.
+
+**`LotGround` is injected, not imported.** `height-field.ts` imports `lots.ts` to
+wire the Sector record, so `lots.ts` cannot call `sampleHeight` directly. The
+same injection pattern `RiverTerrain` and `RoadTerrain` use keeps one composition
+of the ground and lets a unit test drive the generator with a flat plane.
+
+**One mesh per node, not one per building.** A village node holds dozens of
+houses; a mesh each would put fifty draw calls on a node that currently costs
+three. Every building whose centre lies in the node goes into one buffer with
+per-vertex colour. Ownership is the centre: the building is not clipped, it may
+overhang the node square, and the submesh's bounds come from the emitted
+vertices so frustum culling does not cut a house in half at the screen edge.
+
+**`SectorField` is a record of two fields, not an alias for streets.**
+`CoarseData` has one slot per tier name, so streets and lots travel together the
+way rivers and roads do in `RegionField`. They are not symmetric: streets grade
+the ground and lots read the finished ground, so the lot field is built from an
+already-built street field.
+
+**`ChunkData.buildings` and `buildingsLevel` are the anti-vacuity pair.**
+`buildings` says houses were placed; `buildingsLevel` says they stand on ground
+this lod-0 node renders within tolerance of their floor. A regression in the
+grading, in `gradeTarget` or in the lot acceptance tests leaves the count
+untouched and drives levelness to zero. Levelness is measured at lod 0 only -- a
+coarse lattice cannot describe an 8 m footprint, so the number would be about
+mesh resolution rather than about the village.
+
 ### The region memo is derived data, and it is bounded
 
 Every chunk vertex needs river influence; a chunk is ~1,200 vertices and hundreds
@@ -891,7 +945,8 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
-**All 37 views are reproducible again as of Phase 6a**, and the rule that keeps
+**All canonical views are reproducible again as of Phase 6a** (40 as of Phase 6),
+and the rule that keeps
 them that way is stated once, in `renderer.ts`: **wireframe mode must not leave a
 polygon offset enabled.** WebGL has no `GL_POLYGON_OFFSET_LINE`, so what a line
 primitive's depth is while the state is on is unspecified, and SwiftShader's
@@ -1002,6 +1057,16 @@ below), so a bridge node is resident for about seven seconds as the camera passe
 against a five-second sampling interval, and an instantaneous peak would be a
 coin flip. A floor built on a coin flip is a check people re-run until it goes
 green.
+
+**Since Phase 6 the flight also has to see BUILDINGS, and the start did not have
+to move a sixth time.** Houses exist only inside a settlement, so they are the
+thinnest signal yet, but the Phase 4b start already put a village in the
+round-tripped square (`houses at the start` 9/25 on the measured run).
+`buildingNodes` / `buildingDrawCalls` mirror the deck pair; `buildingsSeen` is
+cumulative for the bridge reason; `buildingsLevel` / `buildingsMeasured` is the
+phase's own anti-vacuity number -- placed houses that stand on ground a village
+actually levelled, counted at lod 0 only. The geometry hash folds
+`buildingPositions` in.
 
 **Bridges are counted at lod 0 only, and that was measured rather than assumed.**
 A deck stands at the blended target; the GROUND reaches that target only where

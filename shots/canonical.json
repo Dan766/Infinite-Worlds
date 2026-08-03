@@ -143,7 +143,7 @@
     {
       "name": "settlement-footprint",
       "params": "?time=3&pos=2634,880,110&look=0,-88",
-      "expect": "Phase 4a. Straight down from 830 m onto a large settlement (radius 161 m) 2.6 km east of the origin, with a road leaving it to the south-west, a river system to the east and the sea in the corner. The footprint is a pad graded flat to the site's own altitude and surfaced as trampled ground -- deliberately weaker surfacing than a roadbed, because a village is cleared ground and a road is a made surface. This is where settlement SITING is judged: the pad must sit on gentle ground well above water, near fresh water but not in the channel. Phase 4b lays streets inside this pad and Phase 6 puts buildings on them, so this is the before picture for both, and it is expected to look sparse until then."
+      "expect": "Phase 4a. Straight down from 830 m onto a large settlement (radius 161 m) 2.6 km east of the origin, with a road leaving it to the south-west, a river system to the east and the sea in the corner. The footprint is a pad graded flat to the site's own altitude and surfaced as trampled ground -- deliberately weaker surfacing than a roadbed, because a village is cleared ground and a road is a made surface. This is where settlement SITING is judged: the pad must sit on gentle ground well above water, near fresh water but not in the channel. Since Phase 4b it carries streets; since Phase 6 the pad is filled with buildings whose roof plan is legible from this altitude as a warmer scatter inside the ring -- the before picture is gone, and that is the point of keeping the view."
     },
     {
       "name": "road-river-ford",
@@ -158,7 +158,7 @@
     {
       "name": "settlement-streets",
       "params": "?time=3&pos=2634,350,110&look=0,-88",
-      "expect": "Phase 4b, AND THE VIEW THAT SAYS THE PHASE HAPPENED. Straight down from 305 m onto the same settlement `settlement-footprint` frames from 830 m, close enough that the Sector-tier street plan is legible: an irregular ring at 0.58 of the footprint radius, spokes running in to the centre, and dead-end lanes running out to 0.78 of it. The road from the south-west crosses the ring and continues to the middle, and there is deliberately NO lane lying along it -- a candidate street within about 37 degrees of a road leaving the same settlement is dropped, which is what makes a street plan a refinement of the road network rather than a second corridor on top of it. Two failures show here first: a perfectly regular cartwheel means the angular jitter has been lost, and a lane running down the same line as the road means the clearance rule has."
+      "expect": "Phase 4b. Straight down from 305 m onto the same settlement `settlement-footprint` frames from 830 m, close enough that the Sector-tier street plan is legible: an irregular ring at 0.58 of the footprint radius, spokes running in to the centre, and dead-end lanes running out to 0.78 of it. The road from the south-west crosses the ring and continues to the middle, and there is deliberately NO lane lying along it -- a candidate street within about 37 degrees of a road leaving the same settlement is dropped. Since Phase 6 the lanes are fronted by buildings, so the ring reads as a street plan with a village on it rather than as empty graded corridors; the view that says Phase 6 happened is `settlement-buildings`, one altitude lower."
     },
     {
       "name": "settlement-streets-shallow",
@@ -168,12 +168,12 @@
     {
       "name": "settlement-streets-wireframe",
       "params": "?time=3&pos=2380,200,110&look=-90,-32&wireframe=1",
-      "expect": "Phase 4b, AND THE VIEW THAT SAID IT WOULD SHOW PHASE 5. The structural view of a village. The street GRADING is still a deformation of the ordinary 32x32 lattice, and the quadtree's level rings around it still say that the grading is only resolvable where the ground is fine -- `streetVertices` remains a near-camera quantity and the soak's floors are still set for a flight that passes through a village. On top of it now sits the Phase 5 deck: the ring, its lanes and its spokes as their own geometry, in one submesh with the road that serves them, at exactly the width the street record says rather than at whatever the lattice under them could express. That is the difference the deck buys and this is where it is legible."
+      "expect": "Phase 4b / 5 / 6. The structural view of a village. The street GRADING is still a deformation of the ordinary 32x32 lattice; on top of it sits the Phase 5 deck; and since Phase 6 the ring is lined with building outlines -- walls, gables and roof slopes as their own mesh, parented to the terrain node, in a third render-order band above every deck. Two failures show here first: a house whose winding is inside out shades black on one face, and a house emitted by two nodes doubles every edge along a chunk boundary."
     },
     {
       "name": "settlement-sector-seam",
       "params": "?time=3&pos=2560,300,110&look=0,-89",
-      "expect": "Phase 4b. THE SECTOR-BOUNDARY CANARY, mirroring `river-region-seam` and `road-region-seam` one tier down, and the most likely visual failure of the phase. Straight down onto x = 2560, a SECTOR boundary, so the boundary is the vertical centre line of the frame -- and this settlement's centre is only 74 m east of it, so its western lane and part of its ring lie in the sector NEXT DOOR, which owns no settlement at all. A sector lays out only the settlement whose centre it contains, so the ground west of the centre line is graded by a record belonging to the sector east of it; if a query ever read only its own sector, the village would be sliced off along this line. Nothing may change across it: no break in the ring, no step in the pad, no change in surfacing. Since Phase 5 it carries the deck's version of the same claim, one boundary finer: the lane decks are clipped per CHUNK, so this frame is also a dozen 64 m boundaries the carriageway must cross without a seam or a doubled strip."
+      "expect": "Phase 4b. THE SECTOR-BOUNDARY CANARY, mirroring `river-region-seam` and `road-region-seam` one tier down. Straight down onto x = 2560, a SECTOR boundary, so the boundary is the vertical centre line of the frame -- and this settlement's centre is only 74 m east of it, so its western lane and part of its ring lie in the sector NEXT DOOR, which owns no settlement at all. A sector lays out only the settlement whose centre it contains, so the ground west of the centre line is graded by a record belonging to the sector east of it; if a query ever read only its own sector, the village would be sliced off along this line. Nothing may change across it: no break in the ring, no step in the pad, no change in surfacing. Since Phase 5 the lane decks cross the same line without a seam; since Phase 6 buildings whose centres sit east of the line may overhang west of it -- ownership is by centre, not by clipping -- and that overhang must still be a single house, not a half or a double."
     },
     {
       "name": "road-bridge",
@@ -188,7 +188,22 @@
     {
       "name": "deck-lod-aerial",
       "params": "?time=3&pos=2634,1600,110&look=0,-88",
-      "expect": "Phase 5. Straight down from 1.6 km: two villages, the road joining them, the drainage network and the coast, all at once and all well past lod 0. THE REASON A DECK IS PER-CHUNK GEOMETRY. At this altitude every node on screen is at level 3 to 5, where the vertex lattice is 16-64 m and the Phase 4a surfacing -- which is a per-vertex colour on that lattice -- has washed out to a faint stain. The deck has not: it is exactly as wide as the road record says, because its width comes from the record and not from whatever lattice happens to be under it. That is the whole argument for building it per node against the node's own ground, and it is the difference between a road network you can read from the air and a smear. It is also the view where a deck that sank into a coarse hillside, or floated over a coarse valley, would be obvious."
+      "expect": "Phase 5. Straight down from 1.6 km: two villages, the road joining them, the drainage network and the coast, all at once and all well past lod 0. THE REASON A DECK IS PER-CHUNK GEOMETRY. At this altitude every node on screen is at level 3 to 5, where the vertex lattice is 16-64 m and the Phase 4a surfacing -- which is a per-vertex colour on that lattice -- has washed out to a faint stain. The deck has not: it is exactly as wide as the road record says, because its width comes from the record and not from whatever lattice happens to be under it. That is the whole argument for building it per node against the node's own ground, and it is the difference between a road network you can read from the air and a smear. It is also the view where a deck that sank into a coarse hillside, or floated over a coarse valley, would be obvious. Since Phase 6 the two villages read as roof clusters rather than empty pads, which is the same claim one altitude higher than `settlement-buildings`."
+    },
+    {
+      "name": "settlement-buildings",
+      "params": "?time=3&pos=2634,145,110&look=0,-88",
+      "expect": "Phase 6, AND THE VIEW THAT SAYS THE PHASE HAPPENED. Straight down from 100 m onto the same settlement `settlement-streets` frames from 305 m, close enough that individual roof plans are legible: gabled boxes fronting the ring and the lanes, warm walls and darker roofs, a plinth of stone only where the ground falls away from the floor. Buildings sit on the street setback rather than on the carriageway, leave a gap between neighbours, and stop short of the pad's outer rim. Two failures show here first: a village of identical sheds means the tint and size salts collapsed onto one stream, and a house standing in the street means the clearance tests were lost."
+    },
+    {
+      "name": "settlement-buildings-shallow",
+      "params": "?time=3&pos=2490,55,130&look=-90,-8",
+      "expect": "Phase 6. THE SHALLOW-PITCH BUILDING VIEW, standing just west of the ring about 9 m above the pad and looking east across the roofs toward the sea. Every geometry budget in this project is decided near the horizon, so the phase needs at least one building view at that pitch -- and it is the angle at which the FLOOR / PLINTH split is visible: floors hold a constant altitude while plinths meet this node's ground, so a house does not jump when the quadtree changes level under it. If floors were fitted per node the way a deck is, this view would shimmer as the camera moved."
+    },
+    {
+      "name": "settlement-buildings-wireframe",
+      "params": "?time=3&pos=2520,70,120&look=-90,-18&wireframe=1",
+      "expect": "Phase 6. The structural claim of the phase in one image: a building is A SEPARATE MESH, batched per node. The terrain lattice, the street deck and the house outlines are three distinct geometries; each house is 14 triangles (four walls, two gables, two roof slopes) with winding derived from an outward hint rather than assumed. Ownership is by centre and the geometry is not clipped, so a house whose centre sits in one 64 m node may overhang into the next -- and must appear exactly once. A plinth that hung unbounded down a bank would show here as a curtain of vertical edges."
     }
   ]
 }
