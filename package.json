@@ -11,6 +11,8 @@
     "shot": "node scripts/shot.mjs",
     "shots": "node scripts/shots.mjs",
     "shots:check": "node scripts/shots-check.mjs",
+    "shots:diff": "node scripts/shots-diff.mjs",
+    "shots:repeat": "node scripts/shots-repeat.mjs",
     "soak": "node scripts/soak.mjs",
     "verify:subpath": "node scripts/verify-subpath.mjs",
     "deploy:firebase": "npm run build && firebase deploy --only hosting"

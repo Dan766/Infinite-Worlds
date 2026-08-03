@@ -325,8 +325,31 @@ const ROAD_DETOUR_MARGIN = 768;
  */
 const HEURISTIC_WEIGHT = 4;
 
-/** Region networks held at once, per JS context. */
-export const ROAD_CACHE_LIMIT = 8;
+/**
+ * Region networks held at once, per JS context.
+ *
+ * RAISED FROM 8 TO 16 IN PHASE 5, AND THE OLD VALUE WAS ONE SHORT OF THE
+ * WORKING SET. A quadtree node at the root level covers a whole 4 km region, and
+ * both the per-vertex grading (through its padded sample grid) and the deck
+ * builder need every region within a margin of it -- a 3x3 block, NINE, against
+ * a cache of eight. One short of the working set is the worst possible size: the
+ * entry evicted is always the one wanted next, so a full sweep rebuilds every
+ * region it touches instead of building each once.
+ *
+ * It went unmeasured until Phase 5 because grading sweeps row-major, so its
+ * working set within one row of vertices is three rather than nine, and eight
+ * absorbed it. The deck builder sweeps the 3x3 block in one go and cannot.
+ * Measured on a root node: 10.5 s with the old limit against 3.6 s with the deck
+ * disabled, and both figures collapse together at 16.
+ *
+ * The cost of the larger cache is small and bounded: a network is a few hundred
+ * path nodes plus a bucket index, well under 100 kB, so sixteen of them is a
+ * megabyte or two against a 400 MB heap budget. The lookup is a linear scan, but
+ * over ENTRIES not sectors -- one scan per query point, not four -- and a region
+ * query happens once per vertex, so the scan is nowhere near the cost of the
+ * `baseHeight` evaluation next to it.
+ */
+export const ROAD_CACHE_LIMIT = 16;
 
 /** Metres per bucket in the per-network segment index. */
 const BUCKET_METRES = 128;
@@ -1345,6 +1368,59 @@ function accumulateNetwork(net: RoadNetwork, x: number, z: number, blend: GradeB
     if (weight <= 0) continue;
     blend.add(weight, s.y, weight * SETTLEMENT_SURFACE, SURFACE_ROAD);
   }
+}
+
+/**
+ * The distance beyond which `roadClearance` stops being able to see a road.
+ *
+ * A segment is registered in every bucket its corridor-inflated box touches,
+ * where the inflation is `halfWidth + ROAD_SHOULDER` -- so a one-bucket lookup
+ * finds every road whose GRADING reaches the point and nothing about roads
+ * further away. That is the exact range over which the answer means anything.
+ */
+export const ROAD_CLEARANCE_RANGE = ROAD_SHOULDER;
+
+/**
+ * Metres of clear ground between a point and the nearest ROADBED EDGE, or
+ * `Infinity` when no road's corridor reaches it.
+ *
+ * Phase 6 needs it and nothing before it did: a lot has to be kept off the
+ * carriageway, and "is a road within n metres" is not answerable from
+ * `RegionRoadField.surface`, which is non-zero across an entire settlement
+ * because a village pad surfaces its own ground.
+ *
+ * It reads the same one bucket `accumulateNetwork` does, so it costs the same as
+ * one grading query -- and carries the same limit, stated in
+ * `ROAD_CLEARANCE_RANGE`: an answer larger than that means "no road inside the
+ * corridor", not a measured distance. Callers must compare against a threshold
+ * below the range rather than treating the value as a distance to a far road.
+ */
+export function roadClearance(net: RoadNetwork, x: number, z: number): number {
+  const col = Math.floor((x - net.minX) / BUCKET_METRES);
+  const row = Math.floor((z - net.minZ) / BUCKET_METRES);
+  if (col < 0 || row < 0 || col >= BUCKET_COLS || row >= BUCKET_COLS) return Infinity;
+
+  const bucket = row * BUCKET_COLS + col;
+  const from = net.bucketStart[bucket] as number;
+  const to = net.bucketStart[bucket + 1] as number;
+  let best = Infinity;
+  for (let s = from; s < to; s++) {
+    const seg = net.bucketSeg[s] as number;
+    const ai = net.segNode[seg * 2] as number;
+    const bi = net.segNode[seg * 2 + 1] as number;
+    closestOnSegment(
+      x,
+      z,
+      net.nodeX[ai] as number,
+      net.nodeZ[ai] as number,
+      net.nodeX[bi] as number,
+      net.nodeZ[bi] as number,
+      scratch,
+    );
+    const clear = Math.sqrt(scratch[0] as number) - (net.nodeHalfWidth[ai] as number);
+    if (clear < best) best = clear;
+  }
+  return best;
 }
 
 /**

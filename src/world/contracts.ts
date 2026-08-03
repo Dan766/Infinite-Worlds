@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 6;
+export const CHUNK_DATA_VERSION = 8;
 
 /**
  * The result of generating one chunk.
@@ -324,6 +324,83 @@ export interface ChunkData {
    */
   readonly streetVertices: number;
   /**
+   * The Phase 5 road and street DECK: the made carriageway surface, as its own
+   * submesh, in the same node-local frame as `positions`.
+   *
+   * ZERO-LENGTH ON A NODE NO ROAD OR STREET REACHES, which is most of them, and
+   * that discipline is what keeps a deck off the draw-call budget everywhere it
+   * is not needed -- exactly the rule `waterPositions` follows. Everything
+   * before this phase modified the terrain mesh the node already had; a deck is
+   * the first thing since Phase 3a's water that costs a draw call of its own.
+   *
+   * See `road-mesh.ts` for why a deck is per-chunk geometry rather than one mesh
+   * per road: a node's rendered ground is the interpolation of its OWN lattice,
+   * so a lod-independent deck sinks into a coarse hillside and floats over a
+   * coarse valley.
+   */
+  readonly deckPositions: Float32Array;
+  /** Unit deck normals, xyz triples, one per deck vertex. */
+  readonly deckNormals: Float32Array;
+  /** Per-deck-vertex colour, rgb triples, LINEAR in [0, 1]. */
+  readonly deckColors: Float32Array;
+  /** Triangle indices into `deckPositions`. */
+  readonly deckIndices: Uint32Array;
+  /**
+   * Deck stations standing clear of the ground by more than
+   * `BRIDGE_CLEARANCE` -- i.e. vertices that are on a bridge. Counted at lod 0
+   * only; see `BRIDGE_COUNT_LOD` for why a coarse node would report a number
+   * about its own lattice rather than about the world.
+   *
+   * A scalar, for the reason `riverVertices` is one, and the sharpest example of
+   * it yet. A bridge exists only where a road crosses a carved channel, which is
+   * a handful of places in a region; without a count, "the flight never crossed a
+   * bridge" and "the deck stopped spanning channels" produce identical evidence,
+   * and every bridge check ever written would pass on either. It counts what the
+   * GEOMETRY did, not what `RoadNetwork.segCrossing` predicted -- a regression in
+   * the deck's `max` rule leaves `segCrossing` perfectly intact.
+   */
+  readonly bridgeVertices: number;
+  /**
+   * The Phase 6 BUILDINGS of this node, batched into one submesh, in the same
+   * node-local frame as `positions`.
+   *
+   * ZERO-LENGTH ON A NODE WITH NO BUILDING CENTRE IN IT, which is all but a
+   * handful in the world -- `waterPositions`' rule again, and the reason this
+   * phase costs one draw call in a village and none anywhere else.
+   *
+   * One buffer for EVERY building in the node rather than one per building: see
+   * `building-mesh.ts`. A village node holds dozens, and a mesh each would put
+   * fifty draw calls on a node that currently costs three.
+   */
+  readonly buildingPositions: Float32Array;
+  /** Unit building normals, xyz triples, one per building vertex. */
+  readonly buildingNormals: Float32Array;
+  /** Per-building-vertex colour, rgb triples, LINEAR in [0, 1]. */
+  readonly buildingColors: Float32Array;
+  /** Triangle indices into `buildingPositions`. */
+  readonly buildingIndices: Uint32Array;
+  /**
+   * Buildings this node owns -- i.e. whose centre lies in its square.
+   *
+   * Not derivable from the buffers: every building has the same 30 vertices, so
+   * a vertex count cannot distinguish "forty houses" from "one enormous one",
+   * and the streamer's HUD and the soak both want the object count.
+   */
+  readonly buildings: number;
+  /**
+   * Of those, how many stand on ground THIS node renders within
+   * `BUILDING_LEVEL_TOLERANCE` of their own floor. Counted at lod 0 only; see
+   * `BUILDING_LEVEL_LOD` for why a coarse node would report a number about its
+   * own lattice rather than about the world.
+   *
+   * A scalar, for the reason `riverVertices` and `bridgeVertices` are ones, and
+   * it is the anti-vacuity counter of Phase 6. `buildings` says houses were
+   * placed; this says they were placed on ground a village actually levelled. A
+   * regression in the grading, in `gradeTarget` or in the lot acceptance tests
+   * leaves `buildings` untouched and drives this to zero.
+   */
+  readonly buildingsLevel: number;
+  /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
    *
@@ -347,7 +424,15 @@ export function chunkDataBytes(data: ChunkData): number {
     data.colors.byteLength +
     data.waterPositions.byteLength +
     data.waterColors.byteLength +
-    data.waterIndices.byteLength
+    data.waterIndices.byteLength +
+    data.deckPositions.byteLength +
+    data.deckNormals.byteLength +
+    data.deckColors.byteLength +
+    data.deckIndices.byteLength +
+    data.buildingPositions.byteLength +
+    data.buildingNormals.byteLength +
+    data.buildingColors.byteLength +
+    data.buildingIndices.byteLength
   );
 }
 
@@ -373,6 +458,14 @@ export function chunkDataTransferables(data: ChunkData): Transferable[] {
     data.waterPositions.buffer as ArrayBuffer,
     data.waterColors.buffer as ArrayBuffer,
     data.waterIndices.buffer as ArrayBuffer,
+    data.deckPositions.buffer as ArrayBuffer,
+    data.deckNormals.buffer as ArrayBuffer,
+    data.deckColors.buffer as ArrayBuffer,
+    data.deckIndices.buffer as ArrayBuffer,
+    data.buildingPositions.buffer as ArrayBuffer,
+    data.buildingNormals.buffer as ArrayBuffer,
+    data.buildingColors.buffer as ArrayBuffer,
+    data.buildingIndices.buffer as ArrayBuffer,
   ];
 }
 

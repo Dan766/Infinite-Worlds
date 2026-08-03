@@ -19,6 +19,10 @@ import { Renderer } from './render/renderer';
 import { CubeScene } from './scene/cube';
 import { ChunkStreamer } from './world/chunk-streamer';
 import {
+  buildingDrawsSinceReset,
+  deckDrawsSinceReset,
+  resetBuildingDraws,
+  resetDeckDraws,
   resetRiverDraws,
   resetRoadDraws,
   resetStreetDraws,
@@ -38,6 +42,20 @@ declare global {
      * first frame.
      */
     __worldReady?: boolean;
+    /**
+     * Set to `false` by a harness BEFORE the document runs to hold the
+     * autopilot at `?pos=` until it says otherwise; set back to `true` to
+     * release it. Absent -- the normal case, including a human opening a
+     * `?fly=` URL -- means released.
+     *
+     * `__worldReady` alone is not enough for the soak, and Phase 5 found out
+     * why. Readiness is observed by polling from Node, and the main thread
+     * stalls for over a second at a time building meshes under a software
+     * rasteriser, so the poll lands late and the flight has already covered
+     * hundreds of metres by the time the baseline is taken. Everything the soak
+     * says "at the start" is then a claim about a square nobody chose.
+     */
+    __flightReleased?: boolean;
     __app?: App;
   }
 }
@@ -87,6 +105,24 @@ export class App {
    * a 4 km region, so this is the one most likely to be quietly zero.
    */
   private streetDrawCalls = 0;
+  /**
+   * Phase 5 deck submeshes actually rasterised in the last frame.
+   *
+   * The first of these counters since Phase 3a's water that measures a mesh of
+   * its own rather than a feature baked into the terrain -- which is exactly why
+   * a deck is the first thing since Phase 2b that can move the draw-call budget.
+   */
+  private deckDrawCalls = 0;
+
+  /**
+   * Phase 6 building submeshes actually rasterised in the last frame.
+   *
+   * The second mesh of its own after the deck, and the sparsest thing in the
+   * world: it is zero on almost every frame of a flight, and non-zero only over
+   * a settlement. That is what makes it worth measuring separately rather than
+   * folding into `deckDrawCalls`.
+   */
+  private buildingDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -244,6 +280,26 @@ export class App {
       streetNodes: chunks.streetNodes,
       streetVertices: chunks.streetVertices,
       streetDrawCalls: this.streetDrawCalls,
+      // Phase 5. `deckNodes` is deck geometry that is resident, `deckDrawCalls`
+      // what reached the rasteriser, and `bridgeVertices` how much of it is
+      // standing clear of the ground -- the last being the only evidence that a
+      // road crossing a river became a bridge rather than stopping at the bank.
+      deckNodes: chunks.deckNodes,
+      deckTriangles: chunks.deckTriangles,
+      bridgeVertices: chunks.bridgeVertices,
+      bridgeNodes: chunks.bridgeNodes,
+      deckDrawCalls: this.deckDrawCalls,
+      // Phase 6, and the same trio once more. `buildings` is what is resident,
+      // `buildingDrawCalls` what reached the rasteriser, and `buildingsLevel`
+      // the only one that says the houses are standing on ground a village
+      // levelled rather than merely standing somewhere.
+      buildingNodes: chunks.buildingNodes,
+      buildings: chunks.buildings,
+      buildingsMeasured: chunks.buildingsMeasured,
+      buildingsLevel: chunks.buildingsLevel,
+      buildingTriangles: chunks.buildingTriangles,
+      buildingsSeen: chunks.buildingsSeen,
+      buildingDrawCalls: this.buildingDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -349,6 +405,29 @@ export class App {
     return this.streamer.sampleStreetVertices(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * Deck triangles in the chunks around a world position, as actually resident.
+   * `null` where the chunk is not loaded.
+   *
+   * The Phase 5 counterpart, and the water one rather than the road one: the
+   * geometry hash now folds `deckPositions` in, so this is what says the
+   * round-tripped square had a carriageway in it at all.
+   */
+  sampleChunkDecks(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleDeckTriangles(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
+  /**
+   * Buildings in the chunks around a world position, as actually resident.
+   * `null` where the chunk is not loaded.
+   *
+   * The Phase 6 counterpart, and the narrowest yet: the round-tripped square has
+   * to contain a building, not merely be inside a village.
+   */
+  sampleChunkBuildings(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleBuildings(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -369,7 +448,11 @@ export class App {
     // measured street 10/25 in the square it names and 0/25 in the square the
     // run actually sampled, 760 m away. Holding the flight until
     // `__worldReady` makes the origin exactly `?pos=`, on every machine.
-    if (this.autopilot.active && window.__worldReady === true) {
+    if (
+      this.autopilot.active &&
+      window.__worldReady === true &&
+      window.__flightReleased !== false
+    ) {
       const p = this.rig.position;
       this.rig.setPosition(this.autopilot.advance(wallDt, p.x), p.y, p.z);
     }
@@ -379,11 +462,15 @@ export class App {
     resetRiverDraws();
     resetRoadDraws();
     resetStreetDraws();
+    resetDeckDraws();
+    resetBuildingDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
     this.roadDrawCalls = roadDrawsSinceReset();
     this.streetDrawCalls = streetDrawsSinceReset();
+    this.deckDrawCalls = deckDrawsSinceReset();
+    this.buildingDrawCalls = buildingDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -430,6 +517,8 @@ export class App {
     hud.register('river draws', () => this.riverDrawCalls, HudOrder.render);
     hud.register('road draws', () => this.roadDrawCalls, HudOrder.render);
     hud.register('street draws', () => this.streetDrawCalls, HudOrder.render);
+    hud.register('deck draws', () => this.deckDrawCalls, HudOrder.render);
+    hud.register('building draws', () => this.buildingDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

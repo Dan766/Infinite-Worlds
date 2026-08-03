@@ -40,6 +40,31 @@ describe('GradeBlend', () => {
     expect(blend.empty).toBe(true);
   });
 
+  it('exposes the TARGET before any clamp or yield, for Phase 5 to build on', () => {
+    // A deck is PLACED at the target rather than moved toward it, so it needs
+    // the average itself and not what the ground made of it. All three filters
+    // -- the strength, the cut and fill caps, and the river yield -- are exactly
+    // what a bridge has to ignore.
+    const blend = new GradeBlend();
+    blend.reset();
+    // -Infinity, not 0 and not NaN, so `max(ground, target)` means "the ground
+    // wins" wherever nothing grades at all, with no special case at the caller.
+    expect(blend.target).toBe(-Infinity);
+
+    blend.add(1, 40, 0, SURFACE_ROAD);
+    blend.add(1, 60, 0, SURFACE_ROAD);
+    expect(blend.target).toBe(50);
+
+    // The ground here is clamped to +12 m of fill and stood down completely by
+    // the river; the target is untouched by both. That IS the bridge rule.
+    const o = out();
+    blend.resolve(0, 0, o);
+    expect(o[GRADE_LIFT]).toBe(ROAD_MAX_FILL);
+    blend.resolve(0, ROAD_RIVER_YIELD, o);
+    expect(o[GRADE_LIFT]).toBe(0);
+    expect(blend.target).toBe(50);
+  });
+
   it('moves the ground all the way to the target at full weight', () => {
     const blend = new GradeBlend();
     blend.reset();

@@ -13,8 +13,8 @@ state moves between sessions. Update both at the end of every phase.
 | 3b    | Rivers                             | Done   |
 | 4a    | Settlements and road network       | Done   |
 | 4b    | Settlement streets (Sector tier)   | Done   |
-| 5     | Road meshes                        | Next   |
-| 6     | Lots and buildings                 | -      |
+| 5     | Road meshes                        | Done   |
+| 6     | Lots and buildings                 | Next   |
 | 7     | Vegetation and props               | -      |
 | 8     | Player controller and collision    | -      |
 | 9     | NPCs                               | -      |
@@ -2636,3 +2636,736 @@ Four new views:
 - **`shots:check` is the slowest thing in the project by a wide margin** and has
   to pass twice. Phase 4a flagged the trend as worth watching; 4b added four views
   and did not slow a single test outside them.
+
+---
+
+## Phase 5 -- Road meshes: the deck, and the bridge (done)
+
+The first phase since 3a to add a MESH. Everything from 3b to 4b modified the
+terrain mesh every node already had -- a river is a dent in it, a road is a bench
+and a colour, a street is the same one tier down -- so none of them could cost a
+draw call, and none of them could be resolved more finely than the vertex lattice
+they were drawn into. A deck is separate geometry, so it costs a draw call and it
+is exact at every level. Phase 4b said in advance that this is the phase whose
+budgets should move; they moved, and the number is stated below rather than the
+limit quietly raised.
+
+The binding spec was `PROGRESS.md`'s own "For Phase 5" handoff, `ARCHITECTURE.md`'s
+five rules, and the `baseHeight` / `sampleHeight` / `GradeBlend` layering. All
+five of the handoff's points are answered here, including the open one: **streets
+get the same treatment as roads, through the same extruder.**
+
+### Built
+
+- **`src/world/road-mesh.ts`** -- new, and the phase. Pure, no Three, importable
+  from a worker and from Node like every other file in `world/`. It builds one
+  node's deck: the carriageway of every road and street crossing that node, as
+  its own positions, normals, colours and indices.
+- **`ChunkData` gains `deckPositions`, `deckNormals`, `deckColors`,
+  `deckIndices` and `bridgeVertices`.** `CHUNK_DATA_VERSION` 6 -> 7, the transfer
+  list 7 buffers -> 11, and `chunkDataBytes` covers them. All four arrays are
+  ZERO-LENGTH on a node no road reaches, which is most of them, and a test
+  asserts that such a node still costs exactly 74,676 bytes.
+- **`GradeBlend.target`**, and **`gradeTarget` in `height-field.ts`** beside
+  `gradeSurface`. The blended target altitude, before the strength, the cut and
+  fill caps and the river yield are applied. Nothing before this phase needed it,
+  because nothing before this phase had to be PLACED at the target rather than
+  moved toward it.
+- **`chunk-gen.ts` gains `groundAt`** -- the ground this node actually RENDERS at
+  an arbitrary point, interpolating the two triangles of a cell rather than
+  bilinearly blending its four corners, because those are different surfaces
+  wherever a quad is twisted and only one of them reaches the rasteriser. It also
+  gains the deck palette: a dark metalled bed for a road, a lighter gravel for a
+  village lane.
+- **`chunk-mesh.ts` gains the deck submesh**, parented to the terrain mesh like
+  the water so the streamer's add/remove/dispose carries it, with the same
+  coordinate-derived `renderOrder`, a `polygonOffset` material, and a
+  `deckDraws` counter off `onBeforeRender`. `hashChunkGeometry` folds
+  `deckPositions` in -- the first new term since 3a.
+- **`chunk-streamer.ts` gains `deckNodes`, `deckTriangles`, `bridgeVertices` and
+  a CUMULATIVE `bridgeNodes`**, plus `sampleDeckTriangles` and a `decks` HUD line.
+  `app.ts` gains `deckDrawCalls`, a `deck draws` HUD line, `sampleChunkDecks` and
+  four `perfSnapshot` fields.
+- **Two memo limits raised, on measurements rather than on taste.**
+  `ROAD_CACHE_LIMIT` 8 -> 16 and `STREET_CACHE_LIMIT` 64 -> 192. See below: this
+  is the largest performance change in the project since Phase 2b and it is not
+  really about decks.
+- **The soak holds the autopilot until its baseline is read**
+  (`window.__flightReleased`, set through `context.addInitScript`). Opt-in, so a
+  human opening a `?fly=` URL is unaffected.
+- **`src/world/road-mesh.test.ts`**, 16 tests, plus one for `GradeBlend.target`.
+- **Three new canonical views**: `road-bridge`, `road-bridge-wireframe`,
+  `deck-lod-aerial`.
+
+### The rule, and the two versions of it that were wrong
+
+A deck station's altitude is
+
+```
+deckY = max(gradeTarget(x, z), thisNode.groundAt(x, z)) + DECK_LIFT
+```
+
+and every property of the phase falls out of it:
+
+| where | the ground | the deck |
+| ----- | ---------- | -------- |
+| ordinary terrain | reached the target | flush on the ground |
+| a village edge | the pad/road/street weighted average | flush, reading the same average |
+| a clamped cut on a hillside | stays above the target | rides the ground |
+| inside a river channel | yielded entirely (`ROAD_RIVER_YIELD`) | holds the target: **a bridge** |
+
+**The first version used the road's own profile and floated over every village.**
+`RoadNetwork.nodeY` interpolated along the segment is the road's target, not the
+blended one, and inside a settlement the ground is graded to the average of the
+pad's target and the road's. A deck at the road's profile therefore stood one to
+three metres above its own approach on the way into every village in the world.
+Reading `GradeBlend.target` -- literally the same accumulation `gradeSurface`
+performs, stopped one step short of resolving -- makes flushness a property of
+the composition instead of a coincidence. It also removed the second
+interpolation of `nodeY`: **the deck reads no road altitude at all now**, which
+is one source of truth rather than two that agree today.
+
+**The second version hung the apron to the ground and built a dam.** Every deck
+edge carries an apron below it, which does the terrain skirt's job where the deck
+rests on the ground and is the side of the bridge where it does not. Hanging it
+to the ground unconditionally is right for the first job and catastrophic for the
+second: over a 15 m channel it produced a solid wall from bank to bank standing
+in the water. That is exactly the failure `ROAD_RIVER_YIELD` exists to prevent
+one layer down, and `road-river-ford` has been the canonical picture of not doing
+it since Phase 4a. `DECK_BEAM` (0.8 m) bounds how far the apron may follow the
+ground down, so a deck spanning a channel is a deck with a beam under it and
+daylight below.
+
+### Why per-chunk geometry, and why that is not the obvious choice
+
+One mesh per routed road is the obvious design and is wrong here in four ways.
+Three of them are the ones Phase 3a used to reject a world-sized water plane: its
+extent is not a function of `(worldSeed, coord)`, so the streamer's residency,
+the LRU cache and the soak's round-trip hash do not cover it; it cannot be
+clipped to whatever the quadtree currently covers; and no single worker owns a
+road.
+
+The fourth is new and is the one that settles it. **A node's rendered ground is
+the linear interpolation of its own vertex lattice**, which at lod 5 cuts corners
+by metres. A lod-independent deck sinks into a coarse hillside and floats over a
+coarse valley -- and roads are in valleys. The deck has to be fitted to the same
+grid the node draws, which means it has to be built by the node, in the worker,
+with the payload.
+
+### Two neighbours agree exactly, and that is arithmetic rather than tolerance
+
+A centreline is clipped to the node square parametrically. For the shared
+boundary of two same-level neighbours the two clips solve the same equation with
+opposite signs -- `(maxX - ax) / dx` against `(ax - minX) / -dx` -- and IEEE-754
+makes negation exact and `x / -y === -(x / y)`, so both nodes place a station at
+the same world point. Their padded height grids sample the same world positions
+along that edge, so the station gets the same altitude from both. Two unit tests
+assert it with `toBe`, not with a tolerance: one on the clipper directly, one on
+real generated nodes.
+
+The consequence is that the deck is PARTITIONED between nodes rather than shared
+or dropped: no seam, and no double-drawn overlap to z-fight. The box is half-open
+on its maximum edges, which matters only for a segment running exactly along a
+boundary -- parallel to it, so no interval clips it away, and both neighbours
+would otherwise emit the same strip on top of each other.
+
+Ownership needs one more rule for roads and none for streets. Two regions both
+route a road near their shared boundary and hold bit-identical copies of it, so a
+segment is emitted by the region containing its MIDPOINT. Streets need nothing: a
+sector lays out only the settlement whose centre it contains, so two sectors never
+hold the same street.
+
+### The performance finding, which is not about decks
+
+The deck builder sweeps a whole node in one go, where everything before it swept
+one vertex at a time. That exposed two memo limits that had been wrong since the
+phases that set them, and each was wrong in the same shape: **smaller than the
+working set of a single coarse node.**
+
+A node at the root level covers a whole 4 km region. Its padded sample grid needs
+a 3x3 block of ROAD networks and an 11x11 block of STREET plans.
+`ROAD_CACHE_LIMIT` was 8 against nine, and `STREET_CACHE_LIMIT` 64 against 121.
+One short of the working set is the worst possible size: the entry evicted is
+always the one wanted next, so a sweep rebuilds every record it touches instead
+of building each once.
+
+Neither was visible before, because a VERTEX touches one region and up to four
+sectors and both caches absorbed that comfortably. Measured on real work:
+
+| measured | before | after |
+| -------- | ------ | ----- |
+| one root-level node, memos warm | 3.6 s -- 10.5 s with a deck | ~6 ms |
+| `seed-canary-inland` to `__worldReady` | 96 s, against a 120 s harness limit | ~16 s |
+| `deck-lod-aerial` to `__worldReady` | 103 s | ~20 s |
+
+The second row is the important one: that view had been quietly costing most of a
+`shots` run since Phase 4b, close enough to the timeout that the first Phase 5
+capture attempt failed on it. Phase 4b's handoff asked for exactly this
+measurement (**"a phase that adds a fifth Sector-tier query per vertex should
+measure it"**) and this is the answer -- the scan length was never the problem,
+the capacity was.
+
+**The deck also stopped sweeping the sector grid.** Visiting every sector whose
+square inflated by `STREET_REACH` meets the node is what `accumulate` does per
+vertex and is correct for a vertex; for a node it is an 11x11 block. A street
+plan exists only where a settlement centre is, and the region records already
+list every settlement that can reach the node, so the sectors worth visiting are
+enumerated exactly: none normally, one over a village.
+
+### The soak's fifth vacuity trap, and the one that was not the flight's fault
+
+Phase 5 adds the deck trio -- `deckNodes` resident, `deckDrawCalls` rasterised,
+`deck at the start` in the round-tripped square -- mirroring water rather than
+rivers, because a deck IS its own submesh. It also adds `bridgeNodes`, and that
+one needed two decisions that no earlier counter did.
+
+**Bridges are counted at lod 0 only.** A deck stands at the blended target; the
+ground reaches that target only where the vertex lattice has samples inside a
+2.6-6 m roadbed. At lod 0 the spacing is 2 m and several do. At lod 3 it is 16 m
+and usually none, so the deck legitimately stands a metre or two above ground the
+lattice cannot describe -- which is the deck doing its job and is not a bridge.
+Counting it read 410 where the honest number is 60, and turned the one statistic
+that says "a road crossed a river" into a statement about mesh resolution.
+
+**And it is cumulative, not instantaneous.** A lod-0 bridge node is resident for
+about seven seconds as the camera passes, against a five-second sampling
+interval. An instantaneous peak is a coin flip, and a floor built on a coin flip
+is a check people re-run until it goes green. `bridgeNodes` only rises. The
+corridor was scanned offline before the floor was set: four chunk columns carry a
+bridge, around x = -3,700, which the flight passes at about t = 68 s outbound and
+t = 232 s on the return. The run measured 10.
+
+**`__worldReady` was not enough to anchor the flight, and that cost a whole run.**
+Phase 4b stopped the autopilot advancing before the world was ready, which
+removed 400-900 m of drift. It could not remove the rest: readiness is observed by
+POLLING from Node, and a main thread building a hundred meshes under a software
+rasteriser stalls for over a second at a time, so the poll lands late. On the run
+that exposed this the camera was **1,296 m downrange** by the time the baseline
+was read, which put the round-tripped square out over open sea and failed three
+checks that had nothing wrong with them. The soak now sets
+`window.__flightReleased = false` before the document runs and clears it once
+every baseline is read; the run after that started at exactly x = -6,749 and
+returned to exactly x = -6,749.
+
+### Verified
+
+- **`npm test`: all green**, including 16 new deck tests. The ones worth naming:
+  - two neighbours place the boundary station at the same altitude, **to the
+    bit**, on real generated nodes;
+  - the deck never sinks below the rendered surface **at lod 0 or at lod 3** --
+    the second half is the one that would fail for a lod-independent deck;
+  - it follows the ground rather than hovering: most stations are flush to within
+    5 cm, and the altitude varies across a chunk by more than half a metre;
+  - **over 90% of stations in a village are flush**, which is the regression test
+    for the road-profile version that floated;
+  - bridges exist, span more than `BRIDGE_CLEARANCE`, are **rare** on ordinary
+    road, and are **zero at lod 3**;
+  - a deck regenerates byte-identically after twelve unrelated chunks on other
+    seeds have evicted every memo it reads;
+  - an absent deck costs zero bytes, zero indices and zero normals.
+- **`npm run soak`: green over the full 300 s.** Round trip exact: started at
+  x = -6,749, returned to x = -6,749, 25/25 chunks re-resident, **25/25 geometry
+  hashes identical** with `deckPositions` folded into the hash. All five "at the
+  start" counters real: sea 16/25, river 9/25, road 12/25, street 10/25,
+  **deck 10/25**. Unexplained heap trend +0.96 MB/min against a 6 MB/min limit.
+- **`npm run shots`**: all 37 views captured, no console errors, no failed
+  requests.
+- **`npm run shots:check`: RED, and unresolved. See the section after next.**
+- **`npm run verify:subpath`**: green; the worker now carries `road-mesh.ts` and
+  is still fetched from inside the mount path.
+
+### Budgets: one of the four re-derived, three deliberately left alone
+
+| Budget | Limit | 4b measured | 5 measured | headroom |
+| ------ | ----- | ----------- | ---------- | -------- |
+| live triangles | 2,100,000 | 1,144,318 | 1,368,596 | 1.53x |
+| live vertices | 1,040,000 | 567,869 | 673,805 | 1.54x |
+| draw calls | **500 -> 680** | 290 | 398 | 1.71x |
+| chunk payload bytes | 100 MB | 84.8 MB | 86.8 MB | 1.15x |
+
+**Draw calls moved for two reasons and only one of them is this phase's
+content.** Decks contributed **+34** at the peak frame -- the report's `draws
+without it` line reads 364, which is the figure that isolates them. The other
++72 is the flight: it is not the START that moved, it is that the flight now
+actually begins there rather than up to 1.3 km downrange, so every earlier number
+in that column was measured over a route nobody chose. 680 is 1.71x the new peak,
+the same factor Phase 2b and 3a used, and still far under RULE 5's ceiling of
+1200.
+
+**The other three were not breached and are not raised.** They still hold about
+1.5x, and a limit with less slack catches a regression sooner. The payload
+budget's structural ceiling does rise: a deck adds up to 28 kB to a lod-0 node
+and 70 kB to a root one, so the most expensive possible node goes from 129,744 to
+about 158,000 bytes and the ceiling from ~108 MB to ~131 MB. 100 MB is still
+below it and still fireable.
+
+Per-node deck cost, measured over a 13x13 lod-0 square around a village: 18 of
+169 nodes carry a deck at all, averaging 477 triangles and 12.7 kB, peaking at
+1,068 triangles and 28.4 kB. A root-level node carrying a whole region's roads is
+2,508 triangles and 1,104 vertices.
+
+### Screenshots: 27 of 34 changed, 7 did not, and 3 were added
+
+*(Read the section after this one before trusting `shots:check`: the eight
+wireframe views that contain a deck are not currently reproducible.)*
+
+Captured and diffed on the same Windows machine as the committed set, which is
+the only way to tell a real change from the platform difference Phase 4b found.
+
+**The 7 that did not change** are the ones with no road or village in frame:
+`chunks-aerial`, `chunks-aerial-seed-beta`, `chunks-wireframe`,
+`lod-ground-horizon`, `river-region-seam`, `terrain-mountain-profile`,
+`water-shoreline-shallow`. That they are stable is the useful half of the result:
+a deck appears where a road is and nowhere else.
+
+**The 3 new ones**, and what each is for:
+
+- **`road-bridge`** -- the view that says the phase happened. A road crossing a
+  tidal river, deck spanning open water bank to bank, carriageway continuing both
+  sides. If `DECK_BEAM` is ever lost this frame fills in solid, which is the dam.
+- **`road-bridge-wireframe`** -- the structural claim in one image: the terrain
+  lattice stops at the shoreline, the water lattice covers the channel, and the
+  deck crosses both as its own ladder of triangles belonging to neither. Also
+  where a deck emitted twice, or a run that failed to stop at a chunk boundary,
+  would show as doubled or missing rungs.
+- **`deck-lod-aerial`** -- straight down from 1.6 km: two villages, the road
+  joining them, the drainage network and the coast. Every node on screen is lod
+  3-5, where Phase 4a's per-vertex surfacing has washed out to a stain and the
+  deck has not. That is the whole argument for per-chunk geometry, visible.
+
+**Three existing views had their `expect` text rewritten rather than their
+params.** `road-river-ford` was captured in 4a specifically to show the honest gap
+where a road stopped at a riverbank; the gap is gone, and the entry now says so.
+`road-wireframe-bench` and `settlement-streets-wireframe` both ended with "if a
+later phase gives roads/streets their own geometry, this is the view that will
+show it" -- and it did. Editing the params of a canonical view destroys the only
+history the harness has; editing what it claims does not.
+
+### `shots:check` IS RED ON THE WIREFRAME VIEWS, AND PHASE 5 DID NOT FIX IT
+
+*(Closed in Phase 6a. Left exactly as written, because the two suspects below are
+the record of what was believed at the time and the first one turned out to be
+right for a reason nobody guessed -- the depth tie is real, but what decided it
+was GPU-process state surviving a page, which is why the isolation experiment
+recommended below returns "stable" and misleads. Read Phase 6a for the answer.)*
+
+**This is the one thing this phase is shipping broken, and it is written down
+here rather than smoothed over, because a flaky screenshot harness is precisely
+what this project cannot afford to wave away.**
+
+The state, measured over three separate runs against freshly captured baselines:
+
+| views | result |
+| ----- | ------ |
+| 29 shaded views | **byte-identical on every run** |
+| `chunks-wireframe` -- the one wireframe view with no deck in frame | **byte-identical on every run** |
+| the other 8 wireframe views, all of which contain a deck | **a DIFFERENT hash on every run** |
+
+So the instability is real, it is confined to wireframe, and it tracks the
+presence of a deck exactly. The committed baselines are one capture of those
+eight; `npm run shots:check` will report `8 changed` until this is fixed, and the
+29 shaded views plus `chunks-wireframe` are still doing their job in the
+meantime.
+
+**What was tried and did not work.** The obvious suspect was Phase 1's ordering
+flake in its Phase 5 form: a deck shared its node's `renderOrder` with the
+terrain, so the tie between one node's deck and the NEXT node's terrain would
+fall back to `material.id`, i.e. to whichever worker finished first. Decks now
+draw in a band strictly above every terrain mesh in the world
+(`DECK_RENDER_ORDER_BASE`). The change is kept, because "a deck draws after the
+ground" is a sane invariant either way -- but it did NOT fix the flake, which
+also rules the mechanism out: Three's opaque sort is fully determined once
+`renderOrder` differs, before `material.id` is ever consulted.
+
+**The two remaining suspects, for whoever picks this up.**
+
+1. **WebGL has no `POLYGON_OFFSET_LINE`.** `polygonOffset` is what keeps the deck
+   in front of coplanar ground, and it applies to filled polygons only. In
+   wireframe the deck's lines and the terrain's are separated by `DECK_LIFT`
+   (5 cm), which is well inside one depth-buffer quantum at the 1-4 km these
+   views mostly contain -- about 2 m at 4 km with `near` 0.5 and `far` 8000. So
+   the two sets of lines are at an exact depth tie over most of the frame, and
+   something per-run is deciding it. This is the leading candidate and it also
+   explains why only wireframe is affected.
+2. **The deck's interior end caps are coincident duplicate geometry.** Every
+   clipped run gets a cap at each end, so two consecutive runs put two
+   coincident quads -- eight coincident triangles with both windings -- at the
+   same joint. In shaded rendering they are invisible; in wireframe they are
+   eight coincident line sets. Draw order within one mesh is index order and
+   therefore deterministic, so this should not be it, but it is worth removing
+   regardless (see the known gaps) and would take the question away.
+
+**The isolation experiment to run first**, which was started and not finished:
+capture one wireframe view several times **inside a single browser process** and
+compare hashes. If they differ within one process, the randomness is per-capture
+and the depth tie is confirmed; if they are stable within a process and differ
+between processes, it is something about process start-up and the answer is
+somewhere else entirely.
+
+### Judgement calls worth knowing about
+
+1. **Streets get decks, through the same extruder as roads.** This was the open
+   decision 4b handed over, and one extruder with two sources is the same move
+   `GradeBlend` made for two tiers of grading and `cell-heap.ts` made for two
+   searches. A village whose road had a carriageway and whose lanes did not would
+   read as a road passing an empty clearing. They differ only in palette and
+   half-width, both of which come from their own records.
+2. **The deck reads `gradeTarget`, not `nodeY`.** Discussed above; the version
+   that read the road's own profile floated over every village. The bonus is that
+   the deck now interpolates no altitude of its own.
+3. **The cross-section is horizontal.** Sampling the ground at each edge and
+   tilting the deck to match would make a road across a hillside a ramp and would
+   fold the two triangles of every quad against each other. A roadbed is a bench;
+   the apron is what covers the resulting cut on one side and fill on the other,
+   which is what an embankment is.
+4. **`polygonOffset` is the z-fight fix and a world-space lift is not.** The deck
+   is coplanar with ground graded to the same target, which is the textbook decal
+   problem. With `near` 0.5 and `far` 8000 the depth buffer resolves about two
+   metres at 4 km, so any lift big enough to win out there would visibly hover in
+   the near field. `DECK_LIFT` is 5 cm and does a different job -- making the deck
+   unambiguously the upper surface for Phase 8 to stand on.
+5. **The apron carries both windings with a single-sided material**, for the
+   reason `SKIRT_TRIANGLE_COUNT` gives: a double-sided material flips the normal
+   on back faces, and the underside of a bridge would shade near-black.
+6. **Deck normals come from the deck**, in a fix-up pass once the neighbouring
+   stations exist, rather than from the road's profile slope. The two differ
+   wherever the deck follows the ground rather than the target, which is most of
+   its length.
+7. **Station spacing is the node's own vertex spacing** -- 2 m at lod 0, 128 m at
+   the root. Anything finer would be geometry describing detail the terrain under
+   it does not have; anything coarser would stop following it.
+8. **`DECK_MAX_STATIONS` is a safety valve, not a level of detail.** It has never
+   fired: the busiest measured node is under 400 stations against a cap of 4,096.
+   It exists because the alternative is an unbounded allocation inside the
+   generator. Truncation would be deterministic -- regions, paths, sectors,
+   streets, all in fixed order -- so a node that hit it would still regenerate
+   byte-identically.
+
+### Known gaps, deliberately left
+
+- **A bridge has no piers, no parapet and no abutment.** It is a deck with a
+  0.8 m beam and daylight under it. That is enough to read as a bridge at the
+  distances this project renders at and it is honestly not a structure; anything
+  more belongs with Phase 6's buildings, which is where placed geometry starts.
+- **A deck routinely stands clear of coarse ground, and that is correct but
+  visible.** At lod 3 and beyond no vertex lies inside the roadbed, so the deck
+  holds the target while the lattice under it smooths across. A road on gentle
+  ground therefore reads as very slightly embanked from a distance. The
+  alternative is the road disappearing into the hill, which is worse; the real fix
+  is a finer lattice under a road and that is not on the roadmap.
+- **The settlement pad has no deck.** A village is still a graded disc with lanes
+  laid on it and nothing else -- Phase 6's lots and buildings are what will make
+  it read as built. `settlement-footprint` remains the sparse "before" picture.
+- **The ring street's closing node gets no miter.** The ring repeats its first
+  node at the end rather than wrapping, which is what makes every street an open
+  polyline downstream, so its two ends are polyline ENDS and the averaged
+  cross-direction that rounds off every other corner does not apply there. The
+  result is a few centimetres of notch at one node of every village ring.
+- **A deck overhangs its node by up to `ROAD_HALF_WIDTH_MAX`**, where `groundAt`
+  clamps to the padded grid's edge. That is at most 6 m of carriageway fitted to
+  the nearest ground the node knows about rather than to the neighbour's. It has
+  not been observed as an artefact and it is the reason the apron exists.
+- **End caps are emitted at every clipped run, including interior joints**, where
+  they are coincident with the next run's cap and invisible in shaded rendering.
+  About 16 triangles per segment of waste -- and a suspect in the wireframe
+  instability above, so removing them is worth doing for two reasons.
+- **`shots:check` is red on the eight wireframe views that contain a deck.**
+  Unresolved; see its own section above for what is known, what was ruled out and
+  what to try first. Everything else in the harness is byte-identical.
+  *(Closed in Phase 6a: `polygonOffset` left enabled in wireframe mode.)*
+- **`polygonOffset` has not been verified on a real GPU.** Every screenshot in
+  this project is SwiftShader; the depth-fighting behaviour it fixes is exactly
+  the kind that differs between rasterisers.
+- **Popping at a level switch is still quantified but unobserved**, unchanged
+  since 2b. **Lighting is still the Phase 0 placeholder.** The bundle is one
+  615 kB chunk plus a 33.7 kB worker (up from 28.6 kB: the worker now carries
+  `road-mesh.ts`). Vite still warns.
+- **The GPU verification is still not a committed command.** Phase 4a's note that
+  landing it as `npm run perf:gpu` is worth doing stands, and 5 did not do it
+  either -- so the two frame budgets have not been re-measured since 4a, and this
+  is the first phase since then that could plausibly move them.
+
+### For Phase 6
+
+- **The deck is the model for anything placed on the ground.** Per-chunk
+  geometry, clipped to the node square parametrically, fitted to the node's own
+  `groundAt`, zero-length arrays where there is nothing. A building is not a
+  ribbon, but every one of those four properties is the reason a deck survives
+  the streamer, the LRU, the quadtree and the round-trip hash.
+- **`gradeTarget` exists now** and is the right thing to seat a building on: it
+  is where the ground WANTS to be, before the caps and the river yield, which is
+  what a floor slab should sit at.
+- **Draw calls are the budget to watch, and they are at 398 of 680.** A deck is
+  one extra mesh per node carrying a road; buildings will be far denser than
+  roads, so per-node batching -- one mesh for every building in a node -- is
+  not an optimisation to defer.
+- **`SectorStreets.streetStart` is still CSR and is still the way in.** A street
+  is an open polyline including the ring, `streetsAt` hands it over without a
+  region around it, and `road-mesh.ts` now demonstrates walking one and clipping
+  it to a node.
+- **Both memo limits are sized for a root node's working set** -- 16 regions,
+  192 sectors -- and a phase adding a third per-vertex tier query should re-check
+  them the way this one did. The failure mode is not subtle once you look for it,
+  and it is completely invisible if you do not.
+- **The soak's "at the start" numbers can be trusted now.** The flight is held at
+  `?pos=` until the baseline is read, so a phase that wants a new signal in the
+  round-tripped square can tune for it and get what it tuned for.
+- **`shots:check` is much faster than it was**, for the memo reasons above rather
+  than for anything Phase 5 removed. It is still the slowest command in the
+  project.
+- **FIX THE WIREFRAME INSTABILITY BEFORE ADDING GEOMETRY.** Phase 6 adds
+  buildings, which will sit on the ground the same way a deck does and will land
+  in the same wireframe views. Debugging one flake is much cheaper than
+  debugging two, and the harness cannot judge Phase 6 until this is closed. The
+  section above has the evidence, the ruled-out cause and the next experiment.
+
+## Phase 6a -- The wireframe instability, closed (done)
+
+Phase 5's last handoff note was **"FIX THE WIREFRAME INSTABILITY BEFORE ADDING
+GEOMETRY"**, so this is that, and nothing else: no new content, no new geometry,
+no change to any generated byte. It is written up as its own phase rather than as
+a paragraph at the top of Phase 6 because it is independently verifiable, and
+because what it cost is worth recording -- **Phase 5 shipped a red harness and
+listed the wrong suspect as leading.**
+
+The bug in one line: **`polygonOffset` is a fill-mode concept, and wireframe mode
+was leaving it enabled.**
+
+### The fix
+
+`applyWireframe` in `src/render/renderer.ts` now switches every render state that
+means something in only one of the two draw modes, rather than just the
+`wireframe` flag:
+
+```ts
+function setPolygonOffset(material: THREE.Material, wireframe: boolean): void {
+  const requested = material.userData[OFFSET_REQUESTED] as boolean | undefined;
+  if (requested === undefined) {
+    if (!material.polygonOffset) return;
+    material.userData[OFFSET_REQUESTED] = true;
+    material.polygonOffset = !wireframe;
+    return;
+  }
+  material.polygonOffset = requested && !wireframe;
+}
+```
+
+`glPolygonOffset` is gated on `GL_POLYGON_OFFSET_FILL`. Desktop GL has a
+companion `GL_POLYGON_OFFSET_LINE`; **WebGL has no such enum at all**, so what a
+line primitive's depth is while the state is enabled anyway is not specified by
+anything. SwiftShader's answer turned out to depend on state that outlives a page
+inside the GPU process -- which is why the flake had the one shape nobody was
+looking for. See the measurement section: a wireframe view captured **first** in a
+browser process was byte-stable, and the same view captured after **any** shaded
+view came back different every time.
+
+Three details of the fix are deliberate:
+
+1. **The requested value is remembered on the material, not recomputed.** The
+   deck asks for an offset in `chunk-mesh.ts` and the terrain does not, so
+   "restore it" has to mean "restore what this material asked for" -- and the
+   first call at start-up is normally `false`, since `?wireframe=1` is the rare
+   path. Recording the wireframe value as the requested one would hand the
+   terrain an offset the moment wireframe went off, i.e. give the ground an offset
+   against the deck that is offset against it.
+2. **The magnitudes are never touched.** `polygonOffsetFactor` and
+   `polygonOffsetUnits` are what the deck needs while it is filled; only the
+   enable bit moves.
+3. **It lives in `renderer.ts`.** A material declares what it WANTS; the graphics
+   boundary decides what is legal to ask for in the mode being drawn. Putting it
+   in `chunk-mesh.ts` would mean every future placed mesh -- Phase 6's buildings
+   first -- has to remember to do the same thing, which is the shape of bug that
+   comes back.
+
+### How it was found, and what each step ruled out
+
+The value here is in the order, and specifically in the fact that **the first two
+steps came back clean and that was the misleading part.** A flake whose isolation
+experiment says "perfectly stable" is one you can spend a long time not finding.
+
+1. **Capture the worst view repeatedly, alone.** `road-bridge-wireframe`, three
+   times in fresh browser contexts and three times on the same page, with a scene
+   fingerprint alongside each capture: mesh names, `renderOrder`, material ids,
+   geometry hashes, camera matrices. **Every pixel hash identical.** So the scene
+   is deterministic, the geometry is deterministic, and the view is perfectly
+   reproducible -- on its own. This is the experiment Phase 5 asked for, and its
+   answer was "stable", which reads as good news and is the opposite.
+2. **Run it under load**, concurrently with `npm test` saturating the machine.
+   Same hash. Timing, scheduling and rasteriser load are not involved -- which
+   also kills the comfortable theory that a software rasteriser under a heavy main
+   thread is simply racy.
+3. **Capture a SEQUENCE in one process**, the way `shots:check` does. This is the
+   step that produced a reproducer: `cube-wireframe` is byte-stable when captured
+   first, and comes back with a **different hash on every pass** as soon as a
+   shaded view precedes it in the same process. The flake was never per-view or
+   per-capture; it was **per-process history**, and no amount of examining one
+   view in isolation was ever going to show it.
+4. **Look at the differing pixels rather than the hash.** About 0.5% of them, and
+   they trace the deck lines in the FAR field only -- 1 km and beyond, where 5 cm
+   of `DECK_LIFT` is well inside one depth quantum. Deck, wireframe, depth tie,
+   far field: that is `polygonOffset` on lines. Confirming it took one line --
+   `polygonOffset: false` in `createDeckMaterial` -- which turned all eight views
+   stable at once, and is also the version that had to be rejected, below.
+
+**What was ruled out, and one of them was Phase 5's second suspect.** The deck's
+coincident interior end caps are still there, unchanged, and the harness is green,
+so they were never the cause -- draw order within one mesh is index order, exactly
+as Phase 5 reasoned before listing them anyway. `renderOrder` was already ruled
+out in Phase 5 and stays ruled out. Nothing about worker completion order, memo
+eviction or chunk residency is involved: the fingerprints in step 1 were
+identical across runs, including geometry hashes.
+
+**The wrong fix, and how we know it is wrong.** Dropping `polygonOffset` from the
+deck material outright also fixes the flake, and it moved **every shaded view
+too** -- which is the useful half of that experiment, because it is the direct
+measurement that the offset is doing real work in fill mode. That is why the fix
+is mode-switched rather than removed. Raising `DECK_LIFT` until it wins in the far
+field was not attempted for the reason Phase 5 already wrote down: at 4 km the
+depth buffer resolves about 2 m, and a deck lifted 2 m visibly hovers in the near
+field.
+
+### Two diagnostic scripts, promoted rather than deleted
+
+Both were written to chase this and both answer a question `shots:check`
+structurally cannot, so they are committed as commands instead of being thrown
+away with the session that needed them.
+
+- **`npm run shots:repeat -- --repeat=3 [view...]`** compares a view against
+  ITSELF over several passes, in ONE browser process, in order. `shots:check`
+  compares against a baseline, so "this view changed" and "this view is not
+  reproducible" are the same red line -- and committing one capture of an unstable
+  view bakes a coin flip into the repository, which is exactly what Phase 5 did.
+  Capturing the sequence in one process is load-bearing, per step 3 above: a
+  checker that opened a fresh browser per view would have reported green.
+- **`npm run shots:diff -- a.png b.png [mask.png]`** reports how many pixels
+  differ, by how much, the bounding box they occupy, and writes a greyscale mask.
+  Step 4 is what it exists for. Dependency-free: Chromium screenshots are 8-bit
+  non-interlaced PNGs, so a decoder is a page of code, and adding an image library
+  to a project whose only runtime dependency is Three.js is the worse trade.
+
+`shots/.repeat/` is gitignored, and `shots:repeat` deletes it on success so the
+only captures left behind are the ones that disagreed.
+
+### Verified
+
+- **`npm run shots:repeat -- --repeat=3 cube-default cube-wireframe`, run both
+  with and without the fix.** This is the anti-vacuity half and it is the most
+  important number in the phase:
+
+| run | `cube-default` (shaded) | `cube-wireframe` |
+| --- | ----------------------- | ---------------- |
+| fix disabled | STABLE `ed01177232b5` | **UNSTABLE: 3 distinct hashes over 3 passes** (`b287aedd5401`, `f8b1d96d5c59`, `e0fe2f45cb61`) |
+| fix in place | STABLE `ed01177232b5` | STABLE `1f80ffd7f0de` |
+
+  The reproducer still fails without the fix, so it is testing something. And the
+  shaded view's hash is **the same twelve hex digits in both runs**, which is an
+  independent confirmation that filled rendering is untouched.
+- **`npm run shots`, then `git status`: exactly 8 files modified**, and they are
+  the 8 wireframe views containing a deck. The other 29 came back
+  **byte-identical to the baselines committed in Phase 5**, which is the same
+  claim from the other direction. (Those 29 are 28 shaded views plus
+  `chunks-wireframe`. Phase 5's write-up calls them "29 shaded views" and then
+  lists `chunks-wireframe` separately, which counts it twice and adds up to 38 of
+  37 views; the harness line `8 changed, 0 missing, 29 identical` is the correct
+  split.)
+- **`npm run shots:check` twice in a row: `all 37 canonical views are
+  byte-identical to their baselines`, both times.** Before the fix, the same
+  command over two consecutive runs read `8 changed, 0 missing, 29 identical`
+  with a different set of hashes each time.
+- **`npm test`: 446 tests in 21 files, all green**, including 5 new ones in
+  `src/render/renderer.test.ts`. `applyWireframe` is exported for them, because
+  constructing a `Renderer` needs a real canvas and a WebGL context, and this rule
+  needs a unit test more than most of that file: its failure mode is invisible in
+  the near field and shows up as an unreproducible screenshot rather than as a
+  wrong picture. Both halves are asserted -- the offset must be GONE in wireframe
+  (or the flake is back) and it must COME BACK when wireframe goes off (or every
+  shaded view changes) -- plus the two traps in the fix: a material that never
+  asked for an offset never acquires one, and starting in filled mode does not
+  record "off" as what the material wanted.
+- **`npx tsc --noEmit`: clean.**
+- **`npm run soak`: `soak OK` over the full 300 s**, with the numbers in the next
+  section. It is included for the rule rather than because this phase could move
+  it: the soak flies in fill mode and never touches the code path that changed.
+
+### Budgets: unchanged, and unchanged for a stated reason
+
+No budget moves, and no budget could: this phase changes one enable bit on one
+material while wireframe is on, and **every canonical view is captured in fill
+mode except the nine wireframe ones, which are not what the budgets measure.**
+The soak was re-run anyway, because "checked every phase" is the rule and a
+re-derived number is the only way to notice something unexpected.
+
+| Budget | Limit | 5 measured | 6a measured | headroom |
+| ------ | ----- | ---------- | ----------- | -------- |
+| live triangles | 2,100,000 | 1,368,596 | 1,201,194 | 1.75x |
+| live vertices | 1,040,000 | 673,805 | 592,964 | 1.75x |
+| draw calls | 680 | 398 | 357 | 1.90x |
+| chunk payload bytes | 100 MB | 86.8 MB | 87.6 MB | 1.14x |
+
+Unexplained heap trend **+1.30 MB/min against a limit of 6** (Phase 5: +0.96).
+Round trip: 25/25 chunks re-resident, **25/25 geometry hashes identical**. All
+five "at the start" counters real and unchanged: sea 16/25, river 9/25, road
+12/25, street 10/25, deck 10/25. `soak OK`.
+
+**Every geometry number came in LOWER than Phase 5's, and that is not an
+improvement -- it is the flight not getting as far.** The autopilot is held
+whenever the world is not ready, so on a slower machine state it lags: this run
+returned to **x = -6,063** against a start of x = -6,749, where Phase 5's run
+returned to exactly x = -6,749. So the camera covered about 686 m less of the
+return leg and the peak sample landed somewhere marginally cheaper. The route is
+a subset of Phase 5's rather than a different one, which is why the numbers are
+comparable at all -- and it is worth writing down that **`draw calls 357` is not
+this phase reducing draw calls.** The three claims that do not depend on how far
+the flight got are the ones that matter here, and all three are equal to Phase
+5's: 25/25 re-resident, 25/25 hashes identical, five real counters.
+
+The frame budget is still not measured on real hardware. This run's worst frame
+is 1,766 ms and 2,737 of 3,254 frames are over 20 ms, which is SwiftShader and
+has been since Phase 0; `npm run perf:gpu` is still not a command.
+
+### Known gaps, deliberately left
+
+- **In wireframe, a distant deck's lines are now hidden by the terrain's rather
+  than drawn over them.** This is the honest resolution of a genuine depth tie:
+  coplanar lines resolve by draw order, and a deck draws after the ground it sits
+  on, but `DECK_LIFT` (5 cm) is inside one depth quantum past about 1 km, so the
+  ground wins out there. Near the camera the deck is in front, which is the case
+  an author is actually inspecting. It is stable, which is the only property the
+  harness needs.
+- **The deck's interior end caps are still coincident duplicate geometry**, about
+  16 wasted triangles per segment. Phase 5 listed them as an instability suspect
+  and they were not it, so the reason to remove them is now purely the waste --
+  which makes it a Phase 6 or later cleanup rather than a correctness fix.
+- **`polygonOffset` is still unverified on a real GPU**, unchanged from Phase 5,
+  and this phase adds a second unverified claim of the same kind: that dropping
+  the offset in wireframe is stable on hardware too. Both are SwiftShader
+  observations. The GPU verification is still not a committed command
+  (`npm run perf:gpu`, wanted since Phase 4a).
+- **The eight baselines were re-captured, and only one of them has been read
+  closely.** `road-bridge-wireframe` was checked against the claim Phase 5 made
+  for it and still holds it: the terrain lattice stops at the shoreline, the water
+  lattice covers the channel, and the deck crosses both as its own ladder of
+  triangles belonging to neither -- which is the structural picture the view exists
+  for, and it is the one place a deck is UNAMBIGUOUSLY visible in wireframe,
+  because a bridge is not coplanar with anything. The other seven were only
+  verified to be stable. What is lost is far-field deck lines where the deck lies
+  flush, which is exactly where they were previously fighting; if a later phase
+  wants those visible, it is a `depthTest`/`renderOrder` decision on the deck
+  material and not a return to `polygonOffset`.
+
+### For Phase 6
+
+- **The harness is trustworthy again: 37 of 37, twice.** Everything Phase 5's
+  handoff said about Phase 6 stands, with the blocker removed.
+- **`shots:repeat` is the first thing to run on a new canonical view**, before
+  committing its baseline. That is the check that would have caught Phase 5's
+  problem at the moment it was introduced, and it costs one command.
+- **Buildings will land in the same wireframe views, and the rule that keeps them
+  reproducible is in `renderer.ts`, not in the mesh code.** A new material may ask
+  for `polygonOffset` freely; `applyWireframe` will do the right thing with it.
+  What a new material must NOT do is set graphics state that only applies in one
+  draw mode anywhere else, because that path has no owner.
+- **The wireframe views are the ones that will judge Phase 6's geometry**, and
+  they are now sensitive: `settlement-streets-wireframe` and
+  `road-wireframe-bench` both went from "different every run" to "one hash", so a
+  building appearing in them is a real signal rather than noise.

@@ -69,6 +69,7 @@ import {
   type RoadRivers,
   type RoadTerrain,
 } from './roads';
+import { sectorLotField, type LotGround, type SectorLotField } from './lots';
 import { sectorStreetField, type SectorStreetField } from './streets';
 
 // ---------------------------------------------------------------------------
@@ -486,11 +487,28 @@ export function worldRegionField(worldSeed: number): RegionField {
  * Phase 4b, and the first time `CoarseData` holds two entries at once. A sector
  * record is not one sector's data any more than the region record is one
  * region's: it is a whole-world accessor that memoises per sector behind
- * `streets.ts`, exactly as `RegionRoadField` does per region. That is what lets
- * a single object serve a chunk whose padded sample grid straddles a sector
- * boundary, and a coarse quadtree node that spans sixteen of them.
+ * `streets.ts` and `lots.ts`, exactly as `RegionRoadField` does per region. That
+ * is what lets a single object serve a chunk whose padded sample grid straddles
+ * a sector boundary, and a coarse quadtree node that spans sixteen of them.
+ *
+ * Phase 6 made it a record of TWO fields rather than an alias for the street
+ * one. `RegionField` has held rivers and roads together since Phase 4a for the
+ * same reason: `CoarseData` has one slot per tier NAME, so every generator at a
+ * tier travels in one object however many of them there are.
+ *
+ * THE TWO ARE NOT SYMMETRIC, AND THE ORDER THEY ARE BUILT IN IS THE REASON.
+ * Streets GRADE the ground, so they are part of the composition below and every
+ * height in the world depends on them. Lots READ the finished ground to decide
+ * where a building can stand, so they depend on the composition. Building the
+ * lot field from an already-built street field is what keeps that one-way; a
+ * combined generator that did both at once would have to evaluate the ground
+ * while still deciding what the ground is.
  */
-export type SectorField = SectorStreetField;
+export interface SectorField {
+  readonly worldSeed: number;
+  readonly streets: SectorStreetField;
+  readonly lots: SectorLotField;
+}
 
 /**
  * The Region- and Sector-tier records this module's own `sampleHeight` grades
@@ -509,9 +527,51 @@ function mainFields(worldSeed: number): { region: RegionField; sectors: SectorFi
   if (mainRegion === undefined || mainSectors === undefined || mainSeed !== worldSeed) {
     mainSeed = worldSeed;
     mainRegion = worldRegionField(worldSeed);
-    mainSectors = sectorStreetField(mainRegion, worldSeed);
+    mainSectors = worldSectorField(mainRegion, worldSeed);
   }
   return { region: mainRegion, sectors: mainSectors };
+}
+
+/**
+ * The ground, as `lots.ts` is allowed to see it: the finished surface, and the
+ * altitude everything grading a point agreed on before the caps and the river
+ * yield were applied.
+ *
+ * INJECTED RATHER THAN IMPORTED, and this is the reason the injection exists at
+ * all. `lots.ts` cannot import this module -- this one imports it -- and, far
+ * more importantly, a lot decided against a second implementation of "where is
+ * the ground" is a building sunk a metre into the grass. Both methods here are
+ * the same two functions every other caller uses.
+ *
+ * Its own scratch pair, not `mainBlend`: a lot query can run inside a worker's
+ * chunk generation, where `sampleHeight` may be on the stack, and two callers
+ * sharing one `GradeBlend` is the one way to make this composition non-pure.
+ */
+function lotGround(region: RegionField, streets: SectorStreetField, worldSeed: number): LotGround {
+  const blend = new GradeBlend();
+  const out = new Float64Array(GRADE_OUT_LENGTH);
+  return {
+    height: (x, z) => composeHeight(region, streets, x, z, worldSeed, blend, out),
+    target: (x, z) => gradeTarget(region, streets, x, z, blend),
+  };
+}
+
+/**
+ * The Sector-tier record for this world: street plans, then the lots that front
+ * onto them.
+ *
+ * The lot field is handed the SAME street field the grading uses, so the ground
+ * a lot was accepted on and the ground a chunk meshes are the same arithmetic
+ * through the same memo, rather than two agreeing implementations.
+ */
+export function worldSectorField(region: RegionField, worldSeed: number): SectorField {
+  const seed = worldSeed >>> 0;
+  const streets = sectorStreetField(region, seed);
+  return {
+    worldSeed: seed,
+    streets,
+    lots: sectorLotField(region, streets, lotGround(region, streets, seed), seed),
+  };
 }
 
 /**
@@ -529,7 +589,7 @@ function mainFields(worldSeed: number): { region: RegionField; sectors: SectorFi
  */
 export function gradeSurface(
   region: RegionField,
-  sectors: SectorField,
+  streets: SectorStreetField,
   x: number,
   z: number,
   carved: number,
@@ -539,8 +599,68 @@ export function gradeSurface(
 ): void {
   blend.reset();
   region.roads.accumulate(x, z, blend);
-  sectors.accumulate(x, z, blend);
+  streets.accumulate(x, z, blend);
   blend.resolve(carved, riverDrop, out);
+}
+
+/**
+ * The whole stack at one point: terrain, the river carved into it, and the
+ * grading blended over that.
+ *
+ * `sampleHeight` is this bound to the main thread's own records, and the lot
+ * generator's `LotGround.height` is this bound to a worker's. It exists as a
+ * named function precisely so that those two cannot drift: a building is
+ * accepted at a floor altitude decided here and drawn against ground meshed
+ * from the same arithmetic, and the failure mode of two copies is a house half
+ * a metre under the grass.
+ *
+ * `chunk-gen.ts` deliberately does NOT call it. It needs the carve depth and the
+ * surfacing coverage per vertex for its statistics and its palette, so it spells
+ * the three steps out and shares the part that actually composes -- which is
+ * `gradeSurface`, above, and which is where a divergence would matter.
+ */
+export function composeHeight(
+  region: RegionField,
+  streets: SectorStreetField,
+  x: number,
+  z: number,
+  worldSeed: number,
+  blend: GradeBlend,
+  out: Float64Array,
+): number {
+  const base = baseHeight(x, z, worldSeed);
+  const drop = riverDrop(WORLD_TERRAIN, worldSeed, x, z, base);
+  const carved = base - drop;
+  gradeSurface(region, streets, x, z, carved, drop, blend, out);
+  return carved + (out[GRADE_LIFT] as number);
+}
+
+/**
+ * The blended TARGET altitude at a point: the same accumulation `gradeSurface`
+ * performs, stopped one step short of resolving it.
+ *
+ * Phase 5's deck is placed AT this altitude rather than moved toward it, so it
+ * has to be the identical composition -- both tiers, one weighted average. A
+ * deck that accumulated only the Region tier would float above the ground at
+ * every village edge, and one that used a road's own profile instead of the
+ * average would do the same. Sharing this function is what makes "the deck lies
+ * flush wherever the grading succeeded" true by construction rather than by
+ * tuning.
+ *
+ * `-Infinity` where nothing grades the point, so `max(ground, target)` needs no
+ * special case. See `GradeBlend.target`.
+ */
+export function gradeTarget(
+  region: RegionField,
+  streets: SectorStreetField,
+  x: number,
+  z: number,
+  blend: GradeBlend,
+): number {
+  blend.reset();
+  region.roads.accumulate(x, z, blend);
+  streets.accumulate(x, z, blend);
+  return blend.target;
 }
 
 /** One scratch pair for the main thread's own `sampleHeight`. Never re-entered. */
@@ -575,10 +695,6 @@ const mainOut = new Float64Array(GRADE_OUT_LENGTH);
  */
 export function sampleHeight(x: number, z: number, worldSeed: number): number {
   const seed = worldSeed >>> 0;
-  const base = baseHeight(x, z, seed);
-  const drop = riverDrop(WORLD_TERRAIN, seed, x, z, base);
-  const carved = base - drop;
   const fields = mainFields(seed);
-  gradeSurface(fields.region, fields.sectors, x, z, carved, drop, mainBlend, mainOut);
-  return carved + (mainOut[GRADE_LIFT] as number);
+  return composeHeight(fields.region, fields.sectors.streets, x, z, seed, mainBlend, mainOut);
 }

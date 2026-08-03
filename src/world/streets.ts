@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Streets inside a settlement, at the SECTOR tier.
  *
  * Phase 4b, and the first use of the middle tier. `Sector` has been declared in
@@ -229,8 +229,30 @@ export const STREET_REACH = Math.ceil(
   SETTLEMENT_JITTER + STREET_MAX_EXTENT - SECTOR_SIZE / 2,
 );
 
-/** Sector records held at once, per JS context. */
-export const STREET_CACHE_LIMIT = 64;
+/**
+ * Sector records held at once, per JS context.
+ *
+ * RAISED FROM 64 TO 192 IN PHASE 5, AND PHASE 4b ASKED FOR EXACTLY THIS
+ * MEASUREMENT. 64 was chosen because a query reads up to four sectors and a
+ * coarse quadtree node can span a 4x4 block of them -- which is true of a
+ * VERTEX and badly wrong for a NODE. A node at the root level covers 4,096 m,
+ * and its padded sample grid plus `STREET_REACH` spans 11x11 = 121 sectors. One
+ * short of the working set is bad; a third of it is catastrophic, because every
+ * row of vertices evicts the plans the next row wants and each one is rebuilt
+ * from scratch.
+ *
+ * It went unnoticed until now because nothing measured it. Phase 5 did, on one
+ * canonical screenshot: 96 seconds to reach `__worldReady` against a 120 second
+ * harness timeout, and 15 seconds with this number raised. The same view had
+ * been quietly costing most of a `shots` run since Phase 4b.
+ *
+ * 192 covers the 121 a root node needs with room for the deck builder's own
+ * lookups. The cost is a longer linear scan, which is the trade Phase 4b flagged
+ * -- but move-to-front keeps the handful of sectors a fine node actually uses at
+ * the front of the array, so the scan is short exactly where the vertex count is
+ * high, and the entries are cheap: an empty sector is three zero-length arrays.
+ */
+export const STREET_CACHE_LIMIT = 192;
 
 /** Salts, so two uses of a hash on the same cell cannot correlate. */
 const RING_SALT = 0x53_74_52_67;

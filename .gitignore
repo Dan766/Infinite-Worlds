@@ -7,3 +7,5 @@ dist/
 
 # Output of `npm run shots:check`; the committed baselines in shots/*.png stay.
 shots/.check/
+# Output of `npm run shots:repeat`, kept only when a view came back unstable.
+shots/.repeat/

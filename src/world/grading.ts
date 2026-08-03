@@ -164,6 +164,30 @@ export class GradeBlend {
   }
 
   /**
+   * The altitude everything grading this point agrees on, before any clamp and
+   * before the river yield. `-Infinity` when nothing has been added.
+   *
+   * PHASE 5 NEEDS THIS AND NOTHING BEFORE IT DID, because a deck is the first
+   * thing that has to be placed at the target rather than moved toward it. The
+   * ground is `target` filtered through the strength, the cut and fill caps and
+   * the river yield -- so wherever any of those bites, the ground is NOT where
+   * the carriageway belongs:
+   *
+   *  - in a channel the yield is total, the ground stays at the river bed, and
+   *    the deck standing at the target IS the bridge;
+   *  - at a village edge the ground is the weighted average of the pad and the
+   *    road, and a deck built from the ROAD's own profile would float a metre or
+   *    two above it. Reading the same average is what makes it lie flush.
+   *
+   * `-Infinity` rather than 0 or NaN so a caller can write
+   * `max(ground, target)` and have "nothing grades here" mean "the ground wins"
+   * without a special case.
+   */
+  get target(): number {
+    return this.weightSum > 0 ? this.targetSum / this.weightSum : -Infinity;
+  }
+
+  /**
    * Write `[lift, surface, streetSurface]` into `out`.
    *
    * `carved` is the ground AFTER rivers and `riverDrop` is how much the river
