@@ -15,6 +15,7 @@ import { hashCombine } from '../core/hash';
 import { BUILDING_LEVEL_LOD } from './building-mesh';
 import { skirtDepthOf, WATER_COLOR_COMPONENTS } from './chunk-gen';
 import { SEA_LEVEL } from './height-field';
+import { PROP_SEAT_LOD } from './prop-mesh';
 import { chunkDataBytes, chunkOrigin, chunkSizeAt, type ChunkCoord, type ChunkData } from './contracts';
 
 /**
@@ -81,6 +82,17 @@ const DECK_RENDER_ORDER_BASE = 2 ** 48;
  * integers.
  */
 const BUILDING_RENDER_ORDER_BASE = 2 ** 49;
+
+/**
+ * Phase 7a: props draw after every terrain mesh, every deck, AND every building.
+ *
+ * A tree is not coplanar with the ground (its stump is buried), but its canopy
+ * can sit at nearly the same depth as a rooftop in a shallow aerial view, and
+ * wireframe screenshots of forests would otherwise flake on material-id order
+ * the way buildings did. A fourth band keeps vegetation always after houses.
+ * 2^50 + 2^46 is still exactly representable.
+ */
+const PROP_RENDER_ORDER_BASE = 2 ** 50;
 
 /**
  * Phase 2a: a lit material reading per-vertex colour.
@@ -291,6 +303,30 @@ export function resetBuildingDraws(): void {
 
 const countBuildingDraw = (): void => {
   buildingDraws++;
+};
+
+/**
+ * Phase 7a PROP submeshes actually rasterised since the last reset.
+ *
+ * Forest nodes are denser than village nodes, so the residency half of the
+ * anti-vacuity pair is easier to satisfy than it was for buildings -- but a
+ * world full of trees that never enter the frustum would still pass every
+ * payload check. This is the half that says a canopy reached the rasteriser.
+ */
+let propDraws = 0;
+
+/** Prop submeshes drawn since `resetPropDraws`. Read straight after a render. */
+export function propDrawsSinceReset(): number {
+  return propDraws;
+}
+
+/** Call immediately before `renderer.render` to scope the count to one frame. */
+export function resetPropDraws(): void {
+  propDraws = 0;
+}
+
+const countPropDraw = (): void => {
+  propDraws++;
 };
 
 /**
@@ -516,6 +552,38 @@ function createBuildingGeometry(data: ChunkData): THREE.BufferGeometry | null {
   return geometry;
 }
 
+// ---------------------------------------------------------------------------
+// Props
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 7a: the prop material.
+ *
+ * Same deliberate choices as buildings: no polygonOffset (nothing coplanar by
+ * construction), single-sided, vertex colours from the worker.
+ */
+function createPropMaterial(): THREE.MeshLambertMaterial {
+  return new THREE.MeshLambertMaterial({ vertexColors: true });
+}
+
+/**
+ * The prop submesh's geometry, or `null` on a node with no prop centre in it.
+ *
+ * Bounds from the emitted vertices: a prop is owned by the node holding its
+ * centre and may overhang the square the way a building does.
+ */
+function createPropGeometry(data: ChunkData): THREE.BufferGeometry | null {
+  if (data.propIndices.length === 0) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(data.propPositions, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(data.propNormals, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(data.propColors, 3));
+  geometry.setIndex(new THREE.BufferAttribute(data.propIndices, 1));
+  setBoundsFromPositions(geometry, data.propPositions);
+  return geometry;
+}
+
 /** Box and sphere bounds over an xyz position buffer. */
 function setBoundsFromPositions(geometry: THREE.BufferGeometry, p: Float32Array): void {
   let minX = Infinity;
@@ -603,6 +671,11 @@ function hashFloats(seed: number, values: Float32Array): number {
  * comparing the ground against the grading target, so anything that made either
  * order-dependent would move a house without moving a single terrain vertex,
  * and every other term in this hash would be unchanged.
+ *
+ * PHASE 7a FOLDS THE PROPS IN, for the deck's reason again. Vegetation is
+ * separate geometry at densities far above a village ring; leave it out and the
+ * RULE 2 check would keep passing while a forest came back differently, or not
+ * at all.
  */
 export function hashChunkGeometry(data: ChunkData): number {
   let hash = hashPositions(data.positions);
@@ -610,6 +683,7 @@ export function hashChunkGeometry(data: ChunkData): number {
   hash = hashFloats(hash, data.waterColors);
   hash = hashFloats(hash, data.deckPositions);
   hash = hashFloats(hash, data.buildingPositions);
+  hash = hashFloats(hash, data.propPositions);
   return hash >>> 0;
 }
 
@@ -629,6 +703,10 @@ export interface ChunkMesh {
   readonly buildingMesh: THREE.Mesh | null;
   readonly buildingGeometry: THREE.BufferGeometry | null;
   readonly buildingMaterial: THREE.MeshLambertMaterial | null;
+  /** The Phase 7a prop submesh, or null on a node with no prop in it. */
+  readonly propMesh: THREE.Mesh | null;
+  readonly propGeometry: THREE.BufferGeometry | null;
+  readonly propMaterial: THREE.MeshLambertMaterial | null;
   /** Stable per-chunk identity colour, sRGB. Not what the surface is painted with. */
   readonly color: readonly [number, number, number];
   /** Hash of the uploaded terrain and water buffers, for the RULE 2 round trip. */
@@ -660,6 +738,17 @@ export interface ChunkMesh {
   readonly buildingsMeasured: number;
   /** Of those, how many stand level on this node's own ground. See `BUILDING_LEVEL_LOD`. */
   readonly buildingsLevel: number;
+  /** Triangles in the prop submesh alone. Zero away from forest and settlement. */
+  readonly propTriangles: number;
+  /** Props whose centre lies in this node. */
+  readonly props: number;
+  /**
+   * Props here whose seating was actually MEASURED -- i.e. `props` on a lod-0
+   * node and zero on any coarser one. Denominator of `propsSeated`.
+   */
+  readonly propsMeasured: number;
+  /** Of those, how many sit on this node's own ground. See `PROP_SEAT_LOD`. */
+  readonly propsSeated: number;
   /** Deck stations standing clear of the ground: bridge geometry. Zero on most. */
   readonly bridgeVertices: number;
   /** Surface vertices a Phase 3b river channel lowered. Zero on most nodes. */
@@ -764,6 +853,20 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     mesh.add(buildingMesh);
   }
 
+  const propGeometry = createPropGeometry(data);
+  let propMesh: THREE.Mesh | null = null;
+  let propMaterial: THREE.MeshLambertMaterial | null = null;
+  if (propGeometry !== null) {
+    propMaterial = createPropMaterial();
+    propMesh = new THREE.Mesh(propGeometry, propMaterial);
+    propMesh.name = `props ${data.coord.x},${data.coord.z},${data.coord.lod}`;
+    propMesh.renderOrder = PROP_RENDER_ORDER_BASE + chunkRenderOrder(data.coord);
+    propMesh.matrixAutoUpdate = false;
+    propMesh.updateMatrix();
+    propMesh.onBeforeRender = countPropDraw;
+    mesh.add(propMesh);
+  }
+
   return {
     mesh,
     geometry,
@@ -777,6 +880,9 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     buildingMesh,
     buildingGeometry,
     buildingMaterial,
+    propMesh,
+    propGeometry,
+    propMaterial,
     color: data.color,
     geometryHash: hashChunkGeometry(data),
     bytes: chunkDataBytes(data),
@@ -784,13 +890,15 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
       (data.indices.length +
         data.waterIndices.length +
         data.deckIndices.length +
-        data.buildingIndices.length) /
+        data.buildingIndices.length +
+        data.propIndices.length) /
       3,
     vertices:
       (data.positions.length +
         data.waterPositions.length +
         data.deckPositions.length +
-        data.buildingPositions.length) /
+        data.buildingPositions.length +
+        data.propPositions.length) /
       3,
     waterTriangles: data.waterIndices.length / 3,
     deckTriangles: data.deckIndices.length / 3,
@@ -798,6 +906,10 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     buildings: data.buildings,
     buildingsMeasured: data.coord.lod === BUILDING_LEVEL_LOD ? data.buildings : 0,
     buildingsLevel: data.buildingsLevel,
+    propTriangles: data.propIndices.length / 3,
+    props: data.props,
+    propsMeasured: data.coord.lod === PROP_SEAT_LOD ? data.props : 0,
+    propsSeated: data.propsSeated,
     bridgeVertices: data.bridgeVertices,
     riverVertices: data.riverVertices,
     roadVertices: data.roadVertices,
@@ -825,6 +937,9 @@ export function disposeChunkMesh(entry: ChunkMesh): void {
   if (entry.buildingMesh !== null) entry.buildingMesh.removeFromParent();
   entry.buildingGeometry?.dispose();
   if (entry.buildingMaterial !== null) disposeMaterial(entry.buildingMaterial);
+  if (entry.propMesh !== null) entry.propMesh.removeFromParent();
+  entry.propGeometry?.dispose();
+  if (entry.propMaterial !== null) disposeMaterial(entry.propMaterial);
 }
 
 function disposeMaterial(material: THREE.Material): void {

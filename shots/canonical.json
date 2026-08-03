@@ -204,6 +204,21 @@
       "name": "settlement-buildings-wireframe",
       "params": "?time=3&pos=2520,70,120&look=-90,-18&wireframe=1",
       "expect": "Phase 6. The structural claim of the phase in one image: a building is A SEPARATE MESH, batched per node. The terrain lattice, the street deck and the house outlines are three distinct geometries; each house is 14 triangles (four walls, two gables, two roof slopes) with winding derived from an outward hint rather than assumed. Ownership is by centre and the geometry is not clipped, so a house whose centre sits in one 64 m node may overhang into the next -- and must appear exactly once. A plinth that hung unbounded down a bank would show here as a curtain of vertical edges."
+    },
+    {
+      "name": "vegetation-canopy",
+      "params": "?time=3&pos=-6496,180,-3680&look=0,-88",
+      "expect": "Phase 7a, AND THE VIEW THAT SAYS THE PROP PIPELINE HAPPENED. Straight down from 180 m onto a forest patch west of the soak corridor (near the flight start at -6749,-4140). Trees and bushes are biome-scattered, owned by centre, batched into one submesh per node: a canopy reads as green blocks rather than as a draw-call bomb of one mesh per trunk. Clear of roads and empty of settlement clutter here -- the density claim of the phase, not the yard-prop half."
+    },
+    {
+      "name": "vegetation-shallow",
+      "params": "?time=3&pos=-6520,55,-3680&look=-90,-8",
+      "expect": "Phase 7a. THE SHALLOW-PITCH VEGETATION VIEW, standing just west of the same canopy and looking east through the trunks. Every geometry budget is decided near the horizon, so the phase needs at least one prop view at that pitch -- and it is the angle at which the BASE / STUMP split is visible: bases hold a constant sampleHeight altitude while stumps meet this node's ground, so a tree does not jump when the quadtree changes level under it."
+    },
+    {
+      "name": "vegetation-wireframe",
+      "params": "?time=3&pos=-6496,120,-3680&look=0,-70&wireframe=1",
+      "expect": "Phase 7a. The structural claim of the phase in one image: props are A SEPARATE MESH, batched per node. Terrain lattice and tree/bush boxes are distinct geometries; ownership is by centre and geometry is not clipped. A stump that hung unbounded down a bank would show here as a curtain of vertical edges, the same failure mode buildings have with an unbounded plinth."
     }
   ]
 }

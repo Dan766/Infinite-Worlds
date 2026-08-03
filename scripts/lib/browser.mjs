@@ -174,7 +174,14 @@ async function measureFrame(page) {
 export async function capture(browser, url, outPath, options = {}) {
   const { context, page, consoleErrors, failedRequests } = await openPage(browser, url, options);
   try {
-    await page.screenshot({ path: outPath, animations: 'disabled', caret: 'hide' });
+    await page.screenshot({
+      path: outPath,
+      animations: 'disabled',
+      caret: 'hide',
+      // Forest nodes after Phase 7a can make SwiftShader take longer than the
+      // Playwright default 30s to rasterise a 1280x720 frame.
+      timeout: 120_000,
+    });
     const { distinctColors } = await measureFrame(page);
     return { consoleErrors, failedRequests, distinctColors };
   } finally {

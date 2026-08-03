@@ -15,7 +15,7 @@ state moves between sessions. Update both at the end of every phase.
 | 4b    | Settlement streets (Sector tier)   | Done   |
 | 5     | Road meshes                        | Done   |
 | 6     | Lots and buildings                 | Done   |
-| 7a    | Vegetation and props               | -      |
+| 7a    | Vegetation and props               | Done   |
 | 7b    | Variety (villages, buildings, props) | -    |
 | 8     | Player controller and collision    | -      |
 | 9     | NPCs                               | -      |
@@ -3533,3 +3533,82 @@ placement system.
 - **Anti-vacuity per family.** Each layout family and each building/prop kind
   needs a positive check *and* a "the flight actually saw one" half, or the soak
   will green-pass on a world that only ever emitted the original ring cottage.
+
+## Phase 7a -- Vegetation and props pipeline (done)
+
+Phase 6 left buildings as the model for dense placed content and told 7a to ship
+one coherent prop / vegetation pipeline before variety. 7a does exactly that:
+world trees and bushes first (density and budget proof), sparse yard props on the
+same path second, species and layout families deferred to 7b.
+
+### What was built
+
+- **`props.ts`.** Candidate lattice (`PROP_CELL` = 10 m) jittered from
+  `(worldSeed, cell)`; accept/reject on sea margin, slope, humidity / temperature /
+  continentalness, and clearance from roads, streets and building footprints.
+  Sparse kinds: tree / bush for world scatter, crate / post for yard clutter.
+  Facing is a hash unit direction -- no `sin`/`cos` on the path to a stored
+  vertex. No Sector memo for world trees (rejected: continuous density would
+  force an overhanging sector working set or an 11×11 rebuild).
+- **`prop-mesh.ts`.** One batched submesh per node: trunk+canopy tree, bush box,
+  yard crate/post. Base Y from `sampleHeight`; short buried stump meets
+  `groundAt` the way a plinth does. `propsSeated` counted at lod 0 only.
+  Coarser than `PROP_MESH_MAX_LOD` (2) emits empty arrays so a root node does
+  not batch an entire forest into one draw call.
+- **`ChunkData` v9.** `propPositions/Normals/Colors/Indices`, `props`,
+  `propsSeated`; transferables and byte accounting; hash folds `propPositions`.
+- **Three / HUD / soak.** +1 draw call per prop-bearing node; `propDraws`,
+  `propsSeen`, seating fraction, `sampleChunkProps` anti-vacuity for the
+  round-tripped square near the existing flight start (forest at ~-6496,-3680).
+
+### Judgment calls
+
+- **Rejected one mesh per tree** -- draw-call bomb on a forest lod-0 node.
+- **Rejected Three GPU instancing** -- breaks worker purity / Node tests; Phase 11
+  materials can revisit.
+- **Rejected fitting bases to each LOD lattice** -- would jump; stump absorbs the
+  difference instead.
+- **Yard props are sparse on purpose.** 7a proves the pipeline; 7b proliferates
+  kinds and layouts.
+- **`PROP_MESH_MAX_LOD = 2`** -- coarser nodes stay empty. A root node would
+  otherwise own every tree centre in 4 km and hit the per-node cap with geometry
+  nobody can resolve from that lattice.
+
+### What was measured
+
+Full 5-minute soak on the existing corridor (`START` -6749,-4140), seed
+`infinite-world`, SwiftShader:
+
+```
+props     201 peak prop nodes of 309 live / 10,492 props live / 211k prop tris
+          68 peak prop draws / 66,719 propsSeen / seating 100% of lod-0 samples
+          props at the start 5/25 round-tripped chunks
+payload   106.5 MB peak -- MAX_CHUNK_BYTES re-derived to 120 MB (was 100)
+draws     303 peak (budget 680)
+tris      1.26 M peak (budget 2.1 M)
+buildings unchanged in character: 42 nodes, 96% level, 12,575 seen
+```
+
+Floors in `scripts/soak.mjs` set at roughly a third of measured peaks, matching
+every earlier phase's margin. Canonical views added: `vegetation-canopy`,
+`vegetation-shallow`, `vegetation-wireframe` (43 total). Existing views
+re-baselined wherever canopy appeared as a side effect. `shots:check` green on
+all 43.
+
+### Known gaps, deliberately left
+
+- **No species families, size classes, or clustering rules.** One tree, one bush,
+  one crate, one post. Phase 7b.
+- **No facade / chimney / door detail on buildings.** Still a gabled box; yard
+  clutter is the only settlement prop.
+- **Simple box approximations for canopy.** Readable from the air; not botanical.
+- **`vegetation-canopy` is colour-sparse (30 distinct)** under SwiftShader --
+  enough to pass the blankness guard, thin for judging species later.
+- **Frame budgets remain SwiftShader numbers** (worst frame 550 ms). Real GPU
+  check still owed.
+
+### For Phase 7b
+
+Unchanged from the note under Phase 6: variety across village layouts, building
+kinds, and prop/vegetation species, all on the 7a pipeline -- not a third
+placement system. Each family needs its own anti-vacuity half.

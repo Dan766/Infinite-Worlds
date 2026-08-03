@@ -39,6 +39,7 @@ import {
 } from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
 import { buildBuildingSurface, type BuildingPalette } from './building-mesh';
+import { buildPropSurface, type PropPalette } from './prop-mesh';
 import { buildDeckSurface, type DeckPalette } from './road-mesh';
 import {
   CHUNK_DATA_VERSION,
@@ -352,6 +353,39 @@ const BUILDING_PALETTE: BuildingPalette = {
   roofA: linearRgb(ROOF_A),
   roofB: linearRgb(ROOF_B),
   plinth: linearRgb(PLINTH),
+};
+
+/**
+ * Phase 7a prop colours, authored in sRGB and converted once.
+ *
+ * Sparse kinds only -- tree trunk/canopy, bush, crate, post. Species variety is
+ * Phase 7b; this palette just has to make a forest read as green and a yard as
+ * wood from the air.
+ */
+const TRUNK_A: readonly [number, number, number] = [0.42, 0.3, 0.2];
+const TRUNK_B: readonly [number, number, number] = [0.32, 0.22, 0.14];
+const CANOPY_A: readonly [number, number, number] = [0.22, 0.42, 0.18];
+const CANOPY_B: readonly [number, number, number] = [0.14, 0.32, 0.12];
+const BUSH_A: readonly [number, number, number] = [0.28, 0.46, 0.2];
+const BUSH_B: readonly [number, number, number] = [0.18, 0.34, 0.14];
+const CRATE_A: readonly [number, number, number] = [0.55, 0.4, 0.25];
+const CRATE_B: readonly [number, number, number] = [0.4, 0.28, 0.16];
+const POST_A: readonly [number, number, number] = [0.45, 0.35, 0.22];
+const POST_B: readonly [number, number, number] = [0.3, 0.22, 0.14];
+const STUMP: readonly [number, number, number] = [0.28, 0.22, 0.16];
+
+const PROP_PALETTE: PropPalette = {
+  trunkA: linearRgb(TRUNK_A),
+  trunkB: linearRgb(TRUNK_B),
+  canopyA: linearRgb(CANOPY_A),
+  canopyB: linearRgb(CANOPY_B),
+  bushA: linearRgb(BUSH_A),
+  bushB: linearRgb(BUSH_B),
+  crateA: linearRgb(CRATE_A),
+  crateB: linearRgb(CRATE_B),
+  postA: linearRgb(POST_A),
+  postB: linearRgb(POST_B),
+  stump: linearRgb(STUMP),
 };
 
 /** Metres ABOVE SEA LEVEL at which snow starts, before the temperature shift. */
@@ -1100,6 +1134,21 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     BUILDING_PALETTE,
   );
 
+  // -- the props -------------------------------------------------------------
+  //
+  // Same groundAt contract as buildings: base Y is LOD-independent
+  // (`sampleHeight` inside collectNodeProps), and the stump reaches down to
+  // THIS node's rendered ground. See `prop-mesh.ts` and `props.ts`.
+  const props = buildPropSurface(
+    coord,
+    worldSeed,
+    region.roads,
+    sectors.streets,
+    sectors.lots,
+    groundAt,
+    PROP_PALETTE,
+  );
+
   return {
     version: CHUNK_DATA_VERSION,
     coord: { x: coord.x, z: coord.z, lod: coord.lod },
@@ -1121,6 +1170,12 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     buildingIndices: buildings.indices,
     buildings: buildings.count,
     buildingsLevel: buildings.level,
+    propPositions: props.positions,
+    propNormals: props.normals,
+    propColors: props.colors,
+    propIndices: props.indices,
+    props: props.count,
+    propsSeated: props.seated,
     riverVertices,
     roadVertices,
     streetVertices,

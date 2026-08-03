@@ -162,6 +162,22 @@ export interface ChunkStreamerStats {
    * so a five-second sampling interval can step straight over one.
    */
   buildingsSeen: number;
+  /** Live nodes carrying a Phase 7a prop submesh. One extra draw call each. */
+  propNodes: number;
+  /** Props standing in the live nodes, at every level. */
+  props: number;
+  /** Of those, the ones on a lod-0 node -- the denominator of `propsSeated`. */
+  propsMeasured: number;
+  /** Of THOSE, how many sit on their own node's ground. */
+  propsSeated: number;
+  /** Triangles of prop geometry in the live nodes. */
+  propTriangles: number;
+  /**
+   * Props generated since construction. CUMULATIVE, for the reason
+   * `buildingsSeen` is: a forest corridor can be stepped over between samples
+   * at a five-second interval if only an instantaneous peak is kept.
+   */
+  propsSeen: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -218,6 +234,8 @@ export class ChunkStreamer {
   private bridgeNodeCount = 0;
   /** Buildings ever generated. Monotone, for `bridgeNodeCount`'s reason. */
   private buildingsSeenCount = 0;
+  /** Props ever generated. Monotone, for `buildingsSeenCount`'s reason. */
+  private propsSeenCount = 0;
   private hasUpdated = false;
   private enabled = true;
   private disposed = false;
@@ -341,6 +359,7 @@ export class ChunkStreamer {
       // between samples.
       if (data.bridgeVertices > 0) this.bridgeNodeCount++;
       this.buildingsSeenCount += data.buildings;
+      this.propsSeenCount += data.props;
       this.arrived.push(data);
       this.arrivedKeys.add(key);
     });
@@ -574,6 +593,11 @@ export class ChunkStreamer {
     let buildingsMeasured = 0;
     let buildingsLevel = 0;
     let buildingTriangles = 0;
+    let propNodes = 0;
+    let props = 0;
+    let propsMeasured = 0;
+    let propsSeated = 0;
+    let propTriangles = 0;
     for (const entry of this.live.values()) {
       bytes += entry.bytes;
       triangles += entry.triangles;
@@ -605,6 +629,13 @@ export class ChunkStreamer {
         buildingsMeasured += entry.buildingsMeasured;
         buildingsLevel += entry.buildingsLevel;
         buildingTriangles += entry.buildingTriangles;
+      }
+      if (entry.props > 0) {
+        propNodes++;
+        props += entry.props;
+        propsMeasured += entry.propsMeasured;
+        propsSeated += entry.propsSeated;
+        propTriangles += entry.propTriangles;
       }
     }
     for (const key of this.cache.keys()) bytes += this.cache.peek(key)?.bytes ?? 0;
@@ -639,6 +670,12 @@ export class ChunkStreamer {
       buildingsLevel,
       buildingTriangles,
       buildingsSeen: this.buildingsSeenCount,
+      propNodes,
+      props,
+      propsMeasured,
+      propsSeated,
+      propTriangles,
+      propsSeen: this.propsSeenCount,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -772,6 +809,21 @@ export class ChunkStreamer {
   }
 
   /**
+   * Props in specific nodes. Phase 7a's counterpart to `sampleBuildings`.
+   *
+   * The geometry hash folds `propPositions` in, so a round trip proves a forest
+   * comes back identical -- but over bare ground the prop half of every hash is
+   * the hash of an empty array. This is what the soak reads to refuse that.
+   */
+  sampleProps(coords: readonly ChunkCoord[]): (number | null)[] {
+    return coords.map((coord) => {
+      const key = chunkKey(coord);
+      const entry = this.live.get(key) ?? this.cache.peek(key);
+      return entry === undefined ? null : entry.props;
+    });
+  }
+
+  /**
    * River-carved vertices in specific nodes, as above. Phase 4a's road
    * equivalent is `sampleRoadVertices`, immediately before this.
    */
@@ -900,6 +952,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.buildingNodes} nodes / ${s.buildings} live (${s.buildingsLevel} of ${s.buildingsMeasured} level) / ${s.buildingTriangles} tris / ${s.buildingsSeen} seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'props',
+      () => {
+        const s = this.stats();
+        return `${s.propNodes} nodes / ${s.props} live (${s.propsSeated} of ${s.propsMeasured} seated) / ${s.propTriangles} tris / ${s.propsSeen} seen`;
       },
       HudOrder.world,
     );
