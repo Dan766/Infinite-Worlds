@@ -108,6 +108,8 @@ scripts/
   shot.mjs              one screenshot of one URL
   shots.mjs             capture canonical baselines
   shots-check.mjs       re-capture and byte-compare against baselines
+  shots-diff.mjs        describe how two PNGs differ; dependency-free codec
+  shots-repeat.mjs      capture views repeatedly in one process; catches an unstable view
   verify-subpath.mjs    prove the build (and its workers) run from a nested path
   soak.mjs              5-minute headless flight; heap trend, chunk churn, frames
   lib/                  shared browser, static-server, and canonical-run helpers
@@ -128,6 +130,15 @@ per-frame draw call and triangle counts from.
 
 Subsystems that add meshes at runtime must call `renderer.invalidateMaterials()`
 so wireframe mode reaches the new objects.
+
+Being the boundary makes it the owner of one thing that is easy to put elsewhere:
+**switching a draw mode means switching every render state that only means
+something in one of the two modes**, not just the `wireframe` flag. Since Phase 6a
+`applyWireframe` also drops and restores `polygonOffset`, because polygon offset
+does not apply to line primitives and asking for it anyway is undefined -- see
+Screenshots below. A material declares what it WANTS (`chunk-mesh.ts` asks for an
+offset on the deck) and this file decides what is legal to ask for in the mode
+being drawn.
 
 ### Simulation time is an integer tick, never wall clock
 
@@ -835,7 +846,25 @@ panel's **copy link to this view** button does the same.
 npm run shots         # capture canonical baselines into shots/
 npm run shots:check   # re-capture and byte-compare; exits non-zero on any change
 npm run shot -- <url> <name> [--raw]
+npm run shots:diff -- <a.png> <b.png> [mask.png]   # HOW two captures differ
+npm run shots:repeat -- --repeat=3 [view...]       # is a view reproducible AT ALL
 ```
+
+The last two were added in Phase 6a and each answers a question `shots:check`
+cannot. `shots:check` compares a view against its **baseline**, so "this view
+changed" and "this view is not reproducible" are the same red line, and when it
+is red "changed how" is unanswerable without opening two PNGs and squinting.
+`shots:repeat` compares a view against **itself** over several passes, and
+`shots:diff` reports how many pixels differ, by how much, where, and will write a
+greyscale mask. Between them they turned the Phase 5 instability from a mystery
+into a one-line fix.
+
+`shots:repeat` captures the whole sequence inside **one browser process**, in
+order, exactly as `shots:check` does, and that is load-bearing rather than
+convenient: the Phase 5 flake was invisible to a view captured on its own and
+appeared only once a shaded view had preceded it in the same process. A
+reproducibility checker that opened a fresh browser per view would have reported
+everything green.
 
 Three things make byte-identical comparison possible:
 
@@ -862,16 +891,21 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
-**KNOWN BROKEN SINCE PHASE 5: the eight wireframe views that contain a deck are
-not reproducible.** They come back with a different hash on every run, so
-`shots:check` reports `8 changed`. The 29 shaded views and `chunks-wireframe` --
-the one wireframe view with no deck in it -- are byte-identical on every run, so
-the harness still catches a change to anything else. The leading suspect is that
-WebGL exposes no `POLYGON_OFFSET_LINE`: `polygonOffset` is what keeps a deck in
-front of coplanar ground and applies to filled polygons only, so in wireframe the
-deck's lines and the terrain's sit at an exact depth tie. Sharing `renderOrder`
-with the terrain was investigated and ruled out. Full write-up, including the
-next experiment to run, is in `PROGRESS.md` under Phase 5.
+**All 37 views are reproducible again as of Phase 6a**, and the rule that keeps
+them that way is stated once, in `renderer.ts`: **wireframe mode must not leave a
+polygon offset enabled.** WebGL has no `GL_POLYGON_OFFSET_LINE`, so what a line
+primitive's depth is while the state is on is unspecified, and SwiftShader's
+answer depended on GPU-process state that outlived a page -- which made the eight
+wireframe views containing a Phase 5 deck come back different on every run.
+`applyWireframe` remembers the requested value on the material and restores it
+when wireframe goes off, so filled rendering is bit-for-bit unchanged. Full
+write-up, including what was ruled out and the reproducer that still fails
+without the fix, is in `PROGRESS.md` under Phase 6a.
+
+The general form is worth stating, because Phase 5 lost a phase to it: **a render
+state that only means something in one draw mode has to be switched with the
+mode.** Anything else is undefined behaviour that a byte-comparison harness will
+find and a picture will not.
 
 ### Static subpath
 
@@ -1170,6 +1204,8 @@ npm test               # vitest (60 s per-test timeout; the streaming tests
                        #  generate hundreds of real chunks inside one `it`)
 npm run shots          # write screenshot baselines
 npm run shots:check    # verify nothing visual changed
+npm run shots:diff     # describe HOW two captures differ, with an optional mask
+npm run shots:repeat   # capture views repeatedly; fails on one that is unstable
 npm run verify:subpath # verify the build survives a nested deploy path
 npm run soak           # 5-minute headless flight; fails on a heap leak
 ```
