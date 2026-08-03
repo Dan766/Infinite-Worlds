@@ -430,11 +430,16 @@ declared since Phase 1 and read by nothing. Per sector:
    ever finds two, because that would mean the alignment had broken;
 2. take the **bearings of the roads leaving** that settlement, from the Region
    record read through `coarser('region')`;
-3. lay a **ring** at 0.58 of the footprint radius, jittered radially and
-   angularly so it is a village and not a cartwheel;
-4. hang **lanes** outward to 0.78 of the radius and **spokes** inward to the
-   centre off alternating ring nodes, dropping any whose bearing is within about
-   37 degrees of a road -- so a street never duplicates a road;
+3. pick a **layout family** as a pure function of `(worldSeed, cellX, cellZ)` —
+   ring (~52%), linear, grid, or hilltop — and emit the same CSR
+   `SectorStreets` shape every family shares (`layout` is an additive scalar for
+   soak / HUD; lots and decks keep walking polylines);
+4. for **ring** (the Phase 4b default, still the majority): lay a ring at 0.58 of
+   the footprint radius, jittered radially and angularly; hang lanes outward to
+   0.78 and spokes inward, dropping any whose bearing is within about 37 degrees
+   of a road. **Linear** is a spine along the primary road bearing with short
+   spurs; **grid** is a small road-aligned block of lanes (centre line along the
+   road omitted); **hilltop** is a smaller closed enclosure with few spokes;
 5. give every node the settlement's own altitude as its grading target.
 
 **A sector lays out the settlement whose centre it contains; it does not clip.**
@@ -583,10 +588,11 @@ them. Buildings are the first content in the project whose placement is decided
 by evaluating the *finished* height field rather than by routing from
 `baseHeight` and then moving the ground.
 
-**Everything a building is is fixed at the Sector tier.** Position, footprint,
-facing, eaves, ridge, wall and roof tint, and the altitude of the floor are all
-pure functions of `(worldSeed, sector)`. `building-mesh.ts` places geometry and
-decides nothing. That is a deliberate departure from the deck: a ribbon hundreds
+**Everything a building is is fixed at the Sector tier.** Kind (cottage / barn /
+hall), position, footprint, facing, eaves, ridge, wall and roof tint, and the
+altitude of the floor are all pure functions of `(worldSeed, sector)`.
+`building-mesh.ts` places geometry and decides nothing -- facade detail (door,
+barn doors, chimney cap) is painted from `SectorLots.kind`, never re-rolled. That is a deliberate departure from the deck: a ribbon hundreds
 of metres long must follow each node's own lattice or it sinks into a coarse
 hillside; an eight-metre house that followed the lattice would jump vertically
 every time the quadtree changed level under it. What varies per node is only how
@@ -617,9 +623,11 @@ way rivers and roads do in `RegionField`. They are not symmetric: streets grade
 the ground and lots read the finished ground, so the lot field is built from an
 already-built street field.
 
-**`ChunkData.buildings` and `buildingsLevel` are the anti-vacuity pair.**
-`buildings` says houses were placed; `buildingsLevel` says they stand on ground
-this lod-0 node renders within tolerance of their floor. A regression in the
+**`ChunkData.buildings` / `buildingsLevel` and the kind counters are the
+anti-vacuity set.** `buildings` says houses were placed; `buildingsLevel` says
+they stand on ground this lod-0 node renders within tolerance of their floor;
+`buildingsCottage` / `buildingsBarn` / `buildingsHall` say the kinds variety
+slice is not a cottage-only world. A regression in the
 grading, in `gradeTarget` or in the lot acceptance tests leaves the count
 untouched and drives levelness to zero. Levelness is measured at lod 0 only -- a
 coarse lattice cannot describe an 8 m footprint, so the number would be about
@@ -645,7 +653,22 @@ lies in the node goes into one buffer with per-vertex colour (+1 draw call per
 prop-bearing node). Nodes coarser than `PROP_MESH_MAX_LOD` (2) emit empty arrays
 -- a root node would otherwise own every tree in 4 km. `props` / `propsSeated` /
 `propsMeasured` are the anti-vacuity trio: placed, seated on ground this node
-renders, counted at lod 0 only. Species variety and layout families stay Phase 7b.
+renders, counted at lod 0 only. Village **layout** families shipped in 7b
+slice 1; building kinds in slice 2.
+
+**Species, size class, and clustering are decided in `props.ts`; the mesh only
+reads them.** `species` is a SoA column beside `kind`. Trees pick pine (~55%) /
+broadleaf (~45%); bushes pick round (~55%) / tall (~45%); yard crate/post map
+to `SPECIES_CRATE` / `SPECIES_POST`. Size uses sapling/adult/elder bands from
+the existing scale salt inside each kind's `PROP_*_SCALE_MIN/MAX`. World props
+(only) multiply the accept threshold by a grove factor over `CLUSTER_STRIDE`
+(= 3) cells, softened with a 4-neighbour blend, tuned so total density stays
+near the 7a baseline. `prop-mesh.ts` branches pine vs broadleaf (still 2 boxes)
+and bush round vs tall (still 1 box) and exposes `pine` / `broadleaf` /
+`bushRound` / `bushTall` / `yard` counters on `PropSurface`, mapped to
+`ChunkData.propsPine` etc. (`CHUNK_DATA_VERSION` 12). Streamer cumulative
+`propsSeen*` + HUD `prop-species` + soak floor of one each are the anti-vacuity
+half: a pine-only world fails.
 
 ### The region memo is derived data, and it is bounded
 
@@ -930,6 +953,12 @@ npm run shots:diff -- <a.png> <b.png> [mask.png]   # HOW two captures differ
 npm run shots:repeat -- --repeat=3 [view...]       # is a view reproducible AT ALL
 ```
 
+`shots` and `shots:check` accept `--no-build` to skip the rebuild when `dist/`
+is already current. They capture every view in **one Chromium process on one
+reused page** (`page.goto` + `__worldReady` + screenshot per view), which drops
+the per-view context teardown/startup tax while keeping the one-process
+sequential order Phase 6a showed is load-bearing.
+
 The last two were added in Phase 6a and each answers a question `shots:check`
 cannot. `shots:check` compares a view against its **baseline**, so "this view
 changed" and "this view is not reproducible" are the same red line, and when it
@@ -971,7 +1000,7 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
-**All canonical views are reproducible again as of Phase 6a** (43 as of Phase 7a),
+**All canonical views are reproducible again as of Phase 6a** (46 as of Phase 7b),
 and the rule that keeps
 them that way is stated once, in `renderer.ts`: **wireframe mode must not leave a
 polygon offset enabled.** WebGL has no `GL_POLYGON_OFFSET_LINE`, so what a line

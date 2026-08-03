@@ -757,6 +757,11 @@ export interface ChunkMesh {
   readonly roadVertices: number;
   /** Surface vertices Phase 4b street surfacing covers. Zero on almost all nodes. */
   readonly streetVertices: number;
+  /** Layout family of the settlement whose streets reach this node, or `-1`. */
+  readonly streetLayout: number;
+  readonly buildingsCottage: number;
+  readonly buildingsBarn: number;
+  readonly buildingsHall: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -914,6 +919,10 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     riverVertices: data.riverVertices,
     roadVertices: data.roadVertices,
     streetVertices: data.streetVertices,
+    streetLayout: data.streetLayout,
+    buildingsCottage: data.buildingsCottage,
+    buildingsBarn: data.buildingsBarn,
+    buildingsHall: data.buildingsHall,
   };
 }
 

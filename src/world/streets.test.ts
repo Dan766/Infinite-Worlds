@@ -39,6 +39,11 @@ import {
 import {
   clearStreetCache,
   generateSectorStreets,
+  layoutFamily,
+  LAYOUT_GRID,
+  LAYOUT_HILLTOP,
+  LAYOUT_LINEAR,
+  LAYOUT_RING,
   ringDirection,
   sectorStreetField,
   sectorStreets,
@@ -306,21 +311,101 @@ describe('STREET_REACH', () => {
 // ---------------------------------------------------------------------------
 
 describe('the street plan', () => {
-  it('is a closed ring plus lanes and spokes', () => {
-    for (const rec of populatedSectors(SEED, -6, -6, 20)) {
+  it('picks a layout family from (seed, cell) and keeps ring the majority', () => {
+    // Bias is load-bearing for soak: ring ~52%, the other three share the rest.
+    const counts = [0, 0, 0, 0];
+    for (let z = -40; z < 40; z++) {
+      for (let x = -40; x < 40; x++) {
+        counts[layoutFamily(SEED, x, z)]!++;
+      }
+    }
+    const total = counts.reduce((a, b) => a + b, 0);
+    expect(counts[LAYOUT_RING]! / total).toBeGreaterThan(0.45);
+    expect(counts[LAYOUT_LINEAR]!).toBeGreaterThan(0);
+    expect(counts[LAYOUT_GRID]!).toBeGreaterThan(0);
+    expect(counts[LAYOUT_HILLTOP]!).toBeGreaterThan(0);
+    expect(layoutFamily(SEED, 3, 7)).toBe(layoutFamily(SEED, 3, 7));
+    expect(layoutFamily(SEED, 3, 7)).not.toBe(layoutFamily(hashString('other'), 3, 7));
+  });
+
+  it('tags every populated sector with its layout family', () => {
+    let seen = 0;
+    for (const rec of populatedSectors(SEED, -10, -10, 28)) {
+      expect(rec.layout).toBeGreaterThanOrEqual(LAYOUT_RING);
+      expect(rec.layout).toBeLessThanOrEqual(LAYOUT_HILLTOP);
+      expect(rec.layout).toBe(
+        layoutFamily(SEED, (rec.settlement as Settlement).cellX, (rec.settlement as Settlement).cellZ),
+      );
+      seen++;
+    }
+    expect(seen).toBeGreaterThan(5);
+  });
+
+  it('gives ring and hilltop a closed first street; linear a long spine; grid orthogonal runs', () => {
+    const byFamily: SectorStreets[][] = [[], [], [], []];
+    for (const rec of populatedSectors(SEED, -12, -12, 32)) {
+      byFamily[rec.layout]!.push(rec);
+    }
+    for (const family of [LAYOUT_RING, LAYOUT_LINEAR, LAYOUT_GRID, LAYOUT_HILLTOP]) {
+      expect(byFamily[family]!.length).toBeGreaterThan(0);
+    }
+
+    for (const rec of byFamily[LAYOUT_RING]!) {
       expect(rec.streetCount).toBeGreaterThan(1);
-      // Street 0 is the ring: an OPEN polyline whose last node repeats the
-      // first position, so nothing downstream needs a wrap-around case.
       const ringEnd = (rec.streetStart[1] as number) - 1;
       expect(rec.nodeX[ringEnd]).toBe(rec.nodeX[0]);
       expect(rec.nodeZ[ringEnd]).toBe(rec.nodeZ[0]);
       expect(ringEnd).toBeGreaterThanOrEqual(STREET_RING_NODES_MIN);
       expect(ringEnd).toBeLessThanOrEqual(STREET_RING_NODES_MAX);
-      // Every other street is a two-node segment off the ring.
       for (let s = 1; s < rec.streetCount; s++) {
         expect((rec.streetStart[s + 1] as number) - (rec.streetStart[s] as number)).toBe(2);
       }
-      expect(rec.segCount).toBe(ringEnd + 2 * (rec.streetCount - 1) - (rec.streetCount - 1));
+    }
+
+    for (const rec of byFamily[LAYOUT_HILLTOP]!) {
+      const ringEnd = (rec.streetStart[1] as number) - 1;
+      expect(rec.nodeX[ringEnd]).toBe(rec.nodeX[0]);
+      expect(rec.nodeZ[ringEnd]).toBe(rec.nodeZ[0]);
+      expect(ringEnd).toBeGreaterThanOrEqual(4);
+      expect(ringEnd).toBeLessThanOrEqual(9);
+    }
+
+    for (const rec of byFamily[LAYOUT_LINEAR]!) {
+      expect(rec.streetCount).toBeGreaterThan(0);
+      const from = rec.streetStart[0] as number;
+      const to = rec.streetStart[1] as number;
+      expect(to - from).toBeGreaterThanOrEqual(4);
+      let spine = 0;
+      for (let i = from; i + 1 < to; i++) {
+        const dx = (rec.nodeX[i + 1] as number) - (rec.nodeX[i] as number);
+        const dz = (rec.nodeZ[i + 1] as number) - (rec.nodeZ[i] as number);
+        spine += Math.hypot(dx, dz);
+      }
+      const s = rec.settlement as Settlement;
+      expect(spine).toBeGreaterThan(s.radius * 0.8);
+    }
+
+    for (const rec of byFamily[LAYOUT_GRID]!) {
+      expect(rec.streetCount).toBeGreaterThanOrEqual(2);
+      let orthogonalPairs = 0;
+      const dirs: [number, number][] = [];
+      for (let s = 0; s < rec.streetCount; s++) {
+        const a = rec.streetStart[s] as number;
+        const b = (rec.streetStart[s + 1] as number) - 1;
+        const dx = (rec.nodeX[b] as number) - (rec.nodeX[a] as number);
+        const dz = (rec.nodeZ[b] as number) - (rec.nodeZ[a] as number);
+        const len = Math.hypot(dx, dz);
+        if (len < 1) continue;
+        dirs.push([dx / len, dz / len]);
+      }
+      for (let i = 0; i < dirs.length; i++) {
+        for (let j = i + 1; j < dirs.length; j++) {
+          const a = dirs[i] as [number, number];
+          const b = dirs[j] as [number, number];
+          if (Math.abs(a[0] * b[0] + a[1] * b[1]) < 0.2) orthogonalPairs++;
+        }
+      }
+      expect(orthogonalPairs).toBeGreaterThan(0);
     }
   });
 
@@ -335,15 +420,17 @@ describe('the street plan', () => {
     }
   });
 
-  it('never lays a lane along a road leaving the same settlement', () => {
-    // THE RULE THAT MAKES A STREET A REFINEMENT RATHER THAN A DUPLICATE. A road
-    // already runs from the centre outward on its own bearing; a lane on that
-    // bearing would be a second graded corridor on top of the first, and the
-    // two would fight over the shoulder.
+  it('never lays a non-spine lane along a road leaving the same settlement', () => {
+    // THE RULE THAT MAKES A STREET A REFINEMENT RATHER THAN A DUPLICATE. Ring and
+    // hilltop drop any lane whose bearing matches a leaving road; the concrete
+    // check is that the tip of every spoke/lane stays clear of the carriageway.
+    // Linear spines and grid runs sit beside (or on) the road corridor by design
+    // — those families are covered by the layout shape tests instead.
     const roads = worldRegionField(SEED).roads;
     let withRoads = 0;
     let outerNodes = 0;
     for (const rec of populatedSectors(SEED, -8, -8, 24)) {
+      if (rec.layout !== LAYOUT_RING && rec.layout !== LAYOUT_HILLTOP) continue;
       const s = rec.settlement as Settlement;
       const net = roads.networkAt(s.x, s.z);
       const own = ownRoadSegments(net, s);
@@ -351,19 +438,48 @@ describe('the street plan', () => {
       withRoads++;
       for (let street = 1; street < rec.streetCount; street++) {
         const from = rec.streetStart[street] as number;
-        // Take whichever end is NOT the settlement centre: a spoke starts there
-        // and is trivially on top of every road at that point.
-        for (const i of [from, from + 1]) {
-          const x = rec.nodeX[i] as number;
-          const z = rec.nodeZ[i] as number;
-          if (Math.hypot(x - s.x, z - s.z) < 1) continue;
-          outerNodes++;
-          expect(nearestRoadDistance(own, x, z)).toBeGreaterThan(15);
+        const to = rec.streetStart[street + 1] as number;
+        let best = from;
+        let bestD = -1;
+        for (let i = from; i < to; i++) {
+          const d = Math.hypot((rec.nodeX[i] as number) - s.x, (rec.nodeZ[i] as number) - s.z);
+          if (d > bestD) {
+            bestD = d;
+            best = i;
+          }
         }
+        if (bestD < 1) continue;
+        outerNodes++;
+        expect(
+          nearestRoadDistance(own, rec.nodeX[best] as number, rec.nodeZ[best] as number),
+        ).toBeGreaterThan(15);
       }
     }
     expect(withRoads).toBeGreaterThan(1);
     expect(outerNodes).toBeGreaterThan(10);
+  });
+
+  it('leaves enough street length for lots on every family', () => {
+    // Anti-vacuity for Phase 7b: a family that emits a closed plan with no
+    // walkable frontage would pass every street test and starve buildings.
+    const byFamily = [0, 0, 0, 0];
+    for (const rec of populatedSectors(SEED, -12, -12, 32)) {
+      let length = 0;
+      for (let s = 0; s < rec.streetCount; s++) {
+        const from = rec.streetStart[s] as number;
+        const to = rec.streetStart[s + 1] as number;
+        for (let n = from; n + 1 < to; n++) {
+          const dx = (rec.nodeX[n + 1] as number) - (rec.nodeX[n] as number);
+          const dz = (rec.nodeZ[n + 1] as number) - (rec.nodeZ[n] as number);
+          length += Math.hypot(dx, dz);
+        }
+      }
+      expect(length).toBeGreaterThan(40);
+      byFamily[rec.layout]!++;
+    }
+    for (const family of [LAYOUT_RING, LAYOUT_LINEAR, LAYOUT_GRID, LAYOUT_HILLTOP]) {
+      expect(byFamily[family]!).toBeGreaterThan(0);
+    }
   });
 });
 

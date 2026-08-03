@@ -43,12 +43,15 @@ import { buildPropSurface, type PropPalette } from './prop-mesh';
 import { buildDeckSurface, type DeckPalette } from './road-mesh';
 import {
   CHUNK_DATA_VERSION,
+  SECTOR_SIZE,
   createTierContext,
+  chunkOrigin,
   chunkSizeAt,
   type ChunkCoord,
   type ChunkData,
   type TierContext,
 } from './contracts';
+import { STREET_REACH } from './streets';
 
 /**
  * The tier context a chunk generator needs: a world seed, the REGION-tier record
@@ -919,6 +922,28 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
       if ((grade[GRADE_STREET_SURFACE] as number) >= STREET_VERTEX_MIN_SURFACE) streetVertices++;
     }
   }
+
+  // Which village layout touched this node — for soak anti-vacuity. A ring-only
+  // world and a mixed world look identical if we only count street vertices.
+  let streetLayout = -1;
+  if (streetVertices > 0) {
+    const origin = chunkOrigin(coord);
+    const size = chunkSizeAt(coord.lod);
+    const sx0 = Math.floor((origin.x - STREET_REACH) / SECTOR_SIZE);
+    const sx1 = Math.floor((origin.x + size + STREET_REACH) / SECTOR_SIZE);
+    const sz0 = Math.floor((origin.z - STREET_REACH) / SECTOR_SIZE);
+    const sz1 = Math.floor((origin.z + size + STREET_REACH) / SECTOR_SIZE);
+    for (let sz = sz0; sz <= sz1 && streetLayout < 0; sz++) {
+      for (let sx = sx0; sx <= sx1; sx++) {
+        const layout = sectors.streets.streetsAt(sx, sz).layout;
+        if (layout >= 0) {
+          streetLayout = layout;
+          break;
+        }
+      }
+    }
+  }
+
   const heightAt = (col: number, row: number): number =>
     heights[(row + 1) * padded + (col + 1)] as number;
   const surfaceAt = (col: number, row: number): number =>
@@ -1170,15 +1195,24 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     buildingIndices: buildings.indices,
     buildings: buildings.count,
     buildingsLevel: buildings.level,
+    buildingsCottage: buildings.cottage,
+    buildingsBarn: buildings.barn,
+    buildingsHall: buildings.hall,
     propPositions: props.positions,
     propNormals: props.normals,
     propColors: props.colors,
     propIndices: props.indices,
     props: props.count,
     propsSeated: props.seated,
+    propsPine: props.pine,
+    propsBroadleaf: props.broadleaf,
+    propsBushRound: props.bushRound,
+    propsBushTall: props.bushTall,
+    propsYard: props.yard,
     riverVertices,
     roadVertices,
     streetVertices,
+    streetLayout,
     bridgeVertices: deck.bridgeVertices,
     color: chunkColor(coord, worldSeed),
     minY,

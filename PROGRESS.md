@@ -16,7 +16,7 @@ state moves between sessions. Update both at the end of every phase.
 | 5     | Road meshes                        | Done   |
 | 6     | Lots and buildings                 | Done   |
 | 7a    | Vegetation and props               | Done   |
-| 7b    | Variety (villages, buildings, props) | -    |
+| 7b    | Variety (villages, buildings, props) | In progress (3/3: species code; validation deferred) |
 | 8     | Player controller and collision    | -      |
 | 9     | NPCs                               | -      |
 | 10    | Lighting and atmosphere            | -      |
@@ -3609,6 +3609,222 @@ all 43.
 
 ### For Phase 7b
 
-Unchanged from the note under Phase 6: variety across village layouts, building
-kinds, and prop/vegetation species, all on the 7a pipeline -- not a third
-placement system. Each family needs its own anti-vacuity half.
+Three slices: (1) village layouts, (2) building kinds, (3) prop/vegetation
+species. Slice 1 is below; the phase stays In progress until 2 and 3 land.
+
+## Phase 7b -- Village layouts (slice 1 of 3; phase not done)
+
+Phase 7b is three variety slices on the existing pipelines — **not** complete
+until all three land:
+
+1. Village layouts (this section) — Done
+2. Building kinds (cottage / barn / hall, facade detail) — Done (see slice 2 section)
+3. Prop / vegetation species and clustering — Code landed (see slice 3; validation deferred)
+
+This slice proves **layout variety** on the street pipeline: more than one
+village shape in the world, selected deterministically, still feeding lots →
+buildings → props without a second placement system.
+
+### What was built
+
+- **`layoutFamily(worldSeed, cellX, cellZ)`** in `streets.ts` -- bucketed so ring
+  stays the majority (~52%) and linear / grid / hilltop share the rest. Selection
+  is a pure function of `(worldSeed, settlement cell)`, so two regions still agree.
+- **Four generators**, same CSR output: `layoutRing` (Phase 4b extracted, not
+  rewritten), `layoutLinear` (spine along primary road bearing + spurs),
+  `layoutGrid` (small road-aligned block; centre line along the road omitted),
+  `layoutHilltop` (smaller closed enclosure, few spokes). No `Math.sin` / `cos`
+  on vertex paths; directions reuse `ringDirection` / unit bearings from hashes.
+- **`SectorStreets.layout`** and **`ChunkData.streetLayout`** (v10) -- additive
+  fields so soak / HUD can tell a ring-only world from a mixed one. Lots, decks
+  and grading keep walking the same polylines.
+- **Streamer / HUD / soak** -- cumulative `layoutSeenRing|Linear|Grid|Hilltop`
+  with a floor of one each (anti-vacuity: a ring-only world fails).
+- **Canonical views** -- settlement-* moved onto a ring village at ~(1973, 702)
+  after the old site at (2634, 110) hashed to linear; added `layout-linear`,
+  `layout-grid`, `layout-hilltop` aerials (46 views).
+
+### Rejected
+
+- Reshaping `ChunkData` / Sector memo for layouts -- CSR stays; only additive
+  scalars.
+- Per-family building meshes or prop species in this slice.
+- Replacing the ring entirely -- keep it as the common default so Phase 4b
+  settlement views stay meaningful.
+
+### What was measured
+
+Soak (300 s flight, SwiftShader), Phase 7b layouts slice vs Phase 7a row:
+
+| metric | 7a | 7b layouts | budget |
+| ------ | -- | ---------- | ------ |
+| draw calls peak | (prior) | 300 | 680 |
+| payload bytes peak | ~106.5 MB | 105.5 MB | 120 MB |
+| heap unexplained | | +0.60 MB/min | 6 MB/min |
+| street nodes peak | | 43 | floor 12 |
+| buildings seen | | 10,595 | floor 3,000 |
+| props seen | | 66,219 | floor 20,000 |
+| layouts R/L/G/H | n/a | **224 / 20 / 25 / 8** | floor 1 each |
+
+Layouts alone did not force a budget raise. `shots:check` green on 46 views;
+`shots:repeat --repeat=3` stable on `layout-linear`, `layout-grid`, `layout-hilltop`.
+
+### Known gaps, deliberately left
+
+- Building kinds: shipped in slice 2 (below).
+- Prop / vegetation species and clustering.
+- More layout families beyond the four.
+- Hilltop villages are sparse on street count by design; soak floors stay at 1.
+
+### For slices 2 and 3 (before marking 7b Done)
+
+- **2 — Building kinds:** cottage / barn / hall (and facade detail) on the
+  existing lot → building-mesh path, with soak anti-vacuity per kind.
+- **3 — Prop / vegetation species:** size classes, clustering, and palette
+  bands on the 7a props pipeline, with soak anti-vacuity per species family.
+
+Do not mark the phase table row Done until both are shipped and measured.
+
+## Phase 7b -- Building kinds (slice 2 of 3; phase not done)
+
+Slice 2 of the variety pass. Layouts (slice 1) already mixed village shapes;
+this slice mixes **what fronts the streets** without a second placement system.
+
+### What was built
+
+- **`pickBuildingKind(worldSeed, cell, lot index)`** in `lots.ts` -- cottage
+  ~62%, barn ~22%, hall ~16%. Kind is stored on `SectorLots.kind`; the mesh only
+  reads it.
+- **Kind-specific footprints and heights** -- barns wider/deeper and lower;
+  halls taller; cottages keep the compact house range. Global `BUILDING_*_MAX`
+  constants track the barn/hall caps for `LOT_MAX_EXTENT`.
+- **Facade detail in `building-mesh.ts`** -- every kind still costs a fixed
+  **38 verts / 18 tris** (base gabled box + exactly two facade quads): cottage
+  door + window, barn double doors, hall door + upward chimney cap. Fixed cost
+  keeps payload maths and the winding tests load-bearing.
+- **`ChunkData` v11** -- additive `buildingsCottage` / `buildingsBarn` /
+  `buildingsHall`. Streamer cumulative `buildingsSeen*` + soak floor of one
+  each (anti-vacuity: a cottage-only world fails).
+
+### Rejected
+
+- Variable per-kind vertex budgets -- would make `BUILDING_VERTEX_COUNT` and the
+  winding stride tests advisory.
+- Vertical chimney slabs on the ridge -- pulled the per-building vertex centroid
+  and failed the outward-winding test; an upward cap keeps the chimney readable
+  from the air without that failure.
+- Selecting kind in the mesh -- violates the Phase 6 rule that the Sector tier
+  owns everything a building is.
+
+### What was measured
+
+Soak (300 s flight, SwiftShader), Phase 7b kinds slice vs layouts slice:
+
+| metric | 7b layouts | 7b kinds | budget |
+| ------ | ---------- | -------- | ------ |
+| draw calls peak | 300 | 293 | 680 |
+| payload bytes peak | 105.5 MB | 104.9 MB | 120 MB |
+| heap unexplained | +0.60 MB/min | +0.39 MB/min | 6 MB/min |
+| buildings seen | 10,595 | 9,701 | floor 3,000 |
+| kinds C/B/H | n/a | **6229 / 1899 / 1573** | floor 1 each |
+| layouts R/L/G/H | 224/20/25/8 | 222/19/25/8 | floor 1 each |
+| building tris peak | | 27,144 (18×1508) | |
+
+Kinds did not force a budget raise. Building triangle peak matches the new
+fixed 18-tri cost. Soak openPage timeout raised 60→120 s to match
+`READY_TIMEOUT_MS` after first-frame SwiftShader work started clipping 60 s.
+
+`shots:repeat --repeat=3` stable on `settlement-buildings`,
+`settlement-buildings-shallow`, `settlement-buildings-wireframe`. Baselines
+re-captured for all 46 views.
+
+### Harness: reused-page `shots:check` (wall-clock)
+
+Parallel Chromium sharding was tried and **rejected on this machine**: four
+SwiftShader processes contended past the ready timeout, and even two jobs
+produced `net::ERR_ABORTED` / timeout noise that hid the real failures. Kept
+instead:
+
+- **One browser, one reused page** -- `page.goto` + `__worldReady` + screenshot
+  per view (no `newContext` per view). Crash recovery recreates the context once
+  if SwiftShader kills the renderer mid-run.
+- **`--no-build`** on `shots` / `shots:check` (same as `shots:repeat`) so a warm
+  `dist/` is not rebuilt every iteration.
+
+Measured on Windows / SwiftShader with `--no-build`: **all 46 views
+byte-identical in 915 s (~15 min)**. Shaded views land around 14–19 s; wireframe
+around 26–48 s. A solitary fresh-context capture of `cube-default` earlier in
+the same session cost ~59 s, so the reuse path is roughly 2–3× on the per-view
+tax. `shots:repeat --repeat=3 --no-build cube-default cube-wireframe` stayed
+STABLE (same hashes as the baselines). Multi-process sharding stays out:
+`shots:repeat` must keep one-process order to catch Phase 6a-style flakes.
+
+### Known gaps, deliberately left
+
+- Prop / vegetation species and clustering (slice 3).
+- Richer facades (multi-face chimneys, porches) that would force variable
+  budgets or a second mesh.
+- Kind bias by layout family or centrality -- pure index hash only for now.
+
+### For slice 3 (before marking 7b Done)
+
+Slice 3 code is below. Do not mark the phase table row Done until soak / shots
+are re-run and the budget row is filled in.
+
+## Phase 7c / 7b slice 3 -- Prop & vegetation species (code landed; validation deferred)
+
+Phase 7c is the user-facing name for **7b slice 3**: species / size / clustering
+on the 7a props pipeline. Layouts (slice 1) and building kinds (slice 2) already
+mixed village shape and frontage; this slice mixes **what grows between the
+houses** without a second placement system.
+
+### What was built
+
+- **Global species IDs in `props.ts`** -- `SPECIES_PINE` / `BROADLEAF` /
+  `BUSH_ROUND` / `BUSH_TALL` / `CRATE` / `POST`. Stored on `PropField.species`
+  (SoA); kind still says tree/bush/crate/post.
+- **`pickTreeSpecies` / `pickBushSpecies`** -- ~55/45 pine/broadleaf and
+  round/tall from `hashUnit(hash3i(...))`. Yard crate/post map species to the
+  matching role.
+- **Size classes** -- sapling / adult / elder bands from the existing scale salt
+  inside each kind's `PROP_*_SCALE_MIN/MAX` (no new vertex cost).
+- **World-only clustering** -- `CLUSTER_STRIDE = 3`; grove hash modulates the
+  accept threshold by `lerp(0.55, 1.35, grove)`, softened with a 4-neighbour
+  blend so density stays near the 7a baseline.
+- **`prop-mesh.ts`** -- pine vs broadleaf (different trunk/canopy radii/heights,
+  still 2 boxes); bush round vs tall (still 1 box); slight crate/post dimension
+  tweaks. Counters `pine` / `broadleaf` / `bushRound` / `bushTall` / `yard`.
+- **`ChunkData` v12** -- additive `propsPine` / `propsBroadleaf` /
+  `propsBushRound` / `propsBushTall` / `propsYard`. Streamer cumulative
+  `propsSeen*` + HUD `prop-species` + soak `MIN_PROP_SPECIES_SEEN = 1` each.
+
+### Rejected
+
+- Selecting species in the mesh -- placement owns the decision; mesh only reads.
+- Variable per-species vertex budgets -- would break the fixed tree=2-box /
+  other=1-box cost the winding tests rely on.
+- Sparse third tree band mapped through scale only -- soak simplicity prefers
+  two tree species with clear counters.
+
+### What was measured
+
+**Deferred** -- user asked to validate (soak / shots / full suite) after
+implementation. Unit tests for species membership, pine+broadleaf and bush
+round+tall presence, determinism including `species`, and mesh counter sums
+were added; `npm test` / `tsc` should be green for those. Fill the soak budget
+row here before marking 7b Done.
+
+### Known gaps, deliberately left
+
+- Soak / shots re-baselines and the measured budget table for this slice.
+- Palette colour bands per species (mesh still mixes the shared trunk/canopy
+  tints); silhouette differs, colour family does not yet.
+- Grove clustering is world-lattice only; yard props stay sparse and unclustered.
+
+### For marking 7b Done
+
+- Run `npm test`, `npx tsc --noEmit`, `npm run soak`, and `npm run shots:check`
+  (shots only if rendered silhouettes moved baselines).
+- Record the soak species-seen row and confirm no quiet budget raise.
+- Then flip the phase table to Done.
+

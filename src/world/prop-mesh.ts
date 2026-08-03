@@ -33,6 +33,9 @@ import {
   PROP_MAX_PER_NODE,
   PROP_SEAT_LOD,
   PROP_SEAT_TOLERANCE,
+  SPECIES_BROADLEAF,
+  SPECIES_BUSH_TALL,
+  SPECIES_CRATE,
   type PropField,
 } from './props';
 import { type RegionRoadField } from './roads';
@@ -96,6 +99,12 @@ export interface PropSurface {
    * says they sit on ground the world actually made.
    */
   seated: number;
+  /** Species / yard-role counters (`SPECIES_*`). Sum equals `count`. */
+  pine: number;
+  broadleaf: number;
+  bushRound: number;
+  bushTall: number;
+  yard: number;
 }
 
 /** LINEAR rgb palette a prop is painted with. */
@@ -120,6 +129,11 @@ const EMPTY_PROPS: () => PropSurface = () => ({
   indices: new Uint32Array(0),
   count: 0,
   seated: 0,
+  pine: 0,
+  broadleaf: 0,
+  bushRound: 0,
+  bushTall: 0,
+  yard: 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -139,6 +153,11 @@ class PropBuilder {
   readonly indices: number[] = [];
   count = 0;
   seated = 0;
+  pine = 0;
+  broadleaf = 0;
+  bushRound = 0;
+  bushTall = 0;
+  yard = 0;
   countSeated = true;
 
   vertex(
@@ -188,6 +207,11 @@ class PropBuilder {
       indices: Uint32Array.from(this.indices),
       count: this.count,
       seated: this.seated,
+      pine: this.pine,
+      broadleaf: this.broadleaf,
+      bushRound: this.bushRound,
+      bushTall: this.bushTall,
+      yard: this.yard,
     };
   }
 }
@@ -366,6 +390,7 @@ function addProp(
   const scale = props.scale[i] as number;
   const tint = props.tint[i] as number;
   const kind = props.kind[i] as number;
+  const species = props.species[i] as number;
 
   const bottom = stumpBase(groundAt, localX, localZ, baseY);
   const ground = groundAt(localX, localZ);
@@ -376,45 +401,54 @@ function addProp(
   if (kind === PROP_KIND_TREE) {
     const trunk = mixRgb(palette.trunkA, palette.trunkB, tint);
     const canopy = mixRgb(palette.canopyA, palette.canopyB, tint);
-    const trunkH = 2.4 * scale;
-    const trunkR = 0.22 * scale;
+    const pine = species !== SPECIES_BROADLEAF;
+    // Same 2-box cost; pine taller/narrower, broadleaf shorter/wider canopy.
+    const trunkH = (pine ? 2.7 : 2.2) * scale;
+    const trunkR = (pine ? 0.18 : 0.26) * scale;
     const midY = (bottom + baseY + trunkH) * 0.5;
     const halfH = (baseY + trunkH - bottom) * 0.5;
     boxAt(b, localX, midY, localZ, trunkR, halfH, trunkR, dirX, dirZ, trunk, palette.stump);
-    const canopyY = baseY + trunkH + 1.1 * scale;
-    const canopyR = 1.15 * scale;
-    const canopyH = 1.1 * scale;
+    const canopyY = baseY + trunkH + (pine ? 1.0 : 1.2) * scale;
+    const canopyR = (pine ? 0.95 : 1.35) * scale;
+    const canopyH = (pine ? 1.25 : 1.0) * scale;
     boxAt(b, localX, canopyY, localZ, canopyR, canopyH, canopyR, dirX, dirZ, canopy, null);
+    if (pine) b.pine++;
+    else b.broadleaf++;
     return;
   }
 
   if (kind === PROP_KIND_BUSH) {
     const bush = mixRgb(palette.bushA, palette.bushB, tint);
-    const h = 0.55 * scale;
-    const r = 0.7 * scale;
+    const tall = species === SPECIES_BUSH_TALL;
+    const h = (tall ? 0.75 : 0.5) * scale;
+    const r = (tall ? 0.55 : 0.8) * scale;
     const midY = (bottom + baseY + h * 2) * 0.5;
     const halfH = (baseY + h * 2 - bottom) * 0.5;
     boxAt(b, localX, midY, localZ, r, halfH, r, dirX, dirZ, bush, palette.stump);
+    if (tall) b.bushTall++;
+    else b.bushRound++;
     return;
   }
 
-  if (kind === PROP_KIND_CRATE) {
+  if (kind === PROP_KIND_CRATE || species === SPECIES_CRATE) {
     const crate = mixRgb(palette.crateA, palette.crateB, tint);
-    const h = 0.35 * scale;
-    const r = 0.32 * scale;
+    const h = 0.38 * scale;
+    const r = 0.34 * scale;
     const midY = (bottom + baseY + h * 2) * 0.5;
     const halfH = (baseY + h * 2 - bottom) * 0.5;
     boxAt(b, localX, midY, localZ, r, halfH, r, dirX, dirZ, crate, palette.stump);
+    b.yard++;
     return;
   }
 
   // post
   const post = mixRgb(palette.postA, palette.postB, tint);
-  const h = 1.1 * scale;
-  const r = 0.08 * scale;
+  const h = 1.2 * scale;
+  const r = 0.07 * scale;
   const midY = (bottom + baseY + h) * 0.5;
   const halfH = (baseY + h - bottom) * 0.5;
   boxAt(b, localX, midY, localZ, r, halfH, r, dirX, dirZ, post, palette.stump);
+  b.yard++;
 }
 
 /**

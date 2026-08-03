@@ -178,6 +178,30 @@ export interface ChunkStreamerStats {
    * at a five-second interval if only an instantaneous peak is kept.
    */
   propsSeen: number;
+  /**
+   * Chunks generated carrying each village layout family. CUMULATIVE. A floor
+   * on each is what stops a ring-only world from passing Phase 7b soak checks.
+   */
+  layoutSeenRing: number;
+  layoutSeenLinear: number;
+  layoutSeenGrid: number;
+  layoutSeenHilltop: number;
+  /**
+   * Buildings generated of each kind. CUMULATIVE -- same reason as
+   * `layoutSeen*`: a cottage-only world must fail soak, not pass on total count.
+   */
+  buildingsSeenCottage: number;
+  buildingsSeenBarn: number;
+  buildingsSeenHall: number;
+  /**
+   * Props generated of each species / yard role. CUMULATIVE -- same reason as
+   * `buildingsSeen*`: a pine-only world must fail soak, not pass on total count.
+   */
+  propsSeenPine: number;
+  propsSeenBroadleaf: number;
+  propsSeenBushRound: number;
+  propsSeenBushTall: number;
+  propsSeenYard: number;
   /** Nodes the quadtree currently wants resident. */
   selected: number;
   /** Selected nodes per level, index = lod. */
@@ -236,6 +260,16 @@ export class ChunkStreamer {
   private buildingsSeenCount = 0;
   /** Props ever generated. Monotone, for `buildingsSeenCount`'s reason. */
   private propsSeenCount = 0;
+  /** Chunks ever generated per village layout family. Monotone; see `stats`. */
+  private layoutSeenCounts = [0, 0, 0, 0];
+  private buildingsSeenCottageCount = 0;
+  private buildingsSeenBarnCount = 0;
+  private buildingsSeenHallCount = 0;
+  private propsSeenPineCount = 0;
+  private propsSeenBroadleafCount = 0;
+  private propsSeenBushRoundCount = 0;
+  private propsSeenBushTallCount = 0;
+  private propsSeenYardCount = 0;
   private hasUpdated = false;
   private enabled = true;
   private disposed = false;
@@ -359,7 +393,18 @@ export class ChunkStreamer {
       // between samples.
       if (data.bridgeVertices > 0) this.bridgeNodeCount++;
       this.buildingsSeenCount += data.buildings;
+      this.buildingsSeenCottageCount += data.buildingsCottage;
+      this.buildingsSeenBarnCount += data.buildingsBarn;
+      this.buildingsSeenHallCount += data.buildingsHall;
       this.propsSeenCount += data.props;
+      this.propsSeenPineCount += data.propsPine;
+      this.propsSeenBroadleafCount += data.propsBroadleaf;
+      this.propsSeenBushRoundCount += data.propsBushRound;
+      this.propsSeenBushTallCount += data.propsBushTall;
+      this.propsSeenYardCount += data.propsYard;
+      if (data.streetLayout >= 0 && data.streetLayout < this.layoutSeenCounts.length) {
+        this.layoutSeenCounts[data.streetLayout]!++;
+      }
       this.arrived.push(data);
       this.arrivedKeys.add(key);
     });
@@ -676,6 +721,18 @@ export class ChunkStreamer {
       propsSeated,
       propTriangles,
       propsSeen: this.propsSeenCount,
+      layoutSeenRing: this.layoutSeenCounts[0] as number,
+      layoutSeenLinear: this.layoutSeenCounts[1] as number,
+      layoutSeenGrid: this.layoutSeenCounts[2] as number,
+      layoutSeenHilltop: this.layoutSeenCounts[3] as number,
+      buildingsSeenCottage: this.buildingsSeenCottageCount,
+      buildingsSeenBarn: this.buildingsSeenBarnCount,
+      buildingsSeenHall: this.buildingsSeenHallCount,
+      propsSeenPine: this.propsSeenPineCount,
+      propsSeenBroadleaf: this.propsSeenBroadleafCount,
+      propsSeenBushRound: this.propsSeenBushRoundCount,
+      propsSeenBushTall: this.propsSeenBushTallCount,
+      propsSeenYard: this.propsSeenYardCount,
       selected: this.desired.size,
       lodCounts: lodHistogram(this.selection.leaves, this.selection.rootLod),
       viewDistance: this.viewDistance,
@@ -940,10 +997,34 @@ export class ChunkStreamer {
       HudOrder.world,
     );
     hud.register(
+      'layouts',
+      () => {
+        const s = this.stats();
+        return `R${s.layoutSeenRing} L${s.layoutSeenLinear} G${s.layoutSeenGrid} H${s.layoutSeenHilltop} seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
       'decks',
       () => {
         const s = this.stats();
         return `${s.deckNodes} nodes / ${s.deckTriangles} tris / ${s.bridgeVertices} bridge verts live / ${s.bridgeNodes} bridge nodes seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'building-kinds',
+      () => {
+        const s = this.stats();
+        return `C${s.buildingsSeenCottage} B${s.buildingsSeenBarn} H${s.buildingsSeenHall} seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'prop-species',
+      () => {
+        const s = this.stats();
+        return `P${s.propsSeenPine} L${s.propsSeenBroadleaf} R${s.propsSeenBushRound} T${s.propsSeenBushTall} Y${s.propsSeenYard} seen`;
       },
       HudOrder.world,
     );

@@ -165,18 +165,35 @@ const YARD_SCALE_SALT = 0x7059_5363;
 const YARD_TINT_SALT = 0x7059_546e;
 const YARD_DIR_SALT = 0x7059_4469;
 const YARD_SIDE_SALT = 0x7059_5364;
+const CELL_SPECIES_SALT = 0x7052_5370;
+const YARD_SPECIES_SALT = 0x7059_5370;
+const CLUSTER_SALT = 0x7052_436c;
+
+/** World-prop grove stride in cells. Density is modulated per 3x3 block. */
+export const CLUSTER_STRIDE = 3;
 
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
 
-/** Sparse kind set for Phase 7a. Species proliferation is Phase 7b. */
+/** Sparse kind set for Phase 7a. Species proliferation is Phase 7b / 7c. */
 export type PropKind = 'tree' | 'bush' | 'crate' | 'post';
 
 export const PROP_KIND_TREE = 0;
 export const PROP_KIND_BUSH = 1;
 export const PROP_KIND_CRATE = 2;
 export const PROP_KIND_POST = 3;
+
+/**
+ * Global species / yard-role IDs. Kind still says tree/bush/crate/post; species
+ * picks the silhouette family the mesh reads. Yard roles equal their kind.
+ */
+export const SPECIES_PINE = 0;
+export const SPECIES_BROADLEAF = 1;
+export const SPECIES_BUSH_ROUND = 2;
+export const SPECIES_BUSH_TALL = 3;
+export const SPECIES_CRATE = 4;
+export const SPECIES_POST = 5;
 
 /** Integer tag for a kind, so SoA storage stays typed-array clean. */
 export function propKindId(kind: PropKind): number {
@@ -224,6 +241,8 @@ export interface PropField {
   /** Palette pick in [0, 1]. */
   readonly tint: Float64Array;
   readonly kind: Uint8Array;
+  /** Species / yard-role id (`SPECIES_*`). */
+  readonly species: Uint8Array;
   readonly count: number;
 }
 
@@ -240,6 +259,7 @@ export function emptyPropField(): PropField {
     scale: EMPTY_F64,
     tint: EMPTY_F64,
     kind: EMPTY_U8,
+    species: EMPTY_U8,
     count: 0,
   };
 }
@@ -253,6 +273,7 @@ interface PropAccumulator {
   readonly sc: number[];
   readonly tn: number[];
   readonly kd: number[];
+  readonly sp: number[];
 }
 
 function finishProps(acc: PropAccumulator): PropField {
@@ -267,6 +288,7 @@ function finishProps(acc: PropAccumulator): PropField {
     scale: Float64Array.from(acc.sc),
     tint: Float64Array.from(acc.tn),
     kind: Uint8Array.from(acc.kd),
+    species: Uint8Array.from(acc.sp),
     count,
   };
 }
@@ -430,12 +452,57 @@ function clearOfInfrastructure(
   return true;
 }
 
+
+/**
+ * Tree species: ~55% pine / ~45% broadleaf. Pure of (worldSeed, cell).
+ */
+export function pickTreeSpecies(worldSeed: number, cellX: number, cellZ: number): number {
+  const bucket = Math.floor(hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_SPECIES_SALT)) * 100);
+  return bucket < 55 ? SPECIES_PINE : SPECIES_BROADLEAF;
+}
+
+/**
+ * Bush species: ~55% round / ~45% tall. Pure of (worldSeed, cell).
+ */
+export function pickBushSpecies(worldSeed: number, cellX: number, cellZ: number): number {
+  const bucket = Math.floor(hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_SPECIES_SALT)) * 100);
+  return bucket < 55 ? SPECIES_BUSH_ROUND : SPECIES_BUSH_TALL;
+}
+
+/**
+ * Size-class bands from an existing [0,1] scale salt: sapling / adult / elder
+ * within the kind's PROP_*_SCALE_MIN/MAX. Keeps vertex cost fixed; only scale changes.
+ */
+function sizeClassScale(min: number, max: number, u: number): number {
+  const band = u < 1 / 3 ? 0 : u < 2 / 3 ? 1 : 2;
+  const t = (band + 0.5) / 3;
+  return lerp(min, max, t);
+}
+
+/**
+ * Grove density factor for world props. Self grove blended with 4-neighbour
+ * average so edges soften without changing the deterministic cell accept.
+ */
+function groveFactor(worldSeed: number, cellX: number, cellZ: number): number {
+  const gx = Math.floor(cellX / CLUSTER_STRIDE);
+  const gz = Math.floor(cellZ / CLUSTER_STRIDE);
+  const self = hashUnit(hash3i(gx, gz, worldSeed ^ CLUSTER_SALT));
+  const n0 = hashUnit(hash3i(gx - 1, gz, worldSeed ^ CLUSTER_SALT));
+  const n1 = hashUnit(hash3i(gx + 1, gz, worldSeed ^ CLUSTER_SALT));
+  const n2 = hashUnit(hash3i(gx, gz - 1, worldSeed ^ CLUSTER_SALT));
+  const n3 = hashUnit(hash3i(gx, gz + 1, worldSeed ^ CLUSTER_SALT));
+  const neigh = (n0 + n1 + n2 + n3) * 0.25;
+  const grove = self * 0.5 + neigh * 0.5;
+  return lerp(0.55, 1.35, grove);
+}
+
 function pushProp(
   acc: PropAccumulator,
   x: number,
   z: number,
   worldSeed: number,
   kind: PropKind,
+  species: number,
   scale: number,
   tint: number,
   dirSalt: number,
@@ -452,6 +519,7 @@ function pushProp(
   acc.sc.push(scale);
   acc.tn.push(tint);
   acc.kd.push(propKindId(kind));
+  acc.sp.push(species);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,9 +552,9 @@ function tryWorldProp(
   const grow = biomeCanGrow(x, z, worldSeed);
   if (grow <= 0) return;
 
-  const accept =
-    hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_ACCEPT_SALT)) <
-    PROP_ACCEPT_BASE * (0.35 + 0.65 * grow);
+  const threshold =
+    PROP_ACCEPT_BASE * (0.35 + 0.65 * grow) * groveFactor(worldSeed, cellX, cellZ);
+  const accept = hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_ACCEPT_SALT)) < threshold;
   if (!accept) return;
 
   const base = sampleHeight(x, z, worldSeed);
@@ -498,14 +566,18 @@ function tryWorldProp(
 
   const kindRoll = hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_KIND_SALT));
   const kind: PropKind = kindRoll < PROP_BUSH_FRACTION ? 'bush' : 'tree';
+  const species =
+    kind === 'bush'
+      ? pickBushSpecies(worldSeed, cellX, cellZ)
+      : pickTreeSpecies(worldSeed, cellX, cellZ);
   const scaleU = hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_SCALE_SALT));
   const scale =
     kind === 'bush'
-      ? lerp(PROP_BUSH_SCALE_MIN, PROP_BUSH_SCALE_MAX, scaleU)
-      : lerp(PROP_TREE_SCALE_MIN, PROP_TREE_SCALE_MAX, scaleU);
+      ? sizeClassScale(PROP_BUSH_SCALE_MIN, PROP_BUSH_SCALE_MAX, scaleU)
+      : sizeClassScale(PROP_TREE_SCALE_MIN, PROP_TREE_SCALE_MAX, scaleU);
   const tint = hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_TINT_SALT));
 
-  pushProp(acc, x, z, worldSeed, kind, scale, tint, CELL_DIR_SALT, cellX, cellZ);
+  pushProp(acc, x, z, worldSeed, kind, species, scale, tint, CELL_DIR_SALT, cellX, cellZ);
 }
 
 // ---------------------------------------------------------------------------
@@ -561,14 +633,16 @@ function tryYardProps(
 
       const kindRoll = hashUnit(hash3i(rec.sectorX, index, worldSeed ^ YARD_KIND_SALT));
       const kind: PropKind = kindRoll < 0.55 ? 'crate' : 'post';
+      const species = kind === 'crate' ? SPECIES_CRATE : SPECIES_POST;
+      void YARD_SPECIES_SALT;
       const scaleU = hashUnit(hash3i(rec.sectorX, index, worldSeed ^ YARD_SCALE_SALT));
       const scale =
         kind === 'crate'
-          ? lerp(PROP_CRATE_SCALE_MIN, PROP_CRATE_SCALE_MAX, scaleU)
-          : lerp(PROP_POST_SCALE_MIN, PROP_POST_SCALE_MAX, scaleU);
+          ? sizeClassScale(PROP_CRATE_SCALE_MIN, PROP_CRATE_SCALE_MAX, scaleU)
+          : sizeClassScale(PROP_POST_SCALE_MIN, PROP_POST_SCALE_MAX, scaleU);
       const tint = hashUnit(hash3i(rec.sectorX, index, worldSeed ^ YARD_TINT_SALT));
 
-      pushProp(acc, x, z, worldSeed, kind, scale, tint, YARD_DIR_SALT + index, rec.sectorX, index);
+      pushProp(acc, x, z, worldSeed, kind, species, scale, tint, YARD_DIR_SALT + index, rec.sectorX, index);
     }
   }
 }
@@ -605,6 +679,7 @@ export function collectNodeProps(
     sc: [],
     tn: [],
     kd: [],
+    sp: [],
   };
 
   const cellMinX = Math.floor(minX / PROP_CELL) - 1;

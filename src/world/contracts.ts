@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 9;
+export const CHUNK_DATA_VERSION = 12;
 
 /**
  * The result of generating one chunk.
@@ -324,6 +324,13 @@ export interface ChunkData {
    */
   readonly streetVertices: number;
   /**
+   * Layout family (`LAYOUT_*` in `streets.ts`) of the settlement whose streets
+   * reach this node, or `-1` when none do. Scalar for soak / HUD anti-vacuity:
+   * without it, a ring-only world and a mixed-layout world produce identical
+   * street-vertex evidence.
+   */
+  readonly streetLayout: number;
+  /**
    * The Phase 5 road and street DECK: the made carriageway surface, as its own
    * submesh, in the same node-local frame as `positions`.
    *
@@ -382,7 +389,7 @@ export interface ChunkData {
   /**
    * Buildings this node owns -- i.e. whose centre lies in its square.
    *
-   * Not derivable from the buffers: every building has the same 30 vertices, so
+   * Not derivable from the buffers: every building has the same 38 vertices, so
    * a vertex count cannot distinguish "forty houses" from "one enormous one",
    * and the streamer's HUD and the soak both want the object count.
    */
@@ -400,6 +407,14 @@ export interface ChunkData {
    * leaves `buildings` untouched and drives this to zero.
    */
   readonly buildingsLevel: number;
+  /**
+   * Kind breakdown of `buildings` (`KIND_*` in `lots.ts`). Additive soak /
+   * HUD counters: without them a cottage-only world and a mixed-kind world
+   * produce identical `buildings` evidence.
+   */
+  readonly buildingsCottage: number;
+  readonly buildingsBarn: number;
+  readonly buildingsHall: number;
   /**
    * The Phase 7a PROPS of this node -- world vegetation and sparse yard clutter
    * -- batched into one submesh, in the same node-local frame as `positions`.
@@ -434,6 +449,16 @@ export interface ChunkData {
    * stump / seating path leaves `props` untouched and drives this to zero.
    */
   readonly propsSeated: number;
+  /**
+   * Species / yard-role breakdown of `props` (`SPECIES_*` in `props.ts`).
+   * Additive soak / HUD counters: without them a pine-only world and a mixed
+   * species world produce identical `props` evidence.
+   */
+  readonly propsPine: number;
+  readonly propsBroadleaf: number;
+  readonly propsBushRound: number;
+  readonly propsBushTall: number;
+  readonly propsYard: number;
   /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
