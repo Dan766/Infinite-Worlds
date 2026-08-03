@@ -234,6 +234,31 @@
       "name": "vegetation-wireframe",
       "params": "?time=3&pos=-6496,120,-3680&look=0,-70&wireframe=1",
       "expect": "Phase 7a. The structural claim of the phase in one image: props are A SEPARATE MESH, batched per node. Terrain lattice and tree/bush boxes are distinct geometries; ownership is by centre and geometry is not clipped. A stump that hung unbounded down a bank would show here as a curtain of vertical edges, the same failure mode buildings have with an unbounded plinth."
+    },
+    {
+      "name": "city-aerial",
+      "params": "?time=3&pos=-32612,1250,-28480&look=0,-88",
+      "expect": "Medieval City C2. Default-seed city cell (-64,-56), seen whole: multi-sector curtain wall, clipped arteries, landmark roofs and farmland belt."
+    },
+    {
+      "name": "city-gate-approach",
+      "params": "?time=3&pos=-31980,72,-28480&look=90,-8",
+      "expect": "Medieval City C2. Ground-level approach toward the eastern wall; roads must terminate at a gate rather than tunnel through the curtain."
+    },
+    {
+      "name": "city-market",
+      "params": "?time=3&pos=-32470,125,-28410&look=-110,-45",
+      "expect": "Medieval City C2. Interior district view framing dense townhouse frontage and the reserved market/civic footprint."
+    },
+    {
+      "name": "city-keep",
+      "params": "?time=3&walk=1&pos=-32570,55,-28480&look=90,-8",
+      "expect": "Medieval City C4. Walk-mode view at the default city's keep, exercising the near-landmark interior overlay."
+    },
+    {
+      "name": "city-farmland",
+      "params": "?time=3&pos=-31780,180,-28480&look=90,-22",
+      "expect": "Medieval City C2. View from the Region-owned farmland belt back toward the curtain wall and city skyline."
     }
   ]
 }

@@ -10,6 +10,7 @@
 import * as THREE from 'three';
 import { Autopilot } from './core/autopilot';
 import { CameraRig } from './core/camera-rig';
+import { PlayerController } from './core/player-controller';
 import { Loop } from './core/loop';
 import { hasParam, parseParams, serializeParams, type AppParams } from './core/params';
 import { FrameTimer } from './debug/frame-timer';
@@ -28,13 +29,17 @@ import {
   resetRiverDraws,
   resetRoadDraws,
   resetStreetDraws,
+  resetWallDraws,
   resetWaterDraws,
   riverDrawsSinceReset,
   roadDrawsSinceReset,
   streetDrawsSinceReset,
+  wallDrawsSinceReset,
   waterDrawsSinceReset,
 } from './world/chunk-mesh';
 import { sampleHeight } from './world/height-field';
+import { createWorldCollision } from './world/collision';
+import { InteriorOverlay } from './world/interior-overlay';
 
 declare global {
   interface Window {
@@ -78,6 +83,8 @@ export class App {
   private readonly panel: DebugPanel;
   private readonly frameTimer = new FrameTimer();
   private readonly loop: Loop;
+  private readonly player: PlayerController | null;
+  private readonly interiors: InteriorOverlay;
 
   private renderedFrames = 0;
   /**
@@ -125,6 +132,7 @@ export class App {
    * folding into `deckDrawCalls`.
    */
   private buildingDrawCalls = 0;
+  private wallDrawCalls = 0;
   private propDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
@@ -142,6 +150,9 @@ export class App {
           y: sampleHeight(this.params.pos.x, this.params.pos.z, this.params.seedHash) + this.params.pos.y,
         };
     this.rig = new CameraRig(start, this.params.look);
+    this.player = this.params.walk
+      ? new PlayerController(this.rig, createWorldCollision(this.params.seedHash))
+      : null;
     this.cube = new CubeScene(this.params.seedHash);
     this.hud = new Hud(hudElement, { visible: this.params.hud });
     this.panel = new DebugPanel({ visible: this.params.panel, title: 'Infinite World' });
@@ -153,8 +164,9 @@ export class App {
       onSceneChanged: () => this.renderer.invalidateMaterials(),
     });
     this.autopilot = new Autopilot(this.params.fly, this.params.flyLeg);
+    this.interiors = new InteriorOverlay(this.params.seedHash);
 
-    this.scene.add(this.cube.root, this.streamer.root);
+    this.scene.add(this.cube.root, this.streamer.root, this.interiors.root);
     this.addLighting();
 
     this.renderer.setWireframe(this.params.wireframe);
@@ -179,7 +191,8 @@ export class App {
     // above, by label. See `Hud.register`.
     this.streamer.registerDebug(this.hud, this.panel);
 
-    this.rig.attach(canvas);
+    if (this.player === null) this.rig.attach(canvas);
+    else this.player.attach(canvas);
     window.addEventListener('resize', this.onResize);
     window.addEventListener('keydown', this.onKeyDown);
     this.onResize();
@@ -192,11 +205,13 @@ export class App {
   dispose(): void {
     this.loop.stop();
     this.rig.detach();
+    this.player?.detach();
     window.removeEventListener('resize', this.onResize);
     window.removeEventListener('keydown', this.onKeyDown);
     this.panel.destroy();
     this.cube.dispose();
     this.streamer.dispose();
+    this.interiors.dispose();
     this.renderer.dispose();
   }
 
@@ -303,6 +318,13 @@ export class App {
       buildingTriangles: chunks.buildingTriangles,
       buildingsSeen: chunks.buildingsSeen,
       buildingDrawCalls: this.buildingDrawCalls,
+      wallNodes: chunks.wallNodes,
+      walls: chunks.walls,
+      wallTriangles: chunks.wallTriangles,
+      wallsSeen: chunks.wallsSeen,
+      citiesSeen: chunks.citiesSeen,
+      wallDrawCalls: this.wallDrawCalls,
+      interiorsEntered: this.interiors.interiorsEntered,
       // Phase 7a. Same trio once more: residency, rasteriser, seating.
       propNodes: chunks.propNodes,
       props: chunks.props,
@@ -315,9 +337,17 @@ export class App {
       layoutSeenLinear: chunks.layoutSeenLinear,
       layoutSeenGrid: chunks.layoutSeenGrid,
       layoutSeenHilltop: chunks.layoutSeenHilltop,
+      layoutSeenCity: chunks.layoutSeenCity,
       buildingsSeenCottage: chunks.buildingsSeenCottage,
       buildingsSeenBarn: chunks.buildingsSeenBarn,
       buildingsSeenHall: chunks.buildingsSeenHall,
+      buildingsSeenTownhouse: chunks.buildingsSeenTownhouse,
+      buildingsSeenGuildhall: chunks.buildingsSeenGuildhall,
+      buildingsSeenWarehouse: chunks.buildingsSeenWarehouse,
+      buildingsSeenKeep: chunks.buildingsSeenKeep,
+      buildingsSeenCathedral: chunks.buildingsSeenCathedral,
+      buildingsSeenTownhall: chunks.buildingsSeenTownhall,
+      buildingsSeenGatehouse: chunks.buildingsSeenGatehouse,
       propsSeenPine: chunks.propsSeenPine,
       propsSeenBroadleaf: chunks.propsSeenBroadleaf,
       propsSeenBushRound: chunks.propsSeenBushRound,
@@ -468,7 +498,8 @@ export class App {
   }
 
   private renderFrame(wallDt: number): void {
-    this.rig.update(wallDt);
+    if (this.player === null) this.rig.update(wallDt);
+    else this.player.update(wallDt);
     // THE FLIGHT DOES NOT START UNTIL THE WORLD IS READY, and that is a Phase 4b
     // correctness fix rather than a tidy-up. The autopilot used to advance from
     // the first rendered frame, so it was already moving while the world
@@ -491,6 +522,11 @@ export class App {
       this.rig.setPosition(this.autopilot.advance(wallDt, p.x), p.y, p.z);
     }
     this.streamer.update(this.rig.camera.position);
+    this.interiors.update(
+      this.rig.camera.position.x,
+      this.rig.camera.position.z,
+      this.params.walk,
+    );
     this.frameTimer.sample(wallDt);
     resetWaterDraws();
     resetRiverDraws();
@@ -498,6 +534,7 @@ export class App {
     resetStreetDraws();
     resetDeckDraws();
     resetBuildingDraws();
+    resetWallDraws();
     resetPropDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
@@ -506,6 +543,7 @@ export class App {
     this.streetDrawCalls = streetDrawsSinceReset();
     this.deckDrawCalls = deckDrawsSinceReset();
     this.buildingDrawCalls = buildingDrawsSinceReset();
+    this.wallDrawCalls = wallDrawsSinceReset();
     this.propDrawCalls = propDrawsSinceReset();
     this.hud.update(wallDt);
 
@@ -555,6 +593,8 @@ export class App {
     hud.register('street draws', () => this.streetDrawCalls, HudOrder.render);
     hud.register('deck draws', () => this.deckDrawCalls, HudOrder.render);
     hud.register('building draws', () => this.buildingDrawCalls, HudOrder.render);
+    hud.register('wall draws', () => this.wallDrawCalls, HudOrder.render);
+    hud.register('interiors entered', () => this.interiors.interiorsEntered, HudOrder.world);
     hud.register('prop draws', () => this.propDrawCalls, HudOrder.render);
 
     hud.register(

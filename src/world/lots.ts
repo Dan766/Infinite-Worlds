@@ -80,6 +80,16 @@ import {
   type Settlement,
 } from './roads';
 import { STREET_MAX_EXTENT, type SectorStreetField, type SectorStreets } from './streets';
+import {
+  cityPlanAt,
+  isCity,
+  LANDMARK_CATHEDRAL,
+  LANDMARK_GATEHOUSE,
+  LANDMARK_GUILD,
+  LANDMARK_KEEP,
+  LANDMARK_MARKET,
+  LANDMARK_TOWNHALL,
+} from './city';
 
 // ---------------------------------------------------------------------------
 // What this tier is allowed to read
@@ -187,6 +197,13 @@ export const LOT_MAX_BUILDINGS = 256;
 export const KIND_COTTAGE = 0;
 export const KIND_BARN = 1;
 export const KIND_HALL = 2;
+export const KIND_TOWNHOUSE = 3;
+export const KIND_GUILDHALL = 4;
+export const KIND_WAREHOUSE = 5;
+export const KIND_KEEP = 6;
+export const KIND_CATHEDRAL = 7;
+export const KIND_TOWNHALL = 8;
+export const KIND_GATEHOUSE = 9;
 
 /** Half-footprint ranges per kind, metres. The exported MAX below is the global cap. */
 const COTTAGE_HALF_WIDTH = { min: 2.6, max: 4.8 };
@@ -366,6 +383,12 @@ function unitAt(site: Settlement, index: number, worldSeed: number, salt: number
  */
 export function pickBuildingKind(site: Settlement, index: number, worldSeed: number): number {
   const bucket = Math.floor(unitAt(site, index, worldSeed, KIND_SALT) * 100);
+  if (isCity(site)) {
+    if (bucket < 68) return KIND_TOWNHOUSE;
+    if (bucket < 84) return KIND_WAREHOUSE;
+    if (bucket < 94) return KIND_GUILDHALL;
+    return KIND_HALL;
+  }
   if (bucket < 62) return KIND_COTTAGE;
   if (bucket < 84) return KIND_BARN;
   return KIND_HALL;
@@ -480,6 +503,41 @@ export function generateSectorLots(
     cx: [], cz: [], fy: [], ax: [], az: [], hw: [], hd: [], ev: [], rg: [], wt: [], rt: [], kd: [], br: [],
   };
   const scratch = new Float64Array(2);
+
+  // Landmark lots are Region-owned reservations. The sector containing each
+  // landmark centre emits it first, so random frontage lots collide with and
+  // yield to the reserved footprint.
+  if (isCity(site)) {
+    const plan = cityPlanAt(site, worldSeed);
+    if (plan !== undefined) {
+      const minX = coord.x * 512;
+      const minZ = coord.z * 512;
+      for (let landmark = 0; landmark < plan.landmarkCount; landmark++) {
+        const x = plan.landmarkX[landmark] as number;
+        const z = plan.landmarkZ[landmark] as number;
+        if (x < minX || x >= minX + 512 || z < minZ || z >= minZ + 512) continue;
+        const landmarkKind = plan.landmarkKind[landmark] as number;
+        if (landmarkKind === LANDMARK_MARKET) continue;
+        const kind =
+          landmarkKind === LANDMARK_KEEP ? KIND_KEEP :
+          landmarkKind === LANDMARK_CATHEDRAL ? KIND_CATHEDRAL :
+          landmarkKind === LANDMARK_TOWNHALL ? KIND_TOWNHALL :
+          landmarkKind === LANDMARK_GATEHOUSE ? KIND_GATEHOUSE :
+          landmarkKind === LANDMARK_GUILD ? KIND_GUILDHALL : KIND_TOWNHOUSE;
+        const hw = plan.landmarkHalfW[landmark] as number;
+        const hd = plan.landmarkHalfD[landmark] as number;
+        lots.cx.push(x); lots.cz.push(z); lots.fy.push(ground.height(x, z));
+        lots.ax.push(1); lots.az.push(0); lots.hw.push(hw); lots.hd.push(hd);
+        lots.ev.push(kind === KIND_KEEP ? 12 : kind === KIND_CATHEDRAL ? 14 : 8);
+        lots.rg.push(kind === KIND_CATHEDRAL ? 8 : 5);
+        lots.wt.push(unitAt(site, 10_000 + landmark, worldSeed, WALL_SALT));
+        lots.rt.push(unitAt(site, 10_000 + landmark, worldSeed, ROOF_SALT));
+        lots.kd.push(kind);
+        lots.br.push(Math.sqrt(hw * hw + hd * hd));
+      }
+    }
+  }
+
   const rimRadius = site.radius * LOT_RIM_FRACTION;
   const streetHalf = rec.halfWidth;
   let index = 0;

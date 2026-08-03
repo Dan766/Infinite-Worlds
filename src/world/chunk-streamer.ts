@@ -156,6 +156,13 @@ export interface ChunkStreamerStats {
   buildingsLevel: number;
   /** Triangles of building geometry in the live nodes. */
   buildingTriangles: number;
+  wallNodes: number;
+  walls: number;
+  wallTriangles: number;
+  /** Wall primitives generated since construction. */
+  wallsSeen: number;
+  /** City-touching nodes generated since construction. */
+  citiesSeen: number;
   /**
    * Buildings generated since construction. CUMULATIVE, for the reason
    * `bridgeNodes` is: a village is a few hundred metres across in a 4 km region,
@@ -186,6 +193,7 @@ export interface ChunkStreamerStats {
   layoutSeenLinear: number;
   layoutSeenGrid: number;
   layoutSeenHilltop: number;
+  layoutSeenCity: number;
   /**
    * Buildings generated of each kind. CUMULATIVE -- same reason as
    * `layoutSeen*`: a cottage-only world must fail soak, not pass on total count.
@@ -193,6 +201,13 @@ export interface ChunkStreamerStats {
   buildingsSeenCottage: number;
   buildingsSeenBarn: number;
   buildingsSeenHall: number;
+  buildingsSeenTownhouse: number;
+  buildingsSeenGuildhall: number;
+  buildingsSeenWarehouse: number;
+  buildingsSeenKeep: number;
+  buildingsSeenCathedral: number;
+  buildingsSeenTownhall: number;
+  buildingsSeenGatehouse: number;
   /**
    * Props generated of each species / yard role. CUMULATIVE -- same reason as
    * `buildingsSeen*`: a pine-only world must fail soak, not pass on total count.
@@ -258,13 +273,22 @@ export class ChunkStreamer {
   private bridgeNodeCount = 0;
   /** Buildings ever generated. Monotone, for `bridgeNodeCount`'s reason. */
   private buildingsSeenCount = 0;
+  private wallsSeenCount = 0;
+  private citiesSeenCount = 0;
   /** Props ever generated. Monotone, for `buildingsSeenCount`'s reason. */
   private propsSeenCount = 0;
   /** Chunks ever generated per village layout family. Monotone; see `stats`. */
-  private layoutSeenCounts = [0, 0, 0, 0];
+  private layoutSeenCounts = [0, 0, 0, 0, 0];
   private buildingsSeenCottageCount = 0;
   private buildingsSeenBarnCount = 0;
   private buildingsSeenHallCount = 0;
+  private buildingsSeenTownhouseCount = 0;
+  private buildingsSeenGuildhallCount = 0;
+  private buildingsSeenWarehouseCount = 0;
+  private buildingsSeenKeepCount = 0;
+  private buildingsSeenCathedralCount = 0;
+  private buildingsSeenTownhallCount = 0;
+  private buildingsSeenGatehouseCount = 0;
   private propsSeenPineCount = 0;
   private propsSeenBroadleafCount = 0;
   private propsSeenBushRoundCount = 0;
@@ -393,9 +417,18 @@ export class ChunkStreamer {
       // between samples.
       if (data.bridgeVertices > 0) this.bridgeNodeCount++;
       this.buildingsSeenCount += data.buildings;
+      this.wallsSeenCount += data.walls;
+      this.citiesSeenCount += data.cityTouch;
       this.buildingsSeenCottageCount += data.buildingsCottage;
       this.buildingsSeenBarnCount += data.buildingsBarn;
       this.buildingsSeenHallCount += data.buildingsHall;
+      this.buildingsSeenTownhouseCount += data.buildingsTownhouse;
+      this.buildingsSeenGuildhallCount += data.buildingsGuildhall;
+      this.buildingsSeenWarehouseCount += data.buildingsWarehouse;
+      this.buildingsSeenKeepCount += data.buildingsKeep;
+      this.buildingsSeenCathedralCount += data.buildingsCathedral;
+      this.buildingsSeenTownhallCount += data.buildingsTownhall;
+      this.buildingsSeenGatehouseCount += data.buildingsGatehouse;
       this.propsSeenCount += data.props;
       this.propsSeenPineCount += data.propsPine;
       this.propsSeenBroadleafCount += data.propsBroadleaf;
@@ -638,6 +671,9 @@ export class ChunkStreamer {
     let buildingsMeasured = 0;
     let buildingsLevel = 0;
     let buildingTriangles = 0;
+    let wallNodes = 0;
+    let walls = 0;
+    let wallTriangles = 0;
     let propNodes = 0;
     let props = 0;
     let propsMeasured = 0;
@@ -674,6 +710,11 @@ export class ChunkStreamer {
         buildingsMeasured += entry.buildingsMeasured;
         buildingsLevel += entry.buildingsLevel;
         buildingTriangles += entry.buildingTriangles;
+      }
+      if (entry.walls > 0) {
+        wallNodes++;
+        walls += entry.walls;
+        wallTriangles += entry.wallTriangles;
       }
       if (entry.props > 0) {
         propNodes++;
@@ -715,6 +756,11 @@ export class ChunkStreamer {
       buildingsLevel,
       buildingTriangles,
       buildingsSeen: this.buildingsSeenCount,
+      wallNodes,
+      walls,
+      wallTriangles,
+      wallsSeen: this.wallsSeenCount,
+      citiesSeen: this.citiesSeenCount,
       propNodes,
       props,
       propsMeasured,
@@ -725,9 +771,17 @@ export class ChunkStreamer {
       layoutSeenLinear: this.layoutSeenCounts[1] as number,
       layoutSeenGrid: this.layoutSeenCounts[2] as number,
       layoutSeenHilltop: this.layoutSeenCounts[3] as number,
+      layoutSeenCity: this.layoutSeenCounts[4] as number,
       buildingsSeenCottage: this.buildingsSeenCottageCount,
       buildingsSeenBarn: this.buildingsSeenBarnCount,
       buildingsSeenHall: this.buildingsSeenHallCount,
+      buildingsSeenTownhouse: this.buildingsSeenTownhouseCount,
+      buildingsSeenGuildhall: this.buildingsSeenGuildhallCount,
+      buildingsSeenWarehouse: this.buildingsSeenWarehouseCount,
+      buildingsSeenKeep: this.buildingsSeenKeepCount,
+      buildingsSeenCathedral: this.buildingsSeenCathedralCount,
+      buildingsSeenTownhall: this.buildingsSeenTownhallCount,
+      buildingsSeenGatehouse: this.buildingsSeenGatehouseCount,
       propsSeenPine: this.propsSeenPineCount,
       propsSeenBroadleaf: this.propsSeenBroadleafCount,
       propsSeenBushRound: this.propsSeenBushRoundCount,
@@ -1000,7 +1054,7 @@ export class ChunkStreamer {
       'layouts',
       () => {
         const s = this.stats();
-        return `R${s.layoutSeenRing} L${s.layoutSeenLinear} G${s.layoutSeenGrid} H${s.layoutSeenHilltop} seen`;
+        return `R${s.layoutSeenRing} L${s.layoutSeenLinear} G${s.layoutSeenGrid} H${s.layoutSeenHilltop} C${s.layoutSeenCity} seen`;
       },
       HudOrder.world,
     );
@@ -1021,6 +1075,14 @@ export class ChunkStreamer {
       HudOrder.world,
     );
     hud.register(
+      'city-building-kinds',
+      () => {
+        const s = this.stats();
+        return `T${s.buildingsSeenTownhouse} G${s.buildingsSeenGuildhall} W${s.buildingsSeenWarehouse} K${s.buildingsSeenKeep} C${s.buildingsSeenCathedral} H${s.buildingsSeenTownhall} gate${s.buildingsSeenGatehouse}`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
       'prop-species',
       () => {
         const s = this.stats();
@@ -1033,6 +1095,14 @@ export class ChunkStreamer {
       () => {
         const s = this.stats();
         return `${s.buildingNodes} nodes / ${s.buildings} live (${s.buildingsLevel} of ${s.buildingsMeasured} level) / ${s.buildingTriangles} tris / ${s.buildingsSeen} seen`;
+      },
+      HudOrder.world,
+    );
+    hud.register(
+      'cities / walls',
+      () => {
+        const s = this.stats();
+        return `${s.citiesSeen} city nodes / ${s.wallNodes} wall nodes / ${s.wallsSeen} walls seen`;
       },
       HudOrder.world,
     );

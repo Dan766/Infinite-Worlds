@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 12;
+export const CHUNK_DATA_VERSION = 14;
 
 /**
  * The result of generating one chunk.
@@ -415,6 +415,13 @@ export interface ChunkData {
   readonly buildingsCottage: number;
   readonly buildingsBarn: number;
   readonly buildingsHall: number;
+  readonly buildingsTownhouse: number;
+  readonly buildingsGuildhall: number;
+  readonly buildingsWarehouse: number;
+  readonly buildingsKeep: number;
+  readonly buildingsCathedral: number;
+  readonly buildingsTownhall: number;
+  readonly buildingsGatehouse: number;
   /**
    * The Phase 7a PROPS of this node -- world vegetation and sparse yard clutter
    * -- batched into one submesh, in the same node-local frame as `positions`.
@@ -460,6 +467,17 @@ export interface ChunkData {
   readonly propsBushTall: number;
   readonly propsYard: number;
   /**
+   * City wall / tower / gatehouse submesh. ZERO-LENGTH away from cities.
+   */
+  readonly wallPositions: Float32Array;
+  readonly wallNormals: Float32Array;
+  readonly wallColors: Float32Array;
+  readonly wallIndices: Uint32Array;
+  /** Wall pieces this node owns. */
+  readonly walls: number;
+  /** 1 if this node touches a city settlement class, else 0. */
+  readonly cityTouch: number;
+  /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
    *
@@ -495,7 +513,11 @@ export function chunkDataBytes(data: ChunkData): number {
     data.propPositions.byteLength +
     data.propNormals.byteLength +
     data.propColors.byteLength +
-    data.propIndices.byteLength
+    data.propIndices.byteLength +
+    data.wallPositions.byteLength +
+    data.wallNormals.byteLength +
+    data.wallColors.byteLength +
+    data.wallIndices.byteLength
   );
 }
 
@@ -533,6 +555,10 @@ export function chunkDataTransferables(data: ChunkData): Transferable[] {
     data.propNormals.buffer as ArrayBuffer,
     data.propColors.buffer as ArrayBuffer,
     data.propIndices.buffer as ArrayBuffer,
+    data.wallPositions.buffer as ArrayBuffer,
+    data.wallNormals.buffer as ArrayBuffer,
+    data.wallColors.buffer as ArrayBuffer,
+    data.wallIndices.buffer as ArrayBuffer,
   ];
 }
 

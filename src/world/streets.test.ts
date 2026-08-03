@@ -36,6 +36,7 @@ import {
   type RoadNetwork,
   type Settlement,
 } from './roads';
+import { isCity } from './city';
 import {
   clearStreetCache,
   generateSectorStreets,
@@ -79,7 +80,7 @@ function populatedSectors(seed: number, x0: number, z0: number, count: number): 
   const out: SectorStreets[] = [];
   for (const c of sectorBlock(x0, z0, count)) {
     const rec = field.streetsAt(c.x, c.z);
-    if (rec.settlement !== undefined) out.push(rec);
+    if (rec.settlement !== undefined && !isCity(rec.settlement)) out.push(rec);
   }
   return out;
 }

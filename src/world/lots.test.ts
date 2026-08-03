@@ -52,6 +52,7 @@ import {
 } from './lots';
 import { roadClearance, SETTLEMENT_JITTER } from './roads';
 import { sectorStreetField } from './streets';
+import { isCity } from './city';
 
 const SEED = hashString('lots-test');
 
@@ -77,7 +78,7 @@ function populated(seed = SEED, x0 = -6, z0 = -6, count = 12): SectorLots[] {
   for (let z = z0; z < z0 + count; z++) {
     for (let x = x0; x < x0 + count; x++) {
       const rec = field.lotsAt(x, z);
-      if (rec.count > 0) out.push(rec);
+      if (rec.count > 0 && rec.settlement !== undefined && !isCity(rec.settlement)) out.push(rec);
     }
   }
   return out;

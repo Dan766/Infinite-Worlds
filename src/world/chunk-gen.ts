@@ -39,6 +39,7 @@ import {
 } from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
 import { buildBuildingSurface, type BuildingPalette } from './building-mesh';
+import { buildWallSurface } from './wall-mesh';
 import { buildPropSurface, type PropPalette } from './prop-mesh';
 import { buildDeckSurface, type DeckPalette } from './road-mesh';
 import {
@@ -1164,6 +1165,11 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   // Same groundAt contract as buildings: base Y is LOD-independent
   // (`sampleHeight` inside collectNodeProps), and the stump reaches down to
   // THIS node's rendered ground. See `prop-mesh.ts` and `props.ts`.
+  const walls = buildWallSurface(coord, region.roads, groundAt);
+
+  let cityTouch = 0;
+  if (walls.count > 0) cityTouch = 1;
+
   const props = buildPropSurface(
     coord,
     worldSeed,
@@ -1198,12 +1204,25 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     buildingsCottage: buildings.cottage,
     buildingsBarn: buildings.barn,
     buildingsHall: buildings.hall,
+    buildingsTownhouse: buildings.townhouse,
+    buildingsGuildhall: buildings.guildhall,
+    buildingsWarehouse: buildings.warehouse,
+    buildingsKeep: buildings.keep,
+    buildingsCathedral: buildings.cathedral,
+    buildingsTownhall: buildings.townhall,
+    buildingsGatehouse: buildings.gatehouse,
     propPositions: props.positions,
     propNormals: props.normals,
     propColors: props.colors,
     propIndices: props.indices,
     props: props.count,
     propsSeated: props.seated,
+    wallPositions: walls.positions,
+    wallNormals: walls.normals,
+    wallColors: walls.colors,
+    wallIndices: walls.indices,
+    walls: walls.count,
+    cityTouch,
     propsPine: props.pine,
     propsBroadleaf: props.broadleaf,
     propsBushRound: props.bushRound,

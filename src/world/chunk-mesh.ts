@@ -305,6 +305,20 @@ const countBuildingDraw = (): void => {
   buildingDraws++;
 };
 
+let wallDraws = 0;
+
+export function wallDrawsSinceReset(): number {
+  return wallDraws;
+}
+
+export function resetWallDraws(): void {
+  wallDraws = 0;
+}
+
+const countWallDraw = (): void => {
+  wallDraws++;
+};
+
 /**
  * Phase 7a PROP submeshes actually rasterised since the last reset.
  *
@@ -552,6 +566,17 @@ function createBuildingGeometry(data: ChunkData): THREE.BufferGeometry | null {
   return geometry;
 }
 
+function createWallGeometry(data: ChunkData): THREE.BufferGeometry | null {
+  if (data.wallIndices.length === 0) return null;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(data.wallPositions, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(data.wallNormals, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(data.wallColors, 3));
+  geometry.setIndex(new THREE.BufferAttribute(data.wallIndices, 1));
+  setBoundsFromPositions(geometry, data.wallPositions);
+  return geometry;
+}
+
 // ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
@@ -683,6 +708,7 @@ export function hashChunkGeometry(data: ChunkData): number {
   hash = hashFloats(hash, data.waterColors);
   hash = hashFloats(hash, data.deckPositions);
   hash = hashFloats(hash, data.buildingPositions);
+  hash = hashFloats(hash, data.wallPositions);
   hash = hashFloats(hash, data.propPositions);
   return hash >>> 0;
 }
@@ -703,6 +729,10 @@ export interface ChunkMesh {
   readonly buildingMesh: THREE.Mesh | null;
   readonly buildingGeometry: THREE.BufferGeometry | null;
   readonly buildingMaterial: THREE.MeshLambertMaterial | null;
+  /** Medieval city wall submesh, or null away from a city perimeter. */
+  readonly wallMesh: THREE.Mesh | null;
+  readonly wallGeometry: THREE.BufferGeometry | null;
+  readonly wallMaterial: THREE.MeshLambertMaterial | null;
   /** The Phase 7a prop submesh, or null on a node with no prop in it. */
   readonly propMesh: THREE.Mesh | null;
   readonly propGeometry: THREE.BufferGeometry | null;
@@ -723,6 +753,10 @@ export interface ChunkMesh {
   readonly deckTriangles: number;
   /** Triangles in the building submesh alone. Zero on all but village nodes. */
   readonly buildingTriangles: number;
+  /** Triangles in the city-wall submesh alone. */
+  readonly wallTriangles: number;
+  /** Wall primitives owned by this node. */
+  readonly walls: number;
   /** Buildings whose centre lies in this node. Zero on all but village nodes. */
   readonly buildings: number;
   /**
@@ -762,6 +796,13 @@ export interface ChunkMesh {
   readonly buildingsCottage: number;
   readonly buildingsBarn: number;
   readonly buildingsHall: number;
+  readonly buildingsTownhouse: number;
+  readonly buildingsGuildhall: number;
+  readonly buildingsWarehouse: number;
+  readonly buildingsKeep: number;
+  readonly buildingsCathedral: number;
+  readonly buildingsTownhall: number;
+  readonly buildingsGatehouse: number;
 }
 
 export function createChunkMesh(data: ChunkData): ChunkMesh {
@@ -858,6 +899,20 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     mesh.add(buildingMesh);
   }
 
+  const wallGeometry = createWallGeometry(data);
+  let wallMesh: THREE.Mesh | null = null;
+  let wallMaterial: THREE.MeshLambertMaterial | null = null;
+  if (wallGeometry !== null) {
+    wallMaterial = createBuildingMaterial();
+    wallMesh = new THREE.Mesh(wallGeometry, wallMaterial);
+    wallMesh.name = `walls ${data.coord.x},${data.coord.z},${data.coord.lod}`;
+    wallMesh.renderOrder = BUILDING_RENDER_ORDER_BASE + chunkRenderOrder(data.coord);
+    wallMesh.matrixAutoUpdate = false;
+    wallMesh.updateMatrix();
+    wallMesh.onBeforeRender = countWallDraw;
+    mesh.add(wallMesh);
+  }
+
   const propGeometry = createPropGeometry(data);
   let propMesh: THREE.Mesh | null = null;
   let propMaterial: THREE.MeshLambertMaterial | null = null;
@@ -885,6 +940,9 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     buildingMesh,
     buildingGeometry,
     buildingMaterial,
+    wallMesh,
+    wallGeometry,
+    wallMaterial,
     propMesh,
     propGeometry,
     propMaterial,
@@ -896,6 +954,7 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
         data.waterIndices.length +
         data.deckIndices.length +
         data.buildingIndices.length +
+        data.wallIndices.length +
         data.propIndices.length) /
       3,
     vertices:
@@ -903,11 +962,14 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
         data.waterPositions.length +
         data.deckPositions.length +
         data.buildingPositions.length +
+        data.wallPositions.length +
         data.propPositions.length) /
       3,
     waterTriangles: data.waterIndices.length / 3,
     deckTriangles: data.deckIndices.length / 3,
     buildingTriangles: data.buildingIndices.length / 3,
+    wallTriangles: data.wallIndices.length / 3,
+    walls: data.walls,
     buildings: data.buildings,
     buildingsMeasured: data.coord.lod === BUILDING_LEVEL_LOD ? data.buildings : 0,
     buildingsLevel: data.buildingsLevel,
@@ -923,6 +985,13 @@ export function createChunkMesh(data: ChunkData): ChunkMesh {
     buildingsCottage: data.buildingsCottage,
     buildingsBarn: data.buildingsBarn,
     buildingsHall: data.buildingsHall,
+    buildingsTownhouse: data.buildingsTownhouse,
+    buildingsGuildhall: data.buildingsGuildhall,
+    buildingsWarehouse: data.buildingsWarehouse,
+    buildingsKeep: data.buildingsKeep,
+    buildingsCathedral: data.buildingsCathedral,
+    buildingsTownhall: data.buildingsTownhall,
+    buildingsGatehouse: data.buildingsGatehouse,
   };
 }
 
@@ -946,6 +1015,9 @@ export function disposeChunkMesh(entry: ChunkMesh): void {
   if (entry.buildingMesh !== null) entry.buildingMesh.removeFromParent();
   entry.buildingGeometry?.dispose();
   if (entry.buildingMaterial !== null) disposeMaterial(entry.buildingMaterial);
+  if (entry.wallMesh !== null) entry.wallMesh.removeFromParent();
+  entry.wallGeometry?.dispose();
+  if (entry.wallMaterial !== null) disposeMaterial(entry.wallMaterial);
   if (entry.propMesh !== null) entry.propMesh.removeFromParent();
   entry.propGeometry?.dispose();
   if (entry.propMaterial !== null) disposeMaterial(entry.propMaterial);

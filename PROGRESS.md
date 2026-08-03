@@ -17,7 +17,8 @@ state moves between sessions. Update both at the end of every phase.
 | 6     | Lots and buildings                 | Done   |
 | 7a    | Vegetation and props               | Done   |
 | 7b    | Variety (villages, buildings, props) | In progress (3/3: species code; validation deferred) |
-| 8     | Player controller and collision    | -      |
+| 8     | Player controller and collision    | Done (code; soak deferred with city epic) |
+| City  | Medieval cities C0–C4              | Done (code; full soak/shots deferred) |
 | 9     | NPCs                               | -      |
 | 10    | Lighting and atmosphere            | -      |
 | 11    | Materials and post-processing      | -      |
@@ -3827,4 +3828,87 @@ row here before marking 7b Done.
   (shots only if rendered silhouettes moved baselines).
 - Record the soak species-seen row and confirm no quiet budget raise.
 - Then flip the phase table to Done.
+
+## Medieval City Epic C0-C4 -- implemented; full soak deferred
+
+### C0 -- Region-owned city plans and architecture
+
+- Added deterministic CityPlan tests for cold-cache reproduction, city rarity,
+  `isCity`, nearest-gate selection, and non-empty wall geometry.
+- Rewrote the Sector ownership rule in `ARCHITECTURE.md`: villages remain
+  centre-owned; a city is decided once at Region tier and clipped by every
+  overlapping sector.
+- Rejected independent per-sector city rolls because they cannot agree on wall
+  vertices, gates, landmark reservations, or cross-sector arteries.
+
+### C1 -- walls, gates, streaming evidence
+
+- `chunk-mesh.ts` now uploads, renders, hashes, counts, and disposes wall
+  buffers. Streamer/HUD/snapshot evidence includes live wall nodes, cumulative
+  wall pieces, city-touching nodes, and rasterised wall draws.
+- Region roads now terminate city endpoints at `nearestCityGate`; villages
+  remain centre-pinned.
+- `soak.mjs` has hard `citiesSeen`, cumulative wall, and interior anti-vacuity
+  floors. The deterministic `soak` route starts at the keep of city cell
+  `(-19,4)` (`-9603, 2310`) with walk mode enabled.
+
+### C2 -- multi-sector streets, lots, kinds, and views
+
+- Added `LAYOUT_CITY = 4`. Overlapping sectors clip Region-owned CityPlan
+  segments to their padded square; city centre sectors use the same path and
+  never dispatch a village family.
+- City frontage picks townhouse/warehouse/guildhall kinds. Keep, cathedral,
+  townhall, guild and gatehouse footprints are inserted first as reserved lots;
+  ordinary lots yield through the existing overlap test.
+- Added additive per-kind counters and bumped `CHUNK_DATA_VERSION` 13 to 14.
+  Existing cottage/barn/hall geometry topology remains unchanged.
+- Dense world vegetation is refused inside curtain walls; sparse lot-owned yard
+  props remain possible. Added five default-seed canonical city viewpoints
+  around city cell `(-64,-56)`.
+
+### C3 / Phase 8 -- walk mode and collision
+
+- Added `?walk=1`, a grounded first-person controller with WASD, sprint, mouse
+  look, gravity, 1.7 m eye height, and axis-separated collision sliding.
+- `collision.ts` stays pure and queries the same terrain composition used by
+  rendering. It tests conservative building AABBs, CityPlan wall segments with
+  gate openings, and uses `max(ground, gradeTarget)` for road/street deck height.
+- Synthetic tests cover AABBs, lot footprints, segment distance and wall/gate
+  behavior.
+
+### C4 -- enterable landmark interiors
+
+- Added pure interior buffers for keep halls, cathedral naves, townhalls,
+  guildhalls and gatehouse passages. `interior-overlay.ts` is a Three-only
+  near-player adapter; it uploads one landmark within 26 m and disposes it when
+  the player leaves.
+- `interiorsEntered` is monotone per landmark and exposed to HUD/snapshot/soak.
+  Exterior shells remain visible; no boolean wall cut is attempted.
+
+### Verification and measured evidence
+
+- `npm test`: **28 files, 506 tests passed, 0 failed**.
+- Focused city/collision/streets/lots/chunk payload run: **126 passed**.
+- `npx tsc --noEmit`: clean after integration.
+- The full 300 s soak and canonical captures were deliberately not run in this
+  implementation pass. The changed soak route means the prior Phase 7 budget
+  rows cannot be claimed unchanged; re-derive draw calls, triangles, vertices,
+  payload bytes and heap trend before marking this epic fully measured.
+
+### Known gaps, deliberately left
+
+- City landmark shells reuse the established gabled building topology; their
+  footprint and height differ, but bespoke towers/spires remain future visual
+  work.
+- Interior overlay does not hide/cut the exterior shell. It is intentionally
+  additive and near-player only.
+- City clipping stores each clipped segment as a two-node CSR street. This is
+  deterministic and seam-safe but does not preserve longer polyline runs for
+  batching diagnostics.
+
+### For the next phase
+
+- Run the full 300 s `npm run soak` from the new city route and re-derive every
+  budget row; then capture/review the five new canonical views before committing
+  their PNG baselines.
 

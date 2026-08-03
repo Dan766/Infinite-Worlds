@@ -78,6 +78,13 @@ import { chunkSizeAt, REGION_SIZE, SECTOR_SIZE, type ChunkCoord } from './contra
 import {
   KIND_BARN,
   KIND_HALL,
+  KIND_TOWNHOUSE,
+  KIND_GUILDHALL,
+  KIND_WAREHOUSE,
+  KIND_KEEP,
+  KIND_CATHEDRAL,
+  KIND_TOWNHALL,
+  KIND_GATEHOUSE,
   LOT_MAX_EXTENT,
   type SectorLotField,
   type SectorLots,
@@ -205,6 +212,13 @@ export interface BuildingSurface {
   cottage: number;
   barn: number;
   hall: number;
+  townhouse: number;
+  guildhall: number;
+  warehouse: number;
+  keep: number;
+  cathedral: number;
+  townhall: number;
+  gatehouse: number;
 }
 
 /** The palette a building is painted with, LINEAR rgb. */
@@ -229,6 +243,13 @@ const EMPTY_BUILDINGS: () => BuildingSurface = () => ({
   cottage: 0,
   barn: 0,
   hall: 0,
+  townhouse: 0,
+  guildhall: 0,
+  warehouse: 0,
+  keep: 0,
+  cathedral: 0,
+  townhall: 0,
+  gatehouse: 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -258,6 +279,13 @@ class BuildingBuilder {
   cottage = 0;
   barn = 0;
   hall = 0;
+  townhouse = 0;
+  guildhall = 0;
+  warehouse = 0;
+  keep = 0;
+  cathedral = 0;
+  townhall = 0;
+  gatehouse = 0;
   /** See `BUILDING_LEVEL_LOD`. False on a coarse node, where the number would lie. */
   countLevel = true;
 
@@ -311,6 +339,13 @@ class BuildingBuilder {
       cottage: this.cottage,
       barn: this.barn,
       hall: this.hall,
+      townhouse: this.townhouse,
+      guildhall: this.guildhall,
+      warehouse: this.warehouse,
+      keep: this.keep,
+      cathedral: this.cathedral,
+      townhall: this.townhall,
+      gatehouse: this.gatehouse,
     };
   }
 }
@@ -519,6 +554,13 @@ function addBuilding(
   const kind = lots.kind[i] as number;
   if (kind === KIND_BARN) b.barn++;
   else if (kind === KIND_HALL) b.hall++;
+  else if (kind === KIND_TOWNHOUSE) b.townhouse++;
+  else if (kind === KIND_GUILDHALL) b.guildhall++;
+  else if (kind === KIND_WAREHOUSE) b.warehouse++;
+  else if (kind === KIND_KEEP) b.keep++;
+  else if (kind === KIND_CATHEDRAL) b.cathedral++;
+  else if (kind === KIND_TOWNHALL) b.townhall++;
+  else if (kind === KIND_GATEHOUSE) b.gatehouse++;
   else b.cottage++;
 
   // Facade detail: exactly two quads for every kind so BUILDING_VERTEX_COUNT

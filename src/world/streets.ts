@@ -106,6 +106,7 @@ import {
 } from './contracts';
 import { closestOnSegment, GradeBlend, SURFACE_STREET } from './grading';
 import { hashUnit, lerp, smoothstep } from './noise';
+import { cityPlanAt, isCity } from './city';
 import {
   SETTLEMENT_JITTER,
   SETTLEMENT_RADIUS_MAX,
@@ -266,6 +267,7 @@ export const LAYOUT_RING = 0;
 export const LAYOUT_LINEAR = 1;
 export const LAYOUT_GRID = 2;
 export const LAYOUT_HILLTOP = 3;
+export const LAYOUT_CITY = 4;
 
 /**
  * Which street plan a settlement gets.
@@ -537,11 +539,62 @@ export function generateSectorStreets(
   const centerZ = coord.z * SECTOR_SIZE + SECTOR_SIZE / 2;
   const net = roads.networkAt(centerX, centerZ);
 
+  // Cities are Region-owned and may cross many sectors. Every overlapping
+  // sector clips the same CityPlan; villages retain centre ownership below.
+  const minX = coord.x * SECTOR_SIZE;
+  const minZ = coord.z * SECTOR_SIZE;
+  const maxX = minX + SECTOR_SIZE;
+  const maxZ = minZ + SECTOR_SIZE;
+  const seenCities = new Set<string>();
+  const cityNodeX: number[] = [];
+  const cityNodeZ: number[] = [];
+  const cityStreetStart: number[] = [0];
+  let citySite: Settlement | undefined;
+  for (const candidate of net.settlements) {
+    if (!isCity(candidate)) continue;
+    const key = `${candidate.cellX},${candidate.cellZ}`;
+    if (seenCities.has(key)) continue;
+    seenCities.add(key);
+    const nearX = Math.max(minX, Math.min(candidate.x, maxX));
+    const nearZ = Math.max(minZ, Math.min(candidate.z, maxZ));
+    const dx = candidate.x - nearX;
+    const dz = candidate.z - nearZ;
+    if (dx * dx + dz * dz > candidate.farmRadius * candidate.farmRadius) continue;
+    const plan = cityPlanAt(candidate, worldSeed);
+    if (plan === undefined) continue;
+    citySite ??= candidate;
+    clipCityPlan(
+      plan.nodeX,
+      plan.nodeZ,
+      plan.streetStart,
+      minX - STREET_SHOULDER,
+      minZ - STREET_SHOULDER,
+      maxX + STREET_SHOULDER,
+      maxZ + STREET_SHOULDER,
+      cityNodeX,
+      cityNodeZ,
+      cityStreetStart,
+    );
+  }
+  if (citySite !== undefined) {
+    return finishStreets(
+      terrain,
+      worldSeed,
+      coord.x,
+      coord.z,
+      citySite,
+      LAYOUT_CITY,
+      cityNodeX,
+      cityNodeZ,
+      cityStreetStart,
+    );
+  }
+
   let site: Settlement | undefined;
   let found = 0;
   for (let i = 0; i < net.settlements.length; i++) {
     const s = net.settlements[i] as Settlement;
-    if (Math.floor(s.x / SECTOR_SIZE) !== coord.x) continue;
+    if (isCity(s) || Math.floor(s.x / SECTOR_SIZE) !== coord.x) continue;
     if (Math.floor(s.z / SECTOR_SIZE) !== coord.z) continue;
     found++;
     if (site === undefined) site = s;
@@ -593,6 +646,71 @@ export function generateSectorStreets(
   }
 
   return finishStreets(terrain, worldSeed, coord.x, coord.z, site, layout, nodeX, nodeZ, streetStart);
+}
+
+/** Clip CityPlan segments to one sector's padded square. */
+function clipCityPlan(
+  x: Float64Array,
+  z: Float64Array,
+  starts: Uint32Array,
+  minX: number,
+  minZ: number,
+  maxX: number,
+  maxZ: number,
+  outX: number[],
+  outZ: number[],
+  outStarts: number[],
+): void {
+  for (let street = 0; street + 1 < starts.length; street++) {
+    const from = starts[street] as number;
+    const to = starts[street + 1] as number;
+    for (let i = from; i + 1 < to; i++) {
+      const ax = x[i] as number;
+      const az = z[i] as number;
+      const bx = x[i + 1] as number;
+      const bz = z[i + 1] as number;
+      const clipped = clipSegment(ax, az, bx, bz, minX, minZ, maxX, maxZ);
+      if (clipped === undefined) continue;
+      outX.push(clipped[0], clipped[2]);
+      outZ.push(clipped[1], clipped[3]);
+      outStarts.push(outX.length);
+    }
+  }
+}
+
+function clipSegment(
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+  minX: number,
+  minZ: number,
+  maxX: number,
+  maxZ: number,
+): readonly [number, number, number, number] | undefined {
+  const dx = bx - ax;
+  const dz = bz - az;
+  let t0 = 0;
+  let t1 = 1;
+  const p = [-dx, dx, -dz, dz];
+  const q = [ax - minX, maxX - ax, az - minZ, maxZ - az];
+  for (let i = 0; i < 4; i++) {
+    const pi = p[i] as number;
+    const qi = q[i] as number;
+    if (pi === 0) {
+      if (qi < 0) return undefined;
+      continue;
+    }
+    const r = qi / pi;
+    if (pi < 0) {
+      if (r > t1) return undefined;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return undefined;
+      if (r < t1) t1 = r;
+    }
+  }
+  return [ax + dx * t0, az + dz * t0, ax + dx * t1, az + dz * t1];
 }
 
 /**

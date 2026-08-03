@@ -45,6 +45,7 @@ import {
   type RegionRoadField,
   type RoadNetwork,
 } from './roads';
+import { isCity } from './city';
 import {
   STREET_HALF_WIDTH,
   type SectorStreetField,
@@ -562,6 +563,14 @@ function tryWorldProp(
   if (groundSlope(x, z, worldSeed) > PROP_MAX_SLOPE) return;
 
   const net = roads.networkAt(x, z);
+  // Dense world vegetation yields inside curtain walls. Sparse yard props are
+  // placed later from lots, so a city can still contain authored clutter.
+  for (const settlement of net.settlements) {
+    if (!isCity(settlement)) continue;
+    const cityX = x - settlement.x;
+    const cityZ = z - settlement.z;
+    if (cityX * cityX + cityZ * cityZ < settlement.wallRadius * settlement.wallRadius) return;
+  }
   if (!clearOfInfrastructure(net, streets, lots, roads, x, z)) return;
 
   const kindRoll = hashUnit(hash3i(cellX, cellZ, worldSeed ^ CELL_KIND_SALT));

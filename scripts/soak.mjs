@@ -222,8 +222,10 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  * report after any future move: all four go quiet without failing if the route
  * stops being interesting.
  */
-const START_X = -6749;
-const START_Z = -4140;
+// Seed `soak`, city cell (-19, 4). Starts at its keep (city centre + 0.08R)
+// so walls, city streets and one interior cannot pass vacuously.
+const START_X = -9603;
+const START_Z = 2310;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and
@@ -367,6 +369,9 @@ const MIN_BUILDING_NODES = 12; //            measured    42 peak of 309 live
 const MIN_BUILDINGS_SEEN = 3000; //          measured 12,012 over the run
 const MIN_BUILDING_DRAW_CALLS = 4; //        measured    12 peak
 const MIN_BUILDINGS_LEVEL_FRACTION = 0.6; // measured  0.96 of lod-0 building-samples
+const MIN_CITIES_SEEN = 1;
+const MIN_WALL_NODES = 1;
+const MIN_INTERIORS_ENTERED = 1;
 
 /**
  * PHASE 7a: THE SAME GUARD FOR PROPS, ON DENSER CONTENT.
@@ -475,7 +480,7 @@ const url =
   `${server.url}?seed=${encodeURIComponent(SEED)}&panel=0&hud=1` +
   // yaw -90 faces +X, which is the direction the autopilot travels, so chunks
   // stream in ahead of the camera rather than behind it.
-  `&fly=${SPEED}&flyleg=${legSeconds}&pos=${START_X},90,${START_Z}&look=-90,${OUTBOUND_PITCH}`;
+  `&fly=${SPEED}&flyleg=${legSeconds}&walk=1&pos=${START_X},90,${START_Z}&look=-90,${OUTBOUND_PITCH}`;
 
 let exitCode = 0;
 const failures = [];
@@ -905,6 +910,14 @@ try {
   console.log(
     `  houses at the start ${buildingChunksAtStart}/${buildingsBefore.length} round-tripped chunks`,
   );
+  console.log('medieval cities (C1)');
+  console.log(`  city nodes SEEN   ${finalSnapshot.citiesSeen} (floor ${MIN_CITIES_SEEN})`);
+  console.log(`  city layouts SEEN ${finalSnapshot.layoutSeenCity}`);
+  console.log(`  wall nodes live   ${finalSnapshot.wallNodes}`);
+  console.log(`  walls SEEN        ${finalSnapshot.wallsSeen} (floor ${MIN_WALL_NODES})`);
+  console.log(
+    `  interiors ENTERED ${finalSnapshot.interiorsEntered} (floor ${MIN_INTERIORS_ENTERED})`,
+  );
 
   console.log('props (Phase 7a)');
   console.log(
@@ -1288,6 +1301,24 @@ try {
         'byte-identical-regeneration check said nothing about the building ' +
         'geometry the hash now covers. Move the flight start, deliberately, ' +
         'rather than dropping this check.',
+    );
+  }
+  if (finalSnapshot.citiesSeen < MIN_CITIES_SEEN) {
+    failures.push(
+      `the flight generated ${finalSnapshot.citiesSeen} city-touching nodes (floor ` +
+        `${MIN_CITIES_SEEN}); all city checks would otherwise be vacuous.`,
+    );
+  }
+  if (finalSnapshot.wallsSeen < MIN_WALL_NODES) {
+    failures.push(
+      `only ${finalSnapshot.wallsSeen} wall primitives were generated (floor ` +
+        `${MIN_WALL_NODES}); the flight did not exercise city walls.`,
+    );
+  }
+  if (finalSnapshot.interiorsEntered < MIN_INTERIORS_ENTERED) {
+    failures.push(
+      `the walk flight entered ${finalSnapshot.interiorsEntered} interiors (floor ` +
+        `${MIN_INTERIORS_ENTERED}); the landmark overlay was not exercised.`,
     );
   }
 

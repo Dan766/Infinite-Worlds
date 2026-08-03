@@ -48,6 +48,8 @@ export interface AppParams {
   hud: boolean;
   panel: boolean;
   wireframe: boolean;
+  /** Grounded first-person movement and collision. */
+  walk: boolean;
   /**
    * Autopilot speed in m/s along X. Zero means off. Used by `npm run soak` to
    * fly a repeatable path with no human at the keyboard.
@@ -68,6 +70,7 @@ export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
   hud: true,
   panel: true,
   wireframe: false,
+  walk: false,
   fly: 0,
   flyLeg: 120,
 };
@@ -142,6 +145,7 @@ export function parseParams(search: string): AppParams {
     hud: parseBool(q.get('hud'), DEFAULT_PARAMS.hud),
     panel: parseBool(q.get('panel'), DEFAULT_PARAMS.panel),
     wireframe: parseBool(q.get('wireframe'), DEFAULT_PARAMS.wireframe),
+    walk: parseBool(q.get('walk'), DEFAULT_PARAMS.walk),
     fly: parseNumber(q.get('fly'), DEFAULT_PARAMS.fly),
     flyLeg: Math.max(1, parseNumber(q.get('flyleg'), DEFAULT_PARAMS.flyLeg)),
   };
@@ -182,6 +186,7 @@ export function serializeParams(params: AppParams): string {
   if (params.wireframe !== DEFAULT_PARAMS.wireframe) {
     q.set('wireframe', params.wireframe ? '1' : '0');
   }
+  if (params.walk !== DEFAULT_PARAMS.walk) q.set('walk', params.walk ? '1' : '0');
   if (round(params.fly) !== DEFAULT_PARAMS.fly) q.set('fly', String(round(params.fly)));
   if (round(params.flyLeg) !== DEFAULT_PARAMS.flyLeg) q.set('flyleg', String(round(params.flyLeg)));
 
