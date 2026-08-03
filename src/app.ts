@@ -21,8 +21,10 @@ import { ChunkStreamer } from './world/chunk-streamer';
 import {
   buildingDrawsSinceReset,
   deckDrawsSinceReset,
+  propDrawsSinceReset,
   resetBuildingDraws,
   resetDeckDraws,
+  resetPropDraws,
   resetRiverDraws,
   resetRoadDraws,
   resetStreetDraws,
@@ -123,6 +125,7 @@ export class App {
    * folding into `deckDrawCalls`.
    */
   private buildingDrawCalls = 0;
+  private propDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -300,6 +303,14 @@ export class App {
       buildingTriangles: chunks.buildingTriangles,
       buildingsSeen: chunks.buildingsSeen,
       buildingDrawCalls: this.buildingDrawCalls,
+      // Phase 7a. Same trio once more: residency, rasteriser, seating.
+      propNodes: chunks.propNodes,
+      props: chunks.props,
+      propsMeasured: chunks.propsMeasured,
+      propsSeated: chunks.propsSeated,
+      propTriangles: chunks.propTriangles,
+      propsSeen: chunks.propsSeen,
+      propDrawCalls: this.propDrawCalls,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -428,6 +439,17 @@ export class App {
     return this.streamer.sampleBuildings(ChunkStreamer.coordsAround(worldX, worldZ, radius));
   }
 
+  /**
+   * Props in the chunks around a world position, as actually resident.
+   * `null` where the chunk is not loaded.
+   *
+   * The Phase 7a counterpart: the round-tripped square has to contain vegetation,
+   * not merely pass over bare ground whose empty prop buffers hash identically.
+   */
+  sampleChunkProps(worldX: number, worldZ: number, radius: number): (number | null)[] {
+    return this.streamer.sampleProps(ChunkStreamer.coordsAround(worldX, worldZ, radius));
+  }
+
   /** Ground height at a world position, from the main thread. For debugging parity. */
   groundHeight(worldX: number, worldZ: number): number {
     return sampleHeight(worldX, worldZ, this.params.seedHash);
@@ -464,6 +486,7 @@ export class App {
     resetStreetDraws();
     resetDeckDraws();
     resetBuildingDraws();
+    resetPropDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
@@ -471,6 +494,7 @@ export class App {
     this.streetDrawCalls = streetDrawsSinceReset();
     this.deckDrawCalls = deckDrawsSinceReset();
     this.buildingDrawCalls = buildingDrawsSinceReset();
+    this.propDrawCalls = propDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -519,6 +543,7 @@ export class App {
     hud.register('street draws', () => this.streetDrawCalls, HudOrder.render);
     hud.register('deck draws', () => this.deckDrawCalls, HudOrder.render);
     hud.register('building draws', () => this.buildingDrawCalls, HudOrder.render);
+    hud.register('prop draws', () => this.propDrawCalls, HudOrder.render);
 
     hud.register(
       'js heap',

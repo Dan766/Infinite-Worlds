@@ -501,6 +501,47 @@ describe('roads reach chunk generation through the tier context', () => {
       expect(data.buildingIndices).toHaveLength(0);
     }
   });
+
+  it('places props on growable ground and seats them at lod 0', () => {
+    // Anti-vacuity for Phase 7a: find a block that owns vegetation, then assert
+    // seating. Hard-coding a square around the origin fails on seeds whose
+    // origin is ocean or desert.
+    let anchor: { x: number; z: number } | null = null;
+    for (let z = -60; z <= 60 && anchor === null; z++) {
+      for (let x = -60; x <= 60; x++) {
+        const data = generateChunk({ x, z, lod: 0 }, context());
+        if (data.props >= 5) {
+          anchor = { x, z };
+          break;
+        }
+      }
+    }
+    expect(anchor).not.toBeNull();
+
+    let nodes = 0;
+    let props = 0;
+    let seated = 0;
+    const ax = (anchor as { x: number; z: number }).x;
+    const az = (anchor as { x: number; z: number }).z;
+    for (let dz = -2; dz <= 2; dz++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const data = generateChunk({ x: ax + dx, z: az + dz, lod: 0 }, context());
+        expect(data.propsSeated).toBeLessThanOrEqual(data.props);
+        if (data.props === 0) {
+          expect(data.propIndices).toHaveLength(0);
+          expect(data.propPositions).toHaveLength(0);
+          continue;
+        }
+        nodes++;
+        props += data.props;
+        seated += data.propsSeated;
+      }
+    }
+    expect(nodes).toBeGreaterThan(2);
+    expect(props).toBeGreaterThan(20);
+    // THE ANTI-VACUITY COUNTER OF THE PHASE.
+    expect(seated).toBeGreaterThan(props * 0.5);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -734,7 +775,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(8);
+    expect(CHUNK_DATA_VERSION).toBe(9);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -750,6 +791,10 @@ describe('generateChunk', () => {
     expect(data.buildingNormals).toBeInstanceOf(Float32Array);
     expect(data.buildingColors).toBeInstanceOf(Float32Array);
     expect(data.buildingIndices).toBeInstanceOf(Uint32Array);
+    expect(data.propPositions).toBeInstanceOf(Float32Array);
+    expect(data.propNormals).toBeInstanceOf(Float32Array);
+    expect(data.propColors).toBeInstanceOf(Float32Array);
+    expect(data.propIndices).toBeInstanceOf(Uint32Array);
     expect(data.indices.length % 3).toBe(0);
     for (const index of data.indices) {
       expect(index).toBeLessThan(data.positions.length / 3);
@@ -776,7 +821,11 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.buildingNormals.buffer);
     expect(transferables).toContain(data.buildingColors.buffer);
     expect(transferables).toContain(data.buildingIndices.buffer);
-    expect(transferables).toHaveLength(15);
+    expect(transferables).toContain(data.propPositions.buffer);
+    expect(transferables).toContain(data.propNormals.buffer);
+    expect(transferables).toContain(data.propColors.buffer);
+    expect(transferables).toContain(data.propIndices.buffer);
+    expect(transferables).toHaveLength(19);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
@@ -792,29 +841,37 @@ describe('generateChunk', () => {
         data.buildingPositions.byteLength +
         data.buildingNormals.byteLength +
         data.buildingColors.byteLength +
-        data.buildingIndices.byteLength,
+        data.buildingIndices.byteLength +
+        data.propPositions.byteLength +
+        data.propNormals.byteLength +
+        data.propColors.byteLength +
+        data.propIndices.byteLength,
     );
   });
 
-  it('lists the EMPTY water, deck and building buffers of a bare inland node as transferable too', () => {
+  it('lists the EMPTY water, deck, building and prop buffers of a bare inland node as transferable too', () => {
     // A conditional transfer list is a rule with an exception, and the
     // exception is what a later phase forgets. Zero-length ArrayBuffers
     // transfer fine, so there is no exception: every bulk array, always.
     const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
     expect(data.waterIndices).toHaveLength(0);
     const transferables = chunkDataTransferables(data);
-    expect(transferables).toHaveLength(15);
-    expect(new Set(transferables).size).toBe(15);
+    expect(transferables).toHaveLength(19);
+    expect(new Set(transferables).size).toBe(19);
     expect(transferables).toContain(data.waterPositions.buffer);
     expect(transferables).toContain(data.deckPositions.buffer);
     expect(transferables).toContain(data.buildingPositions.buffer);
-    // ...and an empty water surface, an empty deck AND no buildings must add
-    // exactly nothing to the payload. That discipline is the whole reason
-    // either can exist inside the draw-call and payload budgets: roads are
-    // sparse and settlements sparser, so most nodes must cost nothing for them.
+    expect(transferables).toContain(data.propPositions.buffer);
+    // ...and an empty water surface, an empty deck, no buildings AND no props
+    // must add exactly nothing to the payload. That discipline is the whole
+    // reason either can exist inside the draw-call and payload budgets: roads
+    // are sparse and settlements sparser, so most nodes must cost nothing for
+    // them -- and a desert node must cost nothing for vegetation either.
     expect(data.deckIndices).toHaveLength(0);
     expect(data.buildingIndices).toHaveLength(0);
     expect(data.buildings).toBe(0);
+    expect(data.propIndices).toHaveLength(0);
+    expect(data.props).toBe(0);
     expect(chunkDataBytes(data)).toBe(74676);
   });
 

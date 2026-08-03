@@ -87,6 +87,8 @@ src/
     lots.ts             Sector-tier building lots along streets
     road-mesh.ts        the road and street DECK: carriageway geometry, per chunk
     building-mesh.ts    batched building geometry, per chunk
+    props.ts            world vegetation + yard prop placement (pure)
+    prop-mesh.ts        batched prop / vegetation geometry, per chunk
     grading.ts          the one weighted-average blend everything that moves ground joins
     cell-heap.ts        deterministic (key, index)-ordered min-heap, shared by both
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
@@ -183,6 +185,8 @@ streets.ts      pure functions   Sector tier; imports contracts + grading + road
 lots.ts         pure functions   Sector tier; imports contracts + grading + roads + streets
 road-mesh.ts    pure functions   deck geometry; imports contracts + roads + streets
 building-mesh.ts pure functions  building geometry; imports contracts + lots + roads
+props.ts        pure functions   prop placement; imports contracts + height + lots + roads + streets
+prop-mesh.ts    pure functions   prop geometry; imports contracts + props + lots + roads + streets
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
@@ -621,6 +625,28 @@ untouched and drives levelness to zero. Levelness is measured at lod 0 only -- a
 coarse lattice cannot describe an 8 m footprint, so the number would be about
 mesh resolution rather than about the village.
 
+### Props and vegetation: dense placed content on the building model
+
+Phase 7a. One placement + batching pipeline for world trees/bushes and sparse
+settlement yard props. Placement is a pure function of `(worldSeed, worldXZ)`
+with node ownership by centre -- there is no Sector-tier memo for world trees,
+because density is continuous across the map and a sector memo would either
+overhang like streets or force an 11×11 working set. Yard props query nearby
+`SectorLots` when a settlement is in reach, the same region walk buildings use.
+
+**Base Y is LOD-independent; the stump is not.** `sampleHeight` at the centre
+fixes the pose so a tree does not jump when the quadtree changes level. Each
+node decides how far a short buried stump reaches down to meet *this* node's
+rendered ground -- `BUILDING_FOOTING` / plinth in a different shape.
+
+**One mesh per node, not one per tree.** A forest lod-0 node holds tens to low
+hundreds; one mesh each would blow the draw-call budget. Every prop whose centre
+lies in the node goes into one buffer with per-vertex colour (+1 draw call per
+prop-bearing node). Nodes coarser than `PROP_MESH_MAX_LOD` (2) emit empty arrays
+-- a root node would otherwise own every tree in 4 km. `props` / `propsSeated` /
+`propsMeasured` are the anti-vacuity trio: placed, seated on ground this node
+renders, counted at lod 0 only. Species variety and layout families stay Phase 7b.
+
 ### The region memo is derived data, and it is bounded
 
 Every chunk vertex needs river influence; a chunk is ~1,200 vertices and hundreds
@@ -945,7 +971,7 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
-**All canonical views are reproducible again as of Phase 6a** (40 as of Phase 6),
+**All canonical views are reproducible again as of Phase 6a** (43 as of Phase 7a),
 and the rule that keeps
 them that way is stated once, in `renderer.ts`: **wireframe mode must not leave a
 polygon offset enabled.** WebGL has no `GL_POLYGON_OFFSET_LINE`, so what a line
@@ -1067,6 +1093,15 @@ cumulative for the bridge reason; `buildingsLevel` / `buildingsMeasured` is the
 phase's own anti-vacuity number -- placed houses that stand on ground a village
 actually levelled, counted at lod 0 only. The geometry hash folds
 `buildingPositions` in.
+
+**Since Phase 7a the flight also has to see PROPS, and the start did not have to
+move a seventh time.** World vegetation is continuous along the corridor west of
+the Phase 4b start (forest at roughly -6496,-3680, near `START_X`/`START_Z`), so
+`propsSeen` / `propDrawCalls` / `propsSeated` are easier to satisfy than
+buildings were -- but seating is still the anti-vacuity half that goes to zero if
+the stump / `groundAt` path regresses. The geometry hash folds `propPositions`
+in; `sampleChunkProps` refuses a round trip over bare ground whose empty prop
+buffers would otherwise hash identically.
 
 **Bridges are counted at lod 0 only, and that was measured rather than assumed.**
 A deck stands at the blended target; the GROUND reaches that target only where

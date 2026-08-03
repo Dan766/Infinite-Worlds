@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 8;
+export const CHUNK_DATA_VERSION = 9;
 
 /**
  * The result of generating one chunk.
@@ -401,6 +401,40 @@ export interface ChunkData {
    */
   readonly buildingsLevel: number;
   /**
+   * The Phase 7a PROPS of this node -- world vegetation and sparse yard clutter
+   * -- batched into one submesh, in the same node-local frame as `positions`.
+   *
+   * ZERO-LENGTH ON A NODE WITH NO PROP CENTRE IN IT, which is most of the world
+   * away from forest and settlement. One buffer for EVERY prop in the node
+   * rather than one per prop: see `prop-mesh.ts`. A forest lod-0 node holds
+   * tens to low hundreds, and a mesh each would put the draw-call budget
+   * through the floor.
+   */
+  readonly propPositions: Float32Array;
+  /** Unit prop normals, xyz triples, one per prop vertex. */
+  readonly propNormals: Float32Array;
+  /** Per-prop-vertex colour, rgb triples, LINEAR in [0, 1]. */
+  readonly propColors: Float32Array;
+  /** Triangle indices into `propPositions`. */
+  readonly propIndices: Uint32Array;
+  /**
+   * Props this node owns -- i.e. whose centre lies in its square.
+   *
+   * Not derivable from the buffers: trees and bushes cost different vertex
+   * counts, so an object count is what the HUD and the soak want.
+   */
+  readonly props: number;
+  /**
+   * Of those, how many stand on ground THIS node renders within
+   * `PROP_SEAT_TOLERANCE` of their own base. Counted at lod 0 only; see
+   * `PROP_SEAT_LOD`.
+   *
+   * The anti-vacuity counter of Phase 7a. `props` says vegetation was placed;
+   * this says it sits on ground the world actually made. A regression in the
+   * stump / seating path leaves `props` untouched and drives this to zero.
+   */
+  readonly propsSeated: number;
+  /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
    *
@@ -432,7 +466,11 @@ export function chunkDataBytes(data: ChunkData): number {
     data.buildingPositions.byteLength +
     data.buildingNormals.byteLength +
     data.buildingColors.byteLength +
-    data.buildingIndices.byteLength
+    data.buildingIndices.byteLength +
+    data.propPositions.byteLength +
+    data.propNormals.byteLength +
+    data.propColors.byteLength +
+    data.propIndices.byteLength
   );
 }
 
@@ -466,6 +504,10 @@ export function chunkDataTransferables(data: ChunkData): Transferable[] {
     data.buildingNormals.buffer as ArrayBuffer,
     data.buildingColors.buffer as ArrayBuffer,
     data.buildingIndices.buffer as ArrayBuffer,
+    data.propPositions.buffer as ArrayBuffer,
+    data.propNormals.buffer as ArrayBuffer,
+    data.propColors.buffer as ArrayBuffer,
+    data.propIndices.buffer as ArrayBuffer,
   ];
 }
 

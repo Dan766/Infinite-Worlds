@@ -144,7 +144,14 @@ const MAX_DRAW_CALLS = 680; //           3a measured       292 -- 5 measured    
  * If this fires, check `bytes per chunk` in the report before assuming a bug;
  * that figure is the one that isolates a real regression from a wetter route.
  */
-const MAX_CHUNK_BYTES = 100 * 1024 * 1024;
+/**
+ * Peak transferable bytes across live + cached chunks.
+ *
+ * Phase 7a measured 106.5 MB with forests resident (prop submeshes on lod 0-2).
+ * Re-derived from that run rather than raised quietly: 120 MB leaves ~12%
+ * headroom over the measured peak without inviting unbounded growth.
+ */
+const MAX_CHUNK_BYTES = 120 * 1024 * 1024;
 
 /**
  * Pitch in degrees for the two legs of the flight.
@@ -361,6 +368,24 @@ const MIN_BUILDINGS_SEEN = 3000; //          measured 12,012 over the run
 const MIN_BUILDING_DRAW_CALLS = 4; //        measured    12 peak
 const MIN_BUILDINGS_LEVEL_FRACTION = 0.6; // measured  0.96 of lod-0 building-samples
 
+/**
+ * PHASE 7a: THE SAME GUARD FOR PROPS, ON DENSER CONTENT.
+ *
+ * World vegetation is continuous across the map, so residency and draw-call
+ * halves are easier to satisfy than they were for buildings -- but seating is
+ * the anti-vacuity number that goes to zero if the stump / groundAt path
+ * regresses while props keep being placed and drawn. Floors start conservative
+ * and are re-derived from a measured 300 s run; do not raise quietly.
+ *
+ *  - `propsSeen` is CUMULATIVE.
+ *  - `propDrawCalls` says a canopy REACHED THE RASTERISER.
+ *  - `propsSeated` says props sit on ground THIS node renders.
+ */
+const MIN_PROP_NODES = 60; //                 measured   201 peak of 309 live
+const MIN_PROPS_SEEN = 20000; //              measured 66,719 over the run
+const MIN_PROP_DRAW_CALLS = 20; //            measured    68 peak
+const MIN_PROPS_SEATED_FRACTION = 0.7; //     measured  1.00 of lod-0 prop-samples
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -542,6 +567,15 @@ try {
   );
   const buildingChunksAtStart = buildingsBefore.filter((b) => b !== null && b > 0).length;
 
+  // ...and whether a PROP stands in it. Phase 7a folds `propPositions` into the
+  // geometry hash. Without vegetation in the round-tripped square that term is
+  // the hash of an empty array on every chunk compared.
+  const propsBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkProps(x, z, 2),
+    [originX, originZ],
+  );
+  const propChunksAtStart = propsBefore.filter((p) => p !== null && p > 0).length;
+
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
   await page.evaluate(() => window.__app.resetFrameStats());
@@ -655,6 +689,13 @@ try {
   const measuredBuildings = samples.reduce((sum, s) => sum + s.buildingsMeasured, 0);
   const levelBuildings = samples.reduce((sum, s) => sum + s.buildingsLevel, 0);
   const levelFraction = measuredBuildings === 0 ? 0 : levelBuildings / measuredBuildings;
+  const propDraws = samples.map((s) => s.propDrawCalls);
+  const propNodes = samples.map((s) => s.propNodes);
+  const propsLive = samples.map((s) => s.props);
+  const propTris = samples.map((s) => s.propTriangles);
+  const measuredProps = samples.reduce((sum, s) => sum + s.propsMeasured, 0);
+  const seatedProps = samples.reduce((sum, s) => sum + s.propsSeated, 0);
+  const seatedFraction = measuredProps === 0 ? 0 : seatedProps / measuredProps;
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -847,6 +888,25 @@ try {
   );
   console.log(
     `  houses at the start ${buildingChunksAtStart}/${buildingsBefore.length} round-tripped chunks`,
+  );
+
+  console.log('props (Phase 7a)');
+  console.log(
+    `  prop nodes        ${max(propNodes)} peak of ${max(lives)} live nodes (floor ${MIN_PROP_NODES})`,
+  );
+  console.log(`  props live        ${max(propsLive)} peak`);
+  console.log(`  prop tris         ${max(propTris)} peak`);
+  console.log(`  props DRAWN       ${max(propDraws)} peak (floor ${MIN_PROP_DRAW_CALLS})`);
+  console.log(
+    `  draws without it  ${max(draws.map((d, i) => d - propDraws[i]))} peak prop-free draw calls`,
+  );
+  console.log(
+    `  SEATED            ${seatedProps}/${measuredProps} lod-0 prop-samples` +
+      ` = ${(seatedFraction * 100).toFixed(0)}% (floor ${(MIN_PROPS_SEATED_FRACTION * 100).toFixed(0)}%)`,
+  );
+  console.log(`  props SEEN        ${finalSnapshot.propsSeen} over the run (floor ${MIN_PROPS_SEEN})`);
+  console.log(
+    `  props at the start ${propChunksAtStart}/${propsBefore.length} round-tripped chunks`,
   );
 
   console.log('');
@@ -1187,6 +1247,59 @@ try {
     failures.push(
       'none of the round-tripped chunks contained a building, so the ' +
         'byte-identical-regeneration check said nothing about the building ' +
+        'geometry the hash now covers. Move the flight start, deliberately, ' +
+        'rather than dropping this check.',
+    );
+  }
+
+  // ---- props, and the vacuity guards around them -------------------------
+  if (max(propTris) === 0) {
+    failures.push(
+      'no prop geometry was generated at any point in the flight. Either ' +
+        'vegetation placement is broken or the flight never reached growable ' +
+        'ground -- in which case every prop check in this run passed vacuously.',
+    );
+  }
+  if (max(propNodes) < MIN_PROP_NODES) {
+    failures.push(
+      `only ${max(propNodes)} prop-bearing nodes were ever resident (floor ` +
+        `${MIN_PROP_NODES}). The flight barely reached a forest.`,
+    );
+  }
+  if (finalSnapshot.propsSeen < MIN_PROPS_SEEN) {
+    failures.push(
+      `only ${finalSnapshot.propsSeen} props were generated in the whole ` +
+        `flight (floor ${MIN_PROPS_SEEN}). Vegetation is continuous across the ` +
+        'map, so a number this low means the accept gate is refusing nearly ' +
+        'everything, not that the sampling missed it.',
+    );
+  }
+  if (max(propDraws) < MIN_PROP_DRAW_CALLS) {
+    failures.push(
+      `props were drawn at most ${max(propDraws)} times in a frame (floor ` +
+        `${MIN_PROP_DRAW_CALLS}). A prop existing and a prop RENDERING are ` +
+        'different claims; this run only made the first one.',
+    );
+  }
+  if (measuredProps === 0) {
+    failures.push(
+      'no prop had its seating measured: every prop-bearing node resident at a ' +
+        'sample was coarser than lod 0. The one number that says vegetation sits ' +
+        'on ground the world made has no denominator.',
+    );
+  } else if (seatedFraction < MIN_PROPS_SEATED_FRACTION) {
+    failures.push(
+      `only ${(seatedFraction * 100).toFixed(0)}% of lod-0 props sat within ` +
+        `tolerance of their own base (floor ${(MIN_PROPS_SEATED_FRACTION * 100).toFixed(0)}%). ` +
+        'THE ANTI-VACUITY NUMBER OF PHASE 7a: props would still be placed, still ' +
+        'be drawn and still round-trip identically while floating over grass. ' +
+        'Look at the stump / groundAt path.',
+    );
+  }
+  if (propChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks contained a prop, so the ' +
+        'byte-identical-regeneration check said nothing about the prop ' +
         'geometry the hash now covers. Move the flight start, deliberately, ' +
         'rather than dropping this check.',
     );
