@@ -20,6 +20,7 @@
 import { rngAt2i } from '../core/hash';
 import {
   gradeSurface,
+  gradeTarget,
   humidity,
   SEA_LEVEL,
   sampleHeight,
@@ -36,6 +37,7 @@ import {
   GRADE_SURFACE,
 } from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
+import { buildDeckSurface, type DeckPalette } from './road-mesh';
 import { sectorStreetField } from './streets';
 import {
   CHUNK_DATA_VERSION,
@@ -287,6 +289,35 @@ const SILT: readonly [number, number, number] = [0.33, 0.35, 0.29];
  * the only one.
  */
 const ROAD: readonly [number, number, number] = [0.42, 0.37, 0.31];
+
+/**
+ * The Phase 5 deck palette: the metalled bed of a road, and the gravel of a
+ * village lane.
+ *
+ * Both are darker and flatter than `ROAD`, and that is what makes the phase
+ * legible. `ROAD` now reads as the graded verge -- the ground a road has
+ * disturbed, quantised to the terrain lattice and tapered by the grading -- and
+ * the deck reads as the exact strip laid on top of it, at exactly the width the
+ * road record says. A street deck is lighter because a village lane is dirt
+ * rather than made surface, which is also what separates the ring of a village
+ * from the road running through it from the air.
+ *
+ * They live here with the rest of the palette rather than in `road-mesh.ts`, so
+ * `chunk-gen.ts` stays what its header claims: the single testable source of
+ * truth for what the world looks like. `buildDeckSurface` takes them as an
+ * argument in LINEAR space.
+ */
+const ROAD_DECK: readonly [number, number, number] = [0.34, 0.32, 0.3];
+const STREET_DECK: readonly [number, number, number] = [0.47, 0.43, 0.36];
+
+const DECK_PALETTE: DeckPalette = {
+  road: [srgbToLinear(ROAD_DECK[0]), srgbToLinear(ROAD_DECK[1]), srgbToLinear(ROAD_DECK[2])],
+  street: [
+    srgbToLinear(STREET_DECK[0]),
+    srgbToLinear(STREET_DECK[1]),
+    srgbToLinear(STREET_DECK[2]),
+  ],
+};
 
 /** Metres ABOVE SEA LEVEL at which snow starts, before the temperature shift. */
 const SNOW_LINE = 195;
@@ -824,6 +855,42 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   const surfaceAt = (col: number, row: number): number =>
     surfacing[(row + 1) * padded + (col + 1)] as number;
 
+  /**
+   * The ground this node actually RENDERS at a node-local point, in absolute
+   * metres. Phase 5's deck is fitted to this and not to `sampleHeight`.
+   *
+   * It interpolates the two TRIANGLES of a cell rather than doing a bilinear
+   * blend of its four corners, because those are different surfaces wherever a
+   * quad is twisted, and only one of them is what the rasteriser draws. The
+   * split follows the index winding below -- `(a, c, b)` then `(b, c, d)` -- so
+   * the diagonal runs from `(col + 1, row)` to `(col, row + 1)` and the near
+   * triangle is `fx + fz <= 1`.
+   *
+   * Clamped to the padded grid, so the up-to-`ROAD_HALF_WIDTH_MAX` of deck that
+   * overhangs the node edge is fitted to the nearest ground this node knows
+   * about rather than to nothing.
+   */
+  const groundAt = (localX: number, localZ: number): number => {
+    let cf = localX / step;
+    let rf = localZ / step;
+    if (cf < -1) cf = -1;
+    else if (cf > SEGMENTS + 1) cf = SEGMENTS + 1;
+    if (rf < -1) rf = -1;
+    else if (rf > SEGMENTS + 1) rf = SEGMENTS + 1;
+    let c0 = Math.floor(cf);
+    let r0 = Math.floor(rf);
+    if (c0 > SEGMENTS) c0 = SEGMENTS;
+    if (r0 > SEGMENTS) r0 = SEGMENTS;
+    const fx = cf - c0;
+    const fz = rf - r0;
+    const h00 = heightAt(c0, r0);
+    const h10 = heightAt(c0 + 1, r0);
+    const h01 = heightAt(c0, r0 + 1);
+    const h11 = heightAt(c0 + 1, r0 + 1);
+    if (fx + fz <= 1) return h00 + fx * (h10 - h00) + fz * (h01 - h00);
+    return h11 + (1 - fx) * (h01 - h11) + (1 - fz) * (h10 - h11);
+  };
+
   let minY = Infinity;
   let maxY = -Infinity;
 
@@ -964,6 +1031,19 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
   // below sea level, which is most of them.
   const water = buildWaterSurface(heightAt, step);
 
+  // -- the road and street deck ---------------------------------------------
+  //
+  // Built against `groundAt` -- THIS node's rendered ground -- rather than
+  // against `sampleHeight`, which is the whole reason a deck is per-chunk
+  // geometry. See `road-mesh.ts`.
+  //
+  // `gradeTarget` reuses the same `blend` the vertex loop above finished with,
+  // which is safe because the loop is done and `reset` is the first thing it
+  // does -- the same caller-owned discipline `GradeBlend` is built for.
+  const targetAt = (worldX: number, worldZ: number): number =>
+    gradeTarget(region, sectors, worldX, worldZ, blend);
+  const deck = buildDeckSurface(coord, region.roads, sectors, groundAt, targetAt, DECK_PALETTE);
+
   return {
     version: CHUNK_DATA_VERSION,
     coord: { x: coord.x, z: coord.z, lod: coord.lod },
@@ -975,9 +1055,14 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     waterPositions: water.positions,
     waterColors: water.colors,
     waterIndices: water.indices,
+    deckPositions: deck.positions,
+    deckNormals: deck.normals,
+    deckColors: deck.colors,
+    deckIndices: deck.indices,
     riverVertices,
     roadVertices,
     streetVertices,
+    bridgeVertices: deck.bridgeVertices,
     color: chunkColor(coord, worldSeed),
     minY,
     maxY,

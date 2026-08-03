@@ -84,6 +84,7 @@ src/
     rivers.ts           Region-tier flow accumulation and the channel carve
     roads.ts            Region-tier settlement siting, road graph, routing, grading
     streets.ts          Sector-tier street layout inside a settlement
+    road-mesh.ts        the road and street DECK: carriageway geometry, per chunk
     grading.ts          the one weighted-average blend everything that moves ground joins
     cell-heap.ts        deterministic (key, index)-ordered min-heap, shared by both
     chunk-gen.ts        pure generation; runs in the worker AND in Node tests
@@ -166,6 +167,7 @@ rivers.ts       pure functions   Region tier; imports contracts + noise ONLY
 grading.ts      pure functions   the blend rule; imports noise ONLY
 roads.ts        pure functions   Region tier; imports contracts + grading + noise
 streets.ts      pure functions   Sector tier; imports contracts + grading + roads
+road-mesh.ts    pure functions   deck geometry; imports contracts + roads + streets
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
@@ -479,6 +481,81 @@ is non-zero across a whole settlement with no street in it at all -- "the flight
 never reached a village" and "street layout silently returns nothing" would
 produce identical evidence. This counts the Sector-tier contribution alone.
 
+### Decks: the carriageway as geometry, and the first new mesh since Phase 3a
+
+Phase 5. Everything from 3b to 4b modified the terrain mesh every node already
+had -- a river is a dent in it, a road is a bench and a colour, a street is the
+same one tier down -- so none of them could cost a draw call. A deck is separate
+geometry and does, which is why 4b said in advance that this is the phase whose
+budgets should move.
+
+**Why a deck at all.** Phase 4a's surfacing is a per-vertex colour on the terrain
+lattice, so a road's width is quantised to that lattice. At lod 0 that is 2 m on
+a 7-12 m road; by lod 4 it is 64 m and the road has washed out to a stain while
+still being several pixels wide on screen. A deck's width comes from the road
+record, so it is exact at every level. The second reason is the one 4a deferred:
+a road crossing a river was a ford, and a deck spans it.
+
+**A deck is per-chunk geometry, generated in the worker, exactly like water.**
+One mesh per routed road is the obvious alternative and fails four ways: its
+extent is not a function of `(worldSeed, coord)`, so the streamer, the LRU and
+the soak's round-trip hash do not cover it; it cannot be clipped to what the
+quadtree currently covers; no single worker owns a road; and — the one that
+settles it — **it cannot follow the level of detail.** A node's rendered ground
+is the interpolation of its own lattice, which at lod 5 cuts corners by metres, so
+a lod-independent deck sinks into a coarse hillside and floats over a coarse
+valley. Roads are in valleys.
+
+**The rule is `max(blended target, this node's ground)`, and the bridge falls out
+of it.** `GradeBlend.target` is the altitude everything grading a point agrees
+on, before the strength, the cut and fill caps and the river yield are applied;
+`gradeTarget` in `height-field.ts` is the same accumulation `gradeSurface`
+performs, stopped one step short. Four cases, all wanted:
+
+| where | ground | deck |
+| ----- | ------ | ---- |
+| ordinary terrain | reached the target | flush on the ground |
+| village edge | the pad/road/street average | flush, because it reads the same average |
+| clamped cut on a hillside | above the target | rides the ground |
+| inside a river channel | yielded entirely | holds the target: a bridge |
+
+Building the deck from a road's OWN profile was tried first and floated a metre
+or two over every village approach, because the average is not any one
+contributor's profile — which is the whole point of `grading.ts`.
+
+**The apron does the terrain skirt's job and the bridge's, with one mechanism.**
+Every deck edge hangs an apron below it: buried and invisible where the deck
+rests on the ground, and the side of the bridge where it does not. It carries
+both windings with a single-sided material, for the reason
+`SKIRT_TRIANGLE_COUNT` gives. `DECK_BEAM` bounds how far it may follow the ground
+down, and that bound is load-bearing: without it a deck over a 15 m channel
+produced a solid wall from bank to bank standing in the water — the dam
+`ROAD_RIVER_YIELD` exists to prevent, one layer up.
+
+**Two same-level neighbours agree exactly, by arithmetic.** A centreline is
+clipped to the node square parametrically, and the two sides of a shared boundary
+solve the same equation with opposite signs — `(maxX - ax) / dx` against
+`(ax - minX) / -dx` — which IEEE-754 makes bit-identical. Both nodes place a
+station at the same world point and sample the same ground along the shared edge,
+so the deck is partitioned rather than shared or dropped: no seam, no
+double-drawn overlap. The box is half-open on its maximum edges so a segment
+running exactly along a boundary belongs to one neighbour and not both.
+
+**Ownership needs one rule for roads and none for streets.** Two regions both
+route a road near their shared boundary and hold bit-identical copies of it, so a
+segment is emitted by the region containing its MIDPOINT — a purely positional
+rule, so exactly one region emits each. Streets need nothing: a sector lays out
+only the settlement whose centre it contains, so two sectors never hold the same
+street.
+
+**The sectors a node visits are enumerated, not searched for.** Sweeping the
+sector grid is what `sectorStreetField.accumulate` does per vertex and it is
+correct for a vertex; for a NODE at the root level it is an 11x11 block, which
+overran the street memo and cost 96 s on one canonical view. A street plan exists
+only where a settlement centre is, and the region records already list every
+settlement that can reach the node, so the sectors worth visiting are known
+exactly: none normally, one over a village.
+
 ### The region memo is derived data, and it is bounded
 
 Every chunk vertex needs river influence; a chunk is ~1,200 vertices and hundreds
@@ -498,6 +575,29 @@ One consequence worth knowing: **the first `sampleHeight` call on a new seed
 routes a region synchronously**, ~56 ms. On the main thread that happens once, in
 the `App` constructor, seating the cube and resolving the default camera Y. It is
 not per frame and it is not per chunk.
+
+**Both memo sizes were wrong until Phase 5 measured them, and each was wrong in
+the same shape: smaller than the working set of a single coarse node.** A node at
+the root level covers a whole 4 km region, so its padded sample grid needs a 3x3
+block of ROAD networks and an 11x11 block of STREET plans. `ROAD_CACHE_LIMIT` was
+8 against nine, and `STREET_CACHE_LIMIT` 64 against 121 — and being one short is
+the worst possible size, because the entry evicted is always the one wanted next
+and a sweep rebuilds every record it touches instead of building each once.
+
+Neither was visible before, because a VERTEX touches one region and up to four
+sectors and both caches absorbed that; it took a builder that sweeps a whole node
+in one go to expose it, and a measurement rather than a guess to attribute it.
+The numbers, on real work rather than a microbenchmark:
+
+| measured | before | after |
+| -------- | ------ | ----- |
+| one root-level node, warm | 3.6 s (10.5 s with a deck) | ~6 ms |
+| `seed-canary-inland` to `__worldReady` | 96 s, against a 120 s harness limit | ~16 s |
+
+The limits are now 16 and 192. The cost is memory (a megabyte or two per JS
+context, against a 400 MB budget) and a longer linear scan — but move-to-front
+keeps the handful of records a FINE node uses at the front of the array, so the
+scan stays short exactly where the vertex count is high.
 
 ### `sampleHeight` is the only description of the ground
 
@@ -762,6 +862,17 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
+**KNOWN BROKEN SINCE PHASE 5: the eight wireframe views that contain a deck are
+not reproducible.** They come back with a different hash on every run, so
+`shots:check` reports `8 changed`. The 29 shaded views and `chunks-wireframe` --
+the one wireframe view with no deck in it -- are byte-identical on every run, so
+the harness still catches a change to anything else. The leading suspect is that
+WebGL exposes no `POLYGON_OFFSET_LINE`: `polygonOffset` is what keeps a deck in
+front of coplanar ground and applies to filled polygons only, so in wireframe the
+deck's lines and the terrain's sit at an exact depth tie. Sharing `renderOrder`
+with the terrain was investigated and ruled out. Full write-up, including the
+next experiment to run, is in `PROGRESS.md` under Phase 5.
+
 ### Static subpath
 
 ```
@@ -846,6 +957,38 @@ counts the SECTOR-tier contribution alone -- a settlement pad already surfaces
 every vertex in a village, so a combined number would be non-zero with no street
 in it at all.
 
+**Since Phase 5 the flight also has to pass a DECK and cross a BRIDGE, and the
+start did not have to move a fifth time.** A deck is its own submesh, so
+`deckNodes` and `deckDrawCalls` mirror the water pair rather than the river one,
+and `sampleChunkDecks` says the round-tripped square had carriageway geometry in
+it — which matters, because the geometry hash now folds `deckPositions` in and
+would otherwise be hashing an empty array. `bridgeNodes` is the sharp one and it
+is CUMULATIVE rather than instantaneous: bridges are counted at lod 0 only (see
+below), so a bridge node is resident for about seven seconds as the camera passes
+against a five-second sampling interval, and an instantaneous peak would be a
+coin flip. A floor built on a coin flip is a check people re-run until it goes
+green.
+
+**Bridges are counted at lod 0 only, and that was measured rather than assumed.**
+A deck stands at the blended target; the GROUND reaches that target only where
+the vertex lattice has samples inside a 2.6-6 m roadbed. At lod 0 the spacing is
+2 m and several do; at lod 3 it is 16 m and usually none, so the deck legitimately
+stands clear of ground the lattice cannot describe. Counting that inflated the
+soak's peak by roughly an order of magnitude and turned the one number that says
+"a road crossed a river" into a statement about mesh resolution. The geometry is
+unaffected at every level; only the statistic is taken where it means something.
+
+**`__worldReady` was not enough to anchor the flight, and Phase 5 found out
+why.** Phase 4b stopped the autopilot advancing before the world was ready, which
+removed 400-900 m of drift from every "at the start" claim. What it could not
+remove is the rest: readiness is observed by POLLING from Node, and a main thread
+building a hundred meshes under a software rasteriser stalls for over a second at
+a time, so the poll lands late — 1,296 m downrange on the run that exposed it,
+which put the round-tripped square out over open sea and failed three checks that
+had nothing wrong with them. The soak now sets `window.__flightReleased = false`
+before the document runs and clears it once every baseline has been read. It is
+opt-in, so a human opening a `?fly=` URL is unaffected.
+
 **Since Phase 3b the flight also has to cross a river, and that needs its own
 guard for a reason water did not.** Water is its own submesh, so "was any sea
 drawn" is answerable by looking at the object list. A river is not a mesh -- it
@@ -875,12 +1018,12 @@ trip, or on any page error.
 **GPU-independent budgets are hard failures since Phase 2a**, because they are
 the only budgets this container can honestly judge:
 
-| Budget                        | Limit     | 3a measured | 3b measured | 4a measured | 4b measured |
-| ----------------------------- | --------- | ----------- | ----------- | ----------- | ----------- |
-| live triangles                | 2,100,000 | 1,229,124   | 1,225,890   | 1,184,272   | 1,144,318   |
-| live vertices                 | 1,040,000 | 610,917     | 610,035     | 589,065     | 567,869     |
-| draw calls                    | 500       | 292         | 288         | 291         | 290         |
-| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB     | 90.5 MB     | 84.8 MB     |
+| Budget                        | Limit     | 3a measured | 3b measured | 4a measured | 4b measured | 5 measured |
+| ----------------------------- | --------- | ----------- | ----------- | ----------- | ----------- | ---------- |
+| live triangles                | 2,100,000 | 1,229,124   | 1,225,890   | 1,184,272   | 1,144,318   | 1,368,596  |
+| live vertices                 | 1,040,000 | 610,917     | 610,035     | 589,065     | 567,869     | 673,805    |
+| draw calls                    | **680**   | 292         | 288         | 291         | 290         | 398        |
+| chunk payload bytes           | 100 MB    | 92.5 MB     | 92.9 MB     | 90.5 MB     | 84.8 MB     | 86.8 MB    |
 
 **Phase 3b breached none of them and re-derived none of them.** Rivers are
 carved into the terrain mesh every node already had, so they add no draw call
@@ -905,6 +1048,26 @@ and the autopilot now waits for `__worldReady`, so the run measures a different
 6.75 km of world from the one 4a measured. **Phase 5's road meshes are the first
 thing since 2b that should expect to move these numbers**, and the instruction is
 unchanged: re-derive with a stated number rather than raising a limit quietly.
+
+**Phase 5 moved one of the four, and said in advance that it would.** A deck is
+the first geometry since Phase 3a's water to cost a draw call of its own. The
+shallow-leg peak went from 292 to 398, and TWO separate things did that:
+
+- **decks themselves, +34 at the peak frame.** `draws without it` in the report
+  reads 364, which is the figure that isolates them.
+- **the flight, +72** — and it is not the START that moved, it is that the flight
+  now actually begins there. Before the `__flightReleased` gate the camera had
+  already drifted up to 1.3 km downrange, so every earlier number in this table
+  was measured over a route nobody chose.
+
+`draw calls` is therefore re-derived at 680, which is 1.71x the new peak — the
+same factor 2b and 3a used — and still far under RULE 5's ceiling of 1200. **The
+other three are deliberately left alone.** None was breached, all three still hold
+about 1.5x, and a limit with less slack catches a regression sooner. The payload
+budget's structural ceiling does rise, because a deck adds up to 28 kB to a lod-0
+node and 70 kB to a root one, so the most expensive possible node goes from
+129,744 to about 158,000 bytes and the ceiling from ~108 MB to ~131 MB; 100 MB is
+still comfortably below it and still fireable.
 
 **One caveat on the screenshot baselines, found in Phase 4b.** The committed PNGs
 are specific to the machine that captured them, not just to SwiftShader: the set

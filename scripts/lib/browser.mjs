@@ -87,7 +87,7 @@ const READY_TIMEOUT_MS = 120000;
 export async function openPage(
   browser,
   url,
-  { viewport = VIEWPORT, timeout = READY_TIMEOUT_MS } = {},
+  { viewport = VIEWPORT, timeout = READY_TIMEOUT_MS, holdFlight = false } = {},
 ) {
   const context = await browser.newContext({
     viewport,
@@ -95,6 +95,25 @@ export async function openPage(
     reducedMotion: 'reduce',
     colorScheme: 'dark',
   });
+  // HOLD THE AUTOPILOT UNTIL THE CALLER HAS TAKEN ITS BASELINE.
+  //
+  // Phase 4b stopped the flight advancing before `window.__worldReady`, which
+  // fixed the 400-900 m of drift the soak's "at the start" claims used to suffer
+  // from. It cannot fix the rest of the gap: readiness is observed by POLLING
+  // from Node, and a main thread building a hundred meshes stalls for over a
+  // second at a time under a software rasteriser, so the poll can land tens of
+  // seconds late -- 1,296 m downrange on the run that exposed this, which put
+  // the round-tripped square out over open sea and failed three checks that had
+  // nothing wrong with them.
+  //
+  // The flag is opt-in and set BEFORE the document runs, so nothing but a
+  // harness that asked for it is affected: `undefined !== false` releases the
+  // flight, which is what a human opening a `?fly=` URL gets.
+  if (holdFlight) {
+    await context.addInitScript(() => {
+      window.__flightReleased = false;
+    });
+  }
   const page = await context.newPage();
 
   const consoleErrors = [];

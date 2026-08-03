@@ -543,6 +543,34 @@ export function gradeSurface(
   blend.resolve(carved, riverDrop, out);
 }
 
+/**
+ * The blended TARGET altitude at a point: the same accumulation `gradeSurface`
+ * performs, stopped one step short of resolving it.
+ *
+ * Phase 5's deck is placed AT this altitude rather than moved toward it, so it
+ * has to be the identical composition -- both tiers, one weighted average. A
+ * deck that accumulated only the Region tier would float above the ground at
+ * every village edge, and one that used a road's own profile instead of the
+ * average would do the same. Sharing this function is what makes "the deck lies
+ * flush wherever the grading succeeded" true by construction rather than by
+ * tuning.
+ *
+ * `-Infinity` where nothing grades the point, so `max(ground, target)` needs no
+ * special case. See `GradeBlend.target`.
+ */
+export function gradeTarget(
+  region: RegionField,
+  sectors: SectorField,
+  x: number,
+  z: number,
+  blend: GradeBlend,
+): number {
+  blend.reset();
+  region.roads.accumulate(x, z, blend);
+  sectors.accumulate(x, z, blend);
+  return blend.target;
+}
+
 /** One scratch pair for the main thread's own `sampleHeight`. Never re-entered. */
 const mainBlend = new GradeBlend();
 const mainOut = new Float64Array(GRADE_OUT_LENGTH);

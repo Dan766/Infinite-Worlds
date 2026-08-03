@@ -93,9 +93,34 @@ const MIN_CHUNKS_STREAMED = 50;
  * remain far under the project ceiling of 1200 draw calls: the ceiling says
  * what the hardware can take, these say what the world costs today.
  */
-const MAX_LIVE_TRIANGLES = 2_100_000; // measured 1,229,124 peak -- 1.71x
-const MAX_LIVE_VERTICES = 1_040_000; //  measured   610,917 peak -- 1.70x
-const MAX_DRAW_CALLS = 500; //           measured       292 peak -- 1.71x
+const MAX_LIVE_TRIANGLES = 2_100_000; // 3a measured 1,229,124 -- 5 measured 1,368,596, 1.53x
+const MAX_LIVE_VERTICES = 1_040_000; //  3a measured   610,917 -- 5 measured   673,805, 1.54x
+/**
+ * RE-DERIVED IN PHASE 5, AND IT IS THE ONLY ONE OF THE FOUR THAT MOVED.
+ *
+ * A deck is the first geometry since Phase 3a's water to cost a draw call of its
+ * own, and Phase 4b said in advance that this phase should expect to move these
+ * numbers rather than raise a limit quietly. The measured shallow-leg peak went
+ * from 292 to 398. TWO SEPARATE THINGS DID THAT and they are worth keeping
+ * apart, because only one of them is this phase's content:
+ *
+ *   decks themselves     +34 at the peak frame (`draws without it` reads 364)
+ *   the flight moved     +72, and it is not the START that moved -- it is that
+ *                        the flight now actually begins there. The autopilot is
+ *                        held until the soak has read its baseline (see
+ *                        `holdFlight`), and before that the camera had already
+ *                        drifted up to 1.3 km downrange while Node polled for
+ *                        readiness. Every earlier number in this column was
+ *                        measured over a route nobody chose.
+ *
+ * 680 is 1.71x the new peak -- the same factor Phase 2b and 3a used -- and still
+ * a long way under RULE 5's ceiling of 1200. The ceiling says what the hardware
+ * can take; this says what the world costs today, so a regression fails instead
+ * of quietly consuming slack. The other three limits are deliberately NOT
+ * raised: they were not breached, they still hold 1.5x, and a limit with less
+ * slack catches a regression sooner.
+ */
+const MAX_DRAW_CALLS = 680; //           3a measured       292 -- 5 measured       398, 1.71x
 /**
  * Live plus cached payload bytes held by the streamer. Measured 92.5 MB peak.
  *
@@ -105,7 +130,14 @@ const MAX_DRAW_CALLS = 500; //           measured       292 peak -- 1.71x
  * most expensive possible node is one entirely at sea at 129,744 bytes, so the
  * absolute ceiling is about 108 MB. Anything above that could never fire.
  *
- * 100 MB is 1.08x the measured peak and comfortably below 108, so a per-node
+ * PHASE 5 RAISES THAT CEILING AND LEAVES THE BUDGET WHERE IT IS. A deck adds up
+ * to about 28 kB to a node at lod 0 and 70 kB to one at the root level, so the
+ * worst possible node is now nearer 158 kB and the structural ceiling nearer
+ * 131 MB. The measured peak barely moved -- 84.8 MB to 86.8 MB -- because decks
+ * are sparse and the flight is mostly over sea and empty hillside, which is the
+ * whole reason an absent deck is required to cost exactly zero bytes.
+ *
+ * 100 MB is 1.15x the measured peak and comfortably below 131, so a per-node
  * size regression -- the thing this budget actually guards -- still trips it.
  * Be aware of the cost of that tightness: a flight spending its whole length
  * over open ocean rather than half of it would legitimately land nearer 104 MB.
@@ -265,6 +297,42 @@ const MIN_STREET_NODES = 12; //             measured  44 peak of 309 live
 const MIN_STREET_DRAW_CALLS = 4; //         measured  14 peak
 const MIN_SHALLOW_STREET_DRAW_CALLS = 4; // measured  14 peak
 
+/**
+ * PHASE 5: THE SAME GUARD FOR DECKS, AND THE FIRST ONE SINCE PHASE 3a WHERE
+ * "DRAWN" AND "RESIDENT" ARE DIFFERENT OBJECTS RATHER THAN THE SAME ONE.
+ *
+ * Rivers, roads and streets are all features of the terrain mesh, so their
+ * `*DrawCalls` counters come off `onBeforeRender` on that mesh. A deck is its
+ * own submesh, like water, so `deckDrawCalls` counts the deck being submitted.
+ * Both halves still matter for the same reason they do for water: a world full
+ * of carriageway that never enters the frustum would pass every check written
+ * against residency alone.
+ *
+ * `bridgeNodes` is the sharpest of them and the one this phase actually turns
+ * on. A road crossing a river was a FORD until now -- `grading.ts` yields inside
+ * a channel, so the roadbed ran to the bank and stopped. The deck spans it, and
+ * this is the only number in the run that says the span happened: it is measured
+ * off the GEOMETRY (deck stations standing clear of the ground), not off
+ * `RoadNetwork.segCrossing`, which said a crossing was there long before
+ * anything was built over it.
+ *
+ * IT IS CUMULATIVE, AND THAT IS NOT A CONVENIENCE. Bridges are counted at lod 0
+ * only (see `BRIDGE_COUNT_LOD`), so a bridge node is resident for about seven
+ * seconds as the camera passes it, against a five-second sampling interval --
+ * an instantaneous peak would be a coin flip, and a floor built on a coin flip
+ * is a check people re-run until it goes green. `bridgeNodes` only rises, so it
+ * cannot be missed between two samples. The instantaneous vertex count is still
+ * reported, because it is what says how big the bridge was.
+ *
+ * Measured on the corridor offline before the floor was set: four chunk columns
+ * carry a bridge, around x = -3,700, which the flight passes at about t = 68 s
+ * outbound and t = 232 s on the return.
+ */
+const MIN_DECK_NODES = 20; //              measured  89 peak of 304 live
+const MIN_DECK_DRAW_CALLS = 8; //          measured  24 peak
+const MIN_SHALLOW_DECK_DRAW_CALLS = 8; //  measured  24 peak
+const MIN_BRIDGE_NODES = 2; //             measured  10 over the run
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -360,6 +428,10 @@ console.log('');
 try {
   const { context, page, consoleErrors, failedRequests } = await openPage(browser, url, {
     timeout: 60000,
+    // The flight stays parked at `?pos=` until every baseline below has been
+    // read. See `holdFlight` in `lib/browser.mjs` for the run that made this
+    // necessary and for why `__worldReady` alone was not enough.
+    holdFlight: true,
   });
   const cdp = await context.newCDPSession(page);
 
@@ -422,9 +494,26 @@ try {
   );
   const streetChunksAtStart = streetBefore.filter((v) => v !== null && v > 0).length;
 
+  // ...and whether a DECK reached it. Phase 5 folds `deckPositions` into the
+  // geometry hash, so without a carriageway in the round-tripped square that
+  // half of the hash is the hash of an empty array and RULE 2 says nothing
+  // whatever about the phase that was just written.
+  const deckBefore = await page.evaluate(
+    ([x, z]) => window.__app.sampleChunkDecks(x, z, 2),
+    [originX, originZ],
+  );
+  const deckChunksAtStart = deckBefore.filter((t) => t !== null && t > 0).length;
+
   // Discard start-up hitches from the worst-frame figure: the first frames
   // compile shaders and build a hundred meshes, and that is not the leak.
   await page.evaluate(() => window.__app.resetFrameStats());
+
+  // Every baseline above was read with the camera parked exactly at `?pos=`.
+  // Release the flight only now, so "at the start" means the square this file
+  // names rather than wherever the camera drifted to while Node was polling.
+  await page.evaluate(() => {
+    window.__flightReleased = true;
+  });
 
   const samples = [];
   const startedAt = Date.now();
@@ -465,6 +554,7 @@ try {
       `river ${String(snapshot.riverDrawCalls).padStart(3)}/${String(snapshot.riverNodes).padStart(3)}  ` +
       `road ${String(snapshot.roadDrawCalls).padStart(3)}/${String(snapshot.roadNodes).padStart(3)}  ` +
       `street ${String(snapshot.streetDrawCalls).padStart(3)}/${String(snapshot.streetNodes).padStart(3)}  ` +
+      `deck ${String(snapshot.deckDrawCalls).padStart(3)}/${String(snapshot.deckNodes).padStart(3)}  ` +
       `fps ${snapshot.fps.toFixed(1).padStart(5)}  ` +
       `x ${Math.round(snapshot.cameraX)}${snapshot.shallow ? '  shallow' : ''}`;
     console.log(line);
@@ -512,6 +602,11 @@ try {
   const streetNodes = samples.map((s) => s.streetNodes);
   const streetVerts = samples.map((s) => s.streetVertices);
   const shallowStreetDraws = shallowSamples.map((s) => s.streetDrawCalls);
+  const deckDraws = samples.map((s) => s.deckDrawCalls);
+  const deckNodes = samples.map((s) => s.deckNodes);
+  const deckTris = samples.map((s) => s.deckTriangles);
+  const bridgeVerts = samples.map((s) => s.bridgeVertices);
+  const shallowDeckDraws = shallowSamples.map((s) => s.deckDrawCalls);
   const steepDraws = samples.filter((s) => s.shallow !== true).map((s) => s.drawCalls);
   // Where the heap trend window starts.
   //
@@ -667,6 +762,21 @@ try {
   console.log(
     `  street at the start ${streetChunksAtStart}/${streetBefore.length} round-tripped chunks`,
   );
+
+  console.log('decks and bridges (Phase 5)');
+  console.log(`  deck nodes        ${max(deckNodes)} peak of ${max(lives)} live nodes (floor ${MIN_DECK_NODES})`);
+  console.log(`  deck triangles    ${max(deckTris)} peak`);
+  console.log(`  decks DRAWN       ${max(deckDraws)} peak (floor ${MIN_DECK_DRAW_CALLS})`);
+  console.log(
+    `  ...on shallow leg ${shallowDeckDraws.length === 0 ? 'n/a' : max(shallowDeckDraws)} peak` +
+      ` (floor ${MIN_SHALLOW_DECK_DRAW_CALLS})`,
+  );
+  console.log(
+    `  draws without it  ${max(draws.map((d, i) => d - deckDraws[i]))} peak deck-free draw calls`,
+  );
+  console.log(`  BRIDGE nodes      ${finalSnapshot.bridgeNodes} over the run (floor ${MIN_BRIDGE_NODES})`);
+  console.log(`  bridge vertices   ${max(bridgeVerts)} peak live`);
+  console.log(`  deck at the start ${deckChunksAtStart}/${deckBefore.length} round-tripped chunks`);
 
   console.log('');
   console.log('frames');
@@ -906,6 +1016,54 @@ try {
       'none of the round-tripped chunks carried a street, so the ' +
         'byte-identical-regeneration check said nothing about the Sector tier. ' +
         'Move the flight start, deliberately, rather than dropping this check.',
+    );
+  }
+
+  // ---- decks and bridges, and the vacuity guards around them ------------
+  if (max(deckTris) === 0) {
+    failures.push(
+      'no deck geometry was generated at any point in the flight. Either the ' +
+        'carriageway builder is broken or the flight never passed a road -- in ' +
+        'which case every deck check in this run passed vacuously.',
+    );
+  }
+  if (max(deckNodes) < MIN_DECK_NODES) {
+    failures.push(
+      `only ${max(deckNodes)} deck-bearing nodes were ever resident (floor ` +
+        `${MIN_DECK_NODES}). The flight barely passed a road.`,
+    );
+  }
+  if (max(deckDraws) < MIN_DECK_DRAW_CALLS) {
+    failures.push(
+      `decks were drawn at most ${max(deckDraws)} times in a frame (floor ` +
+        `${MIN_DECK_DRAW_CALLS}). A deck existing and a deck RENDERING are ` +
+        'different claims; this run only made the first one.',
+    );
+  }
+  if (shallowSamples.length >= 3 && max(shallowDeckDraws) < MIN_SHALLOW_DECK_DRAW_CALLS) {
+    failures.push(
+      `the shallow-pitch leg drew decks at most ${max(shallowDeckDraws)} times ` +
+        `(floor ${MIN_SHALLOW_DECK_DRAW_CALLS}). The draw-call budget is decided ` +
+        'on that leg, and a deck is the first thing since Phase 3a to cost one, ' +
+        'so it was measured without the thing this phase added.',
+    );
+  }
+  if (finalSnapshot.bridgeNodes < MIN_BRIDGE_NODES) {
+    failures.push(
+      `only ${finalSnapshot.bridgeNodes} nodes carrying bridge geometry were ` +
+        `generated in the whole flight (floor ${MIN_BRIDGE_NODES}). A road ` +
+        'crossing a river was a ford before this phase and the deck is what ' +
+        'spans it, so this is the ONLY number in the run that says a bridge was ' +
+        'built. Either the max(target, ground) rule regressed or the flight ' +
+        'crossed no channel with a road over it.',
+    );
+  }
+  if (deckChunksAtStart === 0) {
+    failures.push(
+      'none of the round-tripped chunks carried a deck, so the ' +
+        'byte-identical-regeneration check said nothing about the carriageway ' +
+        'geometry the hash now covers. Move the flight start, deliberately, ' +
+        'rather than dropping this check.',
     );
   }
 

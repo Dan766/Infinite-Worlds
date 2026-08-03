@@ -685,7 +685,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(6);
+    expect(CHUNK_DATA_VERSION).toBe(7);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -693,6 +693,10 @@ describe('generateChunk', () => {
     expect(data.waterPositions).toBeInstanceOf(Float32Array);
     expect(data.waterColors).toBeInstanceOf(Float32Array);
     expect(data.waterIndices).toBeInstanceOf(Uint32Array);
+    expect(data.deckPositions).toBeInstanceOf(Float32Array);
+    expect(data.deckNormals).toBeInstanceOf(Float32Array);
+    expect(data.deckColors).toBeInstanceOf(Float32Array);
+    expect(data.deckIndices).toBeInstanceOf(Uint32Array);
     expect(data.indices.length % 3).toBe(0);
     for (const index of data.indices) {
       expect(index).toBeLessThan(data.positions.length / 3);
@@ -711,7 +715,11 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.waterPositions.buffer);
     expect(transferables).toContain(data.waterColors.buffer);
     expect(transferables).toContain(data.waterIndices.buffer);
-    expect(transferables).toHaveLength(7);
+    expect(transferables).toContain(data.deckPositions.buffer);
+    expect(transferables).toContain(data.deckNormals.buffer);
+    expect(transferables).toContain(data.deckColors.buffer);
+    expect(transferables).toContain(data.deckIndices.buffer);
+    expect(transferables).toHaveLength(11);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
@@ -719,21 +727,30 @@ describe('generateChunk', () => {
         data.colors.byteLength +
         data.waterPositions.byteLength +
         data.waterColors.byteLength +
-        data.waterIndices.byteLength,
+        data.waterIndices.byteLength +
+        data.deckPositions.byteLength +
+        data.deckNormals.byteLength +
+        data.deckColors.byteLength +
+        data.deckIndices.byteLength,
     );
   });
 
-  it('lists the EMPTY water buffers of an inland node as transferable too', () => {
+  it('lists the EMPTY water and deck buffers of a bare inland node as transferable too', () => {
     // A conditional transfer list is a rule with an exception, and the
     // exception is what a later phase forgets. Zero-length ArrayBuffers
     // transfer fine, so there is no exception: every bulk array, always.
     const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
     expect(data.waterIndices).toHaveLength(0);
     const transferables = chunkDataTransferables(data);
-    expect(transferables).toHaveLength(7);
-    expect(new Set(transferables).size).toBe(7);
+    expect(transferables).toHaveLength(11);
+    expect(new Set(transferables).size).toBe(11);
     expect(transferables).toContain(data.waterPositions.buffer);
-    // ...and an empty water surface must add exactly nothing to the payload.
+    expect(transferables).toContain(data.deckPositions.buffer);
+    // ...and an empty water surface AND an empty deck must add exactly nothing
+    // to the payload. That discipline is the whole reason a deck can exist at
+    // all inside the draw-call and payload budgets: roads are sparse, so most
+    // nodes must cost nothing for them.
+    expect(data.deckIndices).toHaveLength(0);
     expect(chunkDataBytes(data)).toBe(74676);
   });
 

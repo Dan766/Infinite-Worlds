@@ -325,8 +325,31 @@ const ROAD_DETOUR_MARGIN = 768;
  */
 const HEURISTIC_WEIGHT = 4;
 
-/** Region networks held at once, per JS context. */
-export const ROAD_CACHE_LIMIT = 8;
+/**
+ * Region networks held at once, per JS context.
+ *
+ * RAISED FROM 8 TO 16 IN PHASE 5, AND THE OLD VALUE WAS ONE SHORT OF THE
+ * WORKING SET. A quadtree node at the root level covers a whole 4 km region, and
+ * both the per-vertex grading (through its padded sample grid) and the deck
+ * builder need every region within a margin of it -- a 3x3 block, NINE, against
+ * a cache of eight. One short of the working set is the worst possible size: the
+ * entry evicted is always the one wanted next, so a full sweep rebuilds every
+ * region it touches instead of building each once.
+ *
+ * It went unmeasured until Phase 5 because grading sweeps row-major, so its
+ * working set within one row of vertices is three rather than nine, and eight
+ * absorbed it. The deck builder sweeps the 3x3 block in one go and cannot.
+ * Measured on a root node: 10.5 s with the old limit against 3.6 s with the deck
+ * disabled, and both figures collapse together at 16.
+ *
+ * The cost of the larger cache is small and bounded: a network is a few hundred
+ * path nodes plus a bucket index, well under 100 kB, so sixteen of them is a
+ * megabyte or two against a 400 MB heap budget. The lookup is a linear scan, but
+ * over ENTRIES not sectors -- one scan per query point, not four -- and a region
+ * query happens once per vertex, so the scan is nowhere near the cost of the
+ * `baseHeight` evaluation next to it.
+ */
+export const ROAD_CACHE_LIMIT = 16;
 
 /** Metres per bucket in the per-network segment index. */
 const BUCKET_METRES = 128;
