@@ -4,6 +4,8 @@
  *
  *   npm run shots
  *   npm run shots -- --no-build
+ *   npm run shots -- --only=city-*
+ *   npm run shots -- --only=city-*,vegetation-* --no-build
  *
  * Run this when a change is *supposed* to alter what the world looks like. To
  * check that nothing changed, use `npm run shots:check` instead -- it compares
@@ -11,11 +13,11 @@
  */
 
 import { captureCanonicalViews, reportPageProblems, SHOTS_DIR } from './lib/canonical.mjs';
+import { parseShotArgs } from './lib/shots-select.mjs';
 
-const args = process.argv.slice(2);
-const build = !args.includes('--no-build');
+const { build, only } = parseShotArgs(process.argv.slice(2));
 
-const results = await captureCanonicalViews(SHOTS_DIR, { build });
+const results = await captureCanonicalViews(SHOTS_DIR, { build, only });
 
 console.log(`\ncaptured ${results.length} canonical views into shots/`);
 for (const result of results) {

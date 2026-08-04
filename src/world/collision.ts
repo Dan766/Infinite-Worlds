@@ -3,6 +3,7 @@ import { cityPlanAt, isCity } from './city';
 import { SECTOR_SIZE } from './contracts';
 import { gradeTarget, sampleHeight, worldRegionField, worldSectorField } from './height-field';
 import type { CityPlan } from './city';
+import { GATE_CLEAR_M, WALL_HALF_THICK } from './wall-mesh';
 import type { SectorLots } from './lots';
 
 export interface Aabb2 {
@@ -68,22 +69,33 @@ export function collidesWithCityWall(
   z: number,
   radius: number,
   plan: CityPlan,
-  wallHalfThickness = 1.6,
+  wallHalfThickness = WALL_HALF_THICK,
 ): boolean {
-  for (let i = 0; i + 1 < plan.wallCount; i++) {
-    let gate = false;
+  const gateAt = (index: number): boolean => {
+    const idx = index === plan.wallCount - 1 ? 0 : index;
     for (let g = 0; g < plan.gateCount; g++) {
-      if ((plan.gateIndex[g] as number) === i) gate = true;
+      if ((plan.gateIndex[g] as number) === idx) return true;
     }
-    if (gate) continue;
-    const distanceSq = pointSegmentDistanceSq(
-      x,
-      z,
-      plan.wallX[i] as number,
-      plan.wallZ[i] as number,
-      plan.wallX[i + 1] as number,
-      plan.wallZ[i + 1] as number,
-    );
+    return false;
+  };
+  for (let i = 0; i + 1 < plan.wallCount; i++) {
+    const ox = plan.wallX[i] as number;
+    const oz = plan.wallZ[i] as number;
+    const dx = (plan.wallX[i + 1] as number) - ox;
+    const dz = (plan.wallZ[i + 1] as number) - oz;
+    const len = Math.sqrt(dx * dx + dz * dz);
+    if (len <= 0.01) continue;
+    let t0 = 0;
+    let t1 = 1;
+    const clear = GATE_CLEAR_M / len;
+    if (gateAt(i)) t0 = clear;
+    if (gateAt(i + 1)) t1 = 1 - clear;
+    if (t1 - t0 < 0.05) continue;
+    const ax = ox + dx * t0;
+    const az = oz + dz * t0;
+    const bx = ox + dx * t1;
+    const bz = oz + dz * t1;
+    const distanceSq = pointSegmentDistanceSq(x, z, ax, az, bx, bz);
     const clearance = radius + wallHalfThickness;
     if (distanceSq < clearance * clearance) return true;
   }

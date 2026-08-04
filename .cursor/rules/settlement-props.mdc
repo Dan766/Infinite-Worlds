@@ -1,0 +1,16 @@
+---
+description: Vegetation and yard/market props - Opus designer skill, composition-first, no self-verify
+globs: "{src/world/props.ts,src/world/props.test.ts,src/world/prop-mesh.ts,src/world/prop-mesh.test.ts,docs/settlement-visual-acceptance.md,shots/canonical.json,scripts/soak.mjs}"
+alwaysApply: false
+---
+
+# Settlement props
+
+When editing these files for **trees / plants / yard clutter / stalls**:
+
+1. Follow `.cursor/skills/settlement-props/SKILL.md`.
+2. Prefer Claude Opus (`claude-opus-5-thinking-high`) via Task.
+3. Hash-based placement only; respect city curtain vegetation refusal.
+4. V2 yards need composed PNG proof, not soak counters alone.
+5. Proof PNGs then separate `v-critic`. No self-ACCEPT.
+6. Buildings -> `settlement-massing`. Walls/districts -> `settlement-walls`.

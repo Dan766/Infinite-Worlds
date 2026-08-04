@@ -69,7 +69,7 @@
  */
 
 import { hash3i } from '../core/hash';
-import { createTierContext, type SectorCoord, type TierContext } from './contracts';
+import { createTierContext, SECTOR_SIZE, type SectorCoord, type TierContext } from './contracts';
 import { closestOnSegment } from './grading';
 import { clamp, hashUnit, lerp } from './noise';
 import {
@@ -79,7 +79,7 @@ import {
   type RoadTerrain,
   type Settlement,
 } from './roads';
-import { STREET_MAX_EXTENT, type SectorStreetField, type SectorStreets } from './streets';
+import { STREET_MAX_EXTENT, type SectorStreetField } from './streets';
 import {
   cityPlanAt,
   isCity,
@@ -134,6 +134,9 @@ export interface LotGround {
  */
 export const LOT_FRONTAGE = 16;
 
+/** City station spacing — tighter than villages so aerial packing reads. */
+export const CITY_LOT_FRONTAGE = 4.95; // 2*2.4 + 0.15 abut pitch
+
 /**
  * Metres between the edge of the street bed and the near wall of a building.
  *
@@ -141,6 +144,9 @@ export const LOT_FRONTAGE = 16;
  * REJECTED for, and it is deliberately smaller -- see there.
  */
 export const LOT_SETBACK = 3.2;
+
+/** City buildings sit closer to the carriageway. */
+export const CITY_LOT_SETBACK = 2.0;
 
 /**
  * Metres of clear ground a building must keep from ANY street bed, including
@@ -155,6 +161,7 @@ export const LOT_SETBACK = 3.2;
  * a building standing on a DIFFERENT street, which is what the test is for.
  */
 export const LOT_STREET_CLEAR = 1;
+export const CITY_LOT_STREET_CLEAR = 0.4;
 
 /** Metres of clear ground a building must keep from a Region-tier roadbed. */
 export const LOT_ROAD_CLEAR = 1.5;
@@ -162,8 +169,14 @@ export const LOT_ROAD_CLEAR = 1.5;
 /** Metres between the bounding circles of two buildings. */
 export const LOT_GAP = 2.5;
 
+/** Clearance between city buildings (townhouse rhythm). */
+export const CITY_LOT_GAP = 0.15;
+
 /** Fraction of the settlement radius beyond which no lot is sited. */
 export const LOT_RIM_FRACTION = 0.95;
+
+/** Cities pack almost to the curtain. */
+export const CITY_LOT_RIM_FRACTION = 0.99;
 
 /**
  * Metres the rendered ground may sit from the altitude the village graded
@@ -174,6 +187,10 @@ export const LOT_UNLEVEL_MAX = 1.75;
 
 /** Metres the ground may vary across a footprint's four corners. */
 export const LOT_SPREAD_MAX = 2.5;
+
+/** Cities grade less perfectly at rim; slightly softer than village. */
+export const CITY_LOT_UNLEVEL_MAX = 4.0;
+export const CITY_LOT_SPREAD_MAX = 4.5;
 
 /**
  * Hard cap on buildings in one sector.
@@ -186,6 +203,9 @@ export const LOT_SPREAD_MAX = 2.5;
  * byte-identically.
  */
 export const LOT_MAX_BUILDINGS = 256;
+
+/** Per-sector cap for cities — denser fabric legitimately exceeds 256. */
+export const CITY_LOT_MAX_BUILDINGS = 2048;
 
 /** Footprint, in metres. Width runs ALONG the frontage, depth back from it. */
 /**
@@ -208,6 +228,12 @@ export const KIND_GATEHOUSE = 9;
 /** Half-footprint ranges per kind, metres. The exported MAX below is the global cap. */
 const COTTAGE_HALF_WIDTH = { min: 2.6, max: 4.8 };
 const COTTAGE_HALF_DEPTH = { min: 2.2, max: 3.8 };
+const TOWNHOUSE_HALF_WIDTH = { min: 2.4, max: 2.4 }; // exact abut on CITY_LOT_FRONTAGE
+const TOWNHOUSE_HALF_DEPTH = { min: 4.0, max: 4.0 }; // fixed depth so city rows share walls
+const WAREHOUSE_HALF_WIDTH = { min: 4.5, max: 7.0 };
+const WAREHOUSE_HALF_DEPTH = { min: 5.0, max: 8.0 };
+const GUILD_HALF_WIDTH = { min: 4.0, max: 6.5 };
+const GUILD_HALF_DEPTH = { min: 4.5, max: 7.0 };
 const BARN_HALF_WIDTH = { min: 4.5, max: 7.2 };
 const BARN_HALF_DEPTH = { min: 3.5, max: 5.8 };
 const HALL_HALF_WIDTH = { min: 3.5, max: 6.0 };
@@ -217,11 +243,13 @@ const HALL_HALF_DEPTH = { min: 3.0, max: 5.0 };
 export const BUILDING_HALF_WIDTH_MIN = COTTAGE_HALF_WIDTH.min;
 export const BUILDING_HALF_WIDTH_MAX = BARN_HALF_WIDTH.max;
 export const BUILDING_HALF_DEPTH_MIN = COTTAGE_HALF_DEPTH.min;
-export const BUILDING_HALF_DEPTH_MAX = BARN_HALF_DEPTH.max;
+export const BUILDING_HALF_DEPTH_MAX = WAREHOUSE_HALF_DEPTH.max;
 
 /** Metres from the floor to the eaves, and from the eaves to the ridge. */
 const COTTAGE_EAVES = { min: 3.0, max: 5.2 };
 const COTTAGE_RIDGE = { min: 1.5, max: 3.0 };
+const TOWNHOUSE_EAVES = { min: 5.5, max: 8.0 };
+const TOWNHOUSE_RIDGE = { min: 2.0, max: 3.5 };
 const BARN_EAVES = { min: 3.5, max: 5.0 };
 const BARN_RIDGE = { min: 2.0, max: 3.8 };
 const HALL_EAVES = { min: 5.5, max: 8.5 };
@@ -384,10 +412,8 @@ function unitAt(site: Settlement, index: number, worldSeed: number, salt: number
 export function pickBuildingKind(site: Settlement, index: number, worldSeed: number): number {
   const bucket = Math.floor(unitAt(site, index, worldSeed, KIND_SALT) * 100);
   if (isCity(site)) {
-    if (bucket < 68) return KIND_TOWNHOUSE;
-    if (bucket < 84) return KIND_WAREHOUSE;
-    if (bucket < 94) return KIND_GUILDHALL;
-    return KIND_HALL;
+    // Continuous ribbons: civic kinds only via landmark reservations.
+    return KIND_TOWNHOUSE;
   }
   if (bucket < 62) return KIND_COTTAGE;
   if (bucket < 84) return KIND_BARN;
@@ -437,19 +463,27 @@ interface LotAccumulator {
 }
 
 /** Squared distance from a point to the nearest street bed centreline. */
-function nearestStreetDistanceSq(rec: SectorStreets, x: number, z: number, out: Float64Array): number {
+function nearestStreetDistanceSq(
+  nodeX: ArrayLike<number>,
+  nodeZ: ArrayLike<number>,
+  streetStart: ArrayLike<number>,
+  streetCount: number,
+  x: number,
+  z: number,
+  out: Float64Array,
+): number {
   let best = Infinity;
-  for (let s = 0; s < rec.streetCount; s++) {
-    const from = rec.streetStart[s] as number;
-    const to = rec.streetStart[s + 1] as number;
+  for (let s = 0; s < streetCount; s++) {
+    const from = streetStart[s] as number;
+    const to = streetStart[s + 1] as number;
     for (let i = from; i + 1 < to; i++) {
       closestOnSegment(
         x,
         z,
-        rec.nodeX[i] as number,
-        rec.nodeZ[i] as number,
-        rec.nodeX[i + 1] as number,
-        rec.nodeZ[i + 1] as number,
+        nodeX[i] as number,
+        nodeZ[i] as number,
+        nodeX[i + 1] as number,
+        nodeZ[i + 1] as number,
         out,
       );
       const d = out[0] as number;
@@ -524,12 +558,37 @@ export function generateSectorLots(
           landmarkKind === LANDMARK_TOWNHALL ? KIND_TOWNHALL :
           landmarkKind === LANDMARK_GATEHOUSE ? KIND_GATEHOUSE :
           landmarkKind === LANDMARK_GUILD ? KIND_GUILDHALL : KIND_TOWNHOUSE;
-        const hw = plan.landmarkHalfW[landmark] as number;
-        const hd = plan.landmarkHalfD[landmark] as number;
+        const planHalfW = plan.landmarkHalfW[landmark] as number;
+        const planHalfD = plan.landmarkHalfD[landmark] as number;
+        const hw = kind === KIND_KEEP ? Math.max(17, planHalfW) : planHalfW;
+        const hd = kind === KIND_KEEP ? Math.max(17, planHalfD) :
+          kind === KIND_CATHEDRAL ? Math.max(22, planHalfD) : planHalfD;
         lots.cx.push(x); lots.cz.push(z); lots.fy.push(ground.height(x, z));
-        lots.ax.push(1); lots.az.push(0); lots.hw.push(hw); lots.hd.push(hd);
-        lots.ev.push(kind === KIND_KEEP ? 12 : kind === KIND_CATHEDRAL ? 14 : 8);
-        lots.rg.push(kind === KIND_CATHEDRAL ? 8 : 5);
+        // Gatehouses face along the curtain so twin towers flank the opening;
+        // other landmarks keep the historical +X along axis.
+        let alongX = 1;
+        let alongZ = 0;
+        if (kind === KIND_GATEHOUSE) {
+          for (let g = 0; g < plan.gateCount; g++) {
+            const gi = plan.gateIndex[g] as number;
+            const gx = plan.wallX[gi] as number;
+            const gz = plan.wallZ[gi] as number;
+            if (Math.abs(gx - x) + Math.abs(gz - z) > 0.05) continue;
+            const prev = gi === 0 ? plan.wallCount - 2 : gi - 1;
+            const next = gi + 1;
+            let tx = (plan.wallX[next] as number) - (plan.wallX[prev] as number);
+            let tz = (plan.wallZ[next] as number) - (plan.wallZ[prev] as number);
+            const tlen = Math.sqrt(tx * tx + tz * tz);
+            if (tlen > 0.01) {
+              alongX = tx / tlen;
+              alongZ = tz / tlen;
+            }
+            break;
+          }
+        }
+        lots.ax.push(alongX); lots.az.push(alongZ); lots.hw.push(hw); lots.hd.push(hd);
+        lots.ev.push(kind === KIND_KEEP ? 14 : kind === KIND_CATHEDRAL ? 16 : 8);
+        lots.rg.push(kind === KIND_KEEP ? 7 : kind === KIND_CATHEDRAL ? 9 : 5);
         lots.wt.push(unitAt(site, 10_000 + landmark, worldSeed, WALL_SALT));
         lots.rt.push(unitAt(site, 10_000 + landmark, worldSeed, ROOF_SALT));
         lots.kd.push(kind);
@@ -538,13 +597,31 @@ export function generateSectorLots(
     }
   }
 
-  const rimRadius = site.radius * LOT_RIM_FRACTION;
+  const rimRadius = site.radius * (isCity(site) ? CITY_LOT_RIM_FRACTION : LOT_RIM_FRACTION);
   const streetHalf = rec.halfWidth;
+  const frontage = isCity(site) ? CITY_LOT_FRONTAGE : LOT_FRONTAGE;
+  const maxBuildings = isCity(site) ? CITY_LOT_MAX_BUILDINGS : LOT_MAX_BUILDINGS;
   let index = 0;
+  let emitted = lots.cx.length; // landmarks already in-sector
 
-  for (let s = 0; s < rec.streetCount && lots.cx.length < LOT_MAX_BUILDINGS; s++) {
-    const from = rec.streetStart[s] as number;
-    const to = rec.streetStart[s + 1] as number;
+  // City lots walk the Region-owned CityPlan, not the sector-clipped street
+  // fragments. Clipped polylines restart station phase at every CSR joint and
+  // punch one-pitch holes in townhouse ribbons. Ownership is by lot centre:
+  // each sector accepts only buildings whose centre lands in its square, so
+  // the same plan walk in every overlapping sector stays byte-identical.
+  const cityPlan = isCity(site) ? cityPlanAt(site, worldSeed) : undefined;
+  const sectorMinX = coord.x * SECTOR_SIZE;
+  const sectorMinZ = coord.z * SECTOR_SIZE;
+  const sectorMaxX = sectorMinX + SECTOR_SIZE;
+  const sectorMaxZ = sectorMinZ + SECTOR_SIZE;
+  const streetNodeX = cityPlan !== undefined ? cityPlan.nodeX : rec.nodeX;
+  const streetNodeZ = cityPlan !== undefined ? cityPlan.nodeZ : rec.nodeZ;
+  const streetStarts = cityPlan !== undefined ? cityPlan.streetStart : rec.streetStart;
+  const streetCount = cityPlan !== undefined ? cityPlan.streetCount : rec.streetCount;
+
+  for (let s = 0; s < streetCount && emitted < maxBuildings; s++) {
+    const from = streetStarts[s] as number;
+    const to = streetStarts[s + 1] as number;
     if (to - from < 2) continue;
 
     // Stations are spaced along the WHOLE polyline rather than per segment, so
@@ -552,13 +629,13 @@ export function generateSectorLots(
     // would. The first is offset by a jittered fraction of one spacing, so two
     // streets meeting at a node do not both start a building at the junction.
     let travelled = 0;
-    let next = LOT_FRONTAGE * (0.3 + 0.4 * unitAt(site, s, worldSeed, STATION_SALT));
+    let next = isCity(site) ? frontage * 0.5 : frontage * (0.3 + 0.4 * unitAt(site, s, worldSeed, STATION_SALT));
 
-    for (let i = from; i + 1 < to && lots.cx.length < LOT_MAX_BUILDINGS; i++) {
-      const ax = rec.nodeX[i] as number;
-      const az = rec.nodeZ[i] as number;
-      const bx = rec.nodeX[i + 1] as number;
-      const bz = rec.nodeZ[i + 1] as number;
+    for (let i = from; i + 1 < to && emitted < maxBuildings; i++) {
+      const ax = streetNodeX[i] as number;
+      const az = streetNodeZ[i] as number;
+      const bx = streetNodeX[i + 1] as number;
+      const bz = streetNodeZ[i + 1] as number;
       const dx = bx - ax;
       const dz = bz - az;
       const length = Math.sqrt(dx * dx + dz * dz);
@@ -566,7 +643,7 @@ export function generateSectorLots(
       const dirX = dx / length;
       const dirZ = dz / length;
 
-      while (next <= travelled + length && lots.cx.length < LOT_MAX_BUILDINGS) {
+      while (next <= travelled + length && emitted < maxBuildings) {
         const t = (next - travelled) / length;
         const stationX = ax + dx * t;
         const stationZ = az + dz * t;
@@ -575,12 +652,16 @@ export function generateSectorLots(
         // accepted so far -- a deterministic function of the seed rather than of
         // the order the arrays happened to be walked in.
         for (let side = -1; side <= 1; side += 2) {
-          if (lots.cx.length >= LOT_MAX_BUILDINGS) break;
+          if (emitted >= maxBuildings) break;
+          const before = lots.cx.length;
           tryLot(
             lots,
             index++,
             site,
-            rec,
+            streetNodeX,
+            streetNodeZ,
+            streetStarts,
+            streetCount,
             net,
             ground,
             worldSeed,
@@ -592,19 +673,85 @@ export function generateSectorLots(
             streetHalf,
             rimRadius,
             scratch,
+            0,
+            cityPlan !== undefined ? sectorMinX : undefined,
+            cityPlan !== undefined ? sectorMinZ : undefined,
+            cityPlan !== undefined ? sectorMaxX : undefined,
+            cityPlan !== undefined ? sectorMaxZ : undefined,
           );
+          if (lots.cx.length > before && (lots.ev[lots.ev.length - 1] as number) >= 0) emitted++;
+          // City second row fills block depth so aerial/market FOV is not lawn cores.
+          if (isCity(site) && emitted < maxBuildings) {
+            const before2 = lots.cx.length;
+            tryLot(
+              lots,
+              index++,
+              site,
+              streetNodeX,
+              streetNodeZ,
+              streetStarts,
+              streetCount,
+              net,
+              ground,
+              worldSeed,
+              stationX,
+              stationZ,
+              dirX,
+              dirZ,
+              side,
+              streetHalf,
+              rimRadius,
+              scratch,
+              1,
+              sectorMinX,
+              sectorMinZ,
+              sectorMaxX,
+              sectorMaxZ,
+            );
+            if (lots.cx.length > before2 && (lots.ev[lots.ev.length - 1] as number) >= 0) emitted++;
+          }
         }
-        next += LOT_FRONTAGE * (0.75 + 0.5 * unitAt(site, index, worldSeed, STATION_SALT));
+        next += isCity(site) ? frontage : frontage * (0.75 + 0.5 * unitAt(site, index, worldSeed, STATION_SALT));
       }
       travelled += length;
     }
   }
 
   const count = lots.cx.length;
-  let reachSq = 0;
+  const emitIdx: number[] = [];
   for (let i = 0; i < count; i++) {
-    const dx = (lots.cx[i] as number) - site.x;
-    const dz = (lots.cz[i] as number) - site.z;
+    if ((lots.ev[i] as number) >= 0) emitIdx.push(i);
+  }
+  const emitCount = emitIdx.length;
+  const centerX = new Float64Array(emitCount);
+  const centerZ = new Float64Array(emitCount);
+  const floorY = new Float64Array(emitCount);
+  const alongX = new Float64Array(emitCount);
+  const alongZ = new Float64Array(emitCount);
+  const halfWidth = new Float64Array(emitCount);
+  const halfDepth = new Float64Array(emitCount);
+  const eaves = new Float64Array(emitCount);
+  const ridge = new Float64Array(emitCount);
+  const wallTint = new Float64Array(emitCount);
+  const roofTint = new Float64Array(emitCount);
+  const kind = new Uint8Array(emitCount);
+  let reachSq = 0;
+  for (let e = 0; e < emitCount; e++) {
+    const i = emitIdx[e] as number;
+    centerX[e] = lots.cx[i] as number;
+    centerZ[e] = lots.cz[i] as number;
+    floorY[e] = lots.fy[i] as number;
+    alongX[e] = lots.ax[i] as number;
+    alongZ[e] = lots.az[i] as number;
+    halfWidth[e] = lots.hw[i] as number;
+    halfDepth[e] = lots.hd[i] as number;
+    eaves[e] = lots.ev[i] as number;
+    ridge[e] = lots.rg[i] as number;
+    wallTint[e] = lots.wt[i] as number;
+    roofTint[e] = lots.rt[i] as number;
+    kind[e] = lots.kd[i] as number;
+    const dx = centerX[e]! - site.x;
+    const dz = centerZ[e]! - site.z;
     const d = Math.sqrt(dx * dx + dz * dz) + (lots.br[i] as number);
     if (d * d > reachSq) reachSq = d * d;
   }
@@ -615,19 +762,19 @@ export function generateSectorLots(
     sectorX: coord.x,
     sectorZ: coord.z,
     settlement: site,
-    centerX: Float64Array.from(lots.cx),
-    centerZ: Float64Array.from(lots.cz),
-    floorY: Float64Array.from(lots.fy),
-    alongX: Float64Array.from(lots.ax),
-    alongZ: Float64Array.from(lots.az),
-    halfWidth: Float64Array.from(lots.hw),
-    halfDepth: Float64Array.from(lots.hd),
-    eaves: Float64Array.from(lots.ev),
-    ridge: Float64Array.from(lots.rg),
-    wallTint: Float64Array.from(lots.wt),
-    roofTint: Float64Array.from(lots.rt),
-    kind: Uint8Array.from(lots.kd),
-    count,
+    centerX,
+    centerZ,
+    floorY,
+    alongX,
+    alongZ,
+    halfWidth,
+    halfDepth,
+    eaves,
+    ridge,
+    wallTint,
+    roofTint,
+    kind,
+    count: emitCount,
     reachRadius: Math.sqrt(reachSq),
   };
 }
@@ -643,7 +790,10 @@ function tryLot(
   lots: LotAccumulator,
   index: number,
   site: Settlement,
-  rec: SectorStreets,
+  streetNodeX: ArrayLike<number>,
+  streetNodeZ: ArrayLike<number>,
+  streetStarts: ArrayLike<number>,
+  streetCount: number,
   net: RoadNetwork,
   ground: LotGround,
   worldSeed: number,
@@ -655,6 +805,11 @@ function tryLot(
   streetHalf: number,
   rimRadius: number,
   scratch: Float64Array,
+  row = 0,
+  sectorMinX?: number,
+  sectorMinZ?: number,
+  sectorMaxX?: number,
+  sectorMaxZ?: number,
 ): void {
   // -- kind, then size from the seed and how central the frontage is ----------
   const kind = pickBuildingKind(site, index, worldSeed);
@@ -662,29 +817,67 @@ function tryLot(
     (stationX - site.x) * (stationX - site.x) + (stationZ - site.z) * (stationZ - site.z),
   );
   const central = site.radius > 0 ? clamp(1 - stationDistance / site.radius, 0, 1) : 1;
-  const scale = 1 - BUILDING_RIM_SHRINK * (1 - central);
+  const scale = isCity(site) ? 1 : 1 - BUILDING_RIM_SHRINK * (1 - central);
 
   const widthRange =
-    kind === KIND_BARN ? BARN_HALF_WIDTH : kind === KIND_HALL ? HALL_HALF_WIDTH : COTTAGE_HALF_WIDTH;
+    kind === KIND_BARN ? BARN_HALF_WIDTH :
+    kind === KIND_HALL ? HALL_HALF_WIDTH :
+    kind === KIND_TOWNHOUSE ? TOWNHOUSE_HALF_WIDTH :
+    kind === KIND_WAREHOUSE ? WAREHOUSE_HALF_WIDTH :
+    kind === KIND_GUILDHALL ? GUILD_HALF_WIDTH :
+    COTTAGE_HALF_WIDTH;
   const depthRange =
-    kind === KIND_BARN ? BARN_HALF_DEPTH : kind === KIND_HALL ? HALL_HALF_DEPTH : COTTAGE_HALF_DEPTH;
+    kind === KIND_BARN ? BARN_HALF_DEPTH :
+    kind === KIND_HALL ? HALL_HALF_DEPTH :
+    kind === KIND_TOWNHOUSE ? TOWNHOUSE_HALF_DEPTH :
+    kind === KIND_WAREHOUSE ? WAREHOUSE_HALF_DEPTH :
+    kind === KIND_GUILDHALL ? GUILD_HALF_DEPTH :
+    COTTAGE_HALF_DEPTH;
   const eavesRange =
-    kind === KIND_BARN ? BARN_EAVES : kind === KIND_HALL ? HALL_EAVES : COTTAGE_EAVES;
+    kind === KIND_BARN ? BARN_EAVES :
+    kind === KIND_HALL ? HALL_EAVES :
+    kind === KIND_TOWNHOUSE || kind === KIND_WAREHOUSE || kind === KIND_GUILDHALL ? TOWNHOUSE_EAVES :
+    COTTAGE_EAVES;
   const ridgeRange =
-    kind === KIND_BARN ? BARN_RIDGE : kind === KIND_HALL ? HALL_RIDGE : COTTAGE_RIDGE;
+    kind === KIND_BARN ? BARN_RIDGE :
+    kind === KIND_HALL ? HALL_RIDGE :
+    kind === KIND_TOWNHOUSE || kind === KIND_WAREHOUSE || kind === KIND_GUILDHALL ? TOWNHOUSE_RIDGE :
+    COTTAGE_RIDGE;
 
-  const halfWidth =
+  let halfWidth =
     lerp(widthRange.min, widthRange.max, unitAt(site, index, worldSeed, WIDTH_SALT)) * scale;
-  const halfDepth =
+  let halfDepth =
     lerp(depthRange.min, depthRange.max, unitAt(site, index, worldSeed, DEPTH_SALT)) * scale;
+  // City townhouses lock width to the station pitch so accepted lots abut.
+  if (isCity(site) && kind === KIND_TOWNHOUSE) {
+    halfWidth = CITY_LOT_FRONTAGE * 0.5 - CITY_LOT_GAP * 0.5;
+  }
   const boundingRadius = Math.sqrt(halfWidth * halfWidth + halfDepth * halfDepth);
 
   // -- where it stands --------------------------------------------------------
   const normalX = -dirZ * side;
   const normalZ = dirX * side;
-  const offset = streetHalf + LOT_SETBACK + halfDepth;
+  const setback = isCity(site) ? CITY_LOT_SETBACK : LOT_SETBACK;
+  const gapNow = isCity(site) ? CITY_LOT_GAP : LOT_GAP;
+  const offset = streetHalf + setback + halfDepth + row * (halfDepth * 2 + gapNow + 0.2);
   const centerX = stationX + normalX * offset;
   const centerZ = stationZ + normalZ * offset;
+
+  // City multi-sector: skip candidates far from this sector. Near-but-outside
+  // centres still run the accept path into the overlap shadow so boundary
+  // ribbons do not double-emit or ignore a neighbour across the CSR cut.
+  const CITY_SHADOW_M = 64;
+  let emitLot = true;
+  if (sectorMinX !== undefined && sectorMinZ !== undefined && sectorMaxX !== undefined && sectorMaxZ !== undefined) {
+    const inSector =
+      centerX >= sectorMinX && centerX < sectorMaxX &&
+      centerZ >= sectorMinZ && centerZ < sectorMaxZ;
+    const inMargin =
+      centerX >= sectorMinX - CITY_SHADOW_M && centerX < sectorMaxX + CITY_SHADOW_M &&
+      centerZ >= sectorMinZ - CITY_SHADOW_M && centerZ < sectorMaxZ + CITY_SHADOW_M;
+    if (!inMargin) return;
+    emitLot = inSector;
+  }
 
   // Inside the footprint. A building past the rim stands where the pad's taper
   // has run out, and the level test below would refuse it anyway -- this is the
@@ -695,27 +888,70 @@ function tryLot(
 
   // Clear of every street, including the one it fronts. See `LOT_STREET_CLEAR`
   // for why the threshold is not the setback.
-  const clearOfStreet = streetHalf + halfDepth + LOT_STREET_CLEAR;
-  if (nearestStreetDistanceSq(rec, centerX, centerZ, scratch) < clearOfStreet * clearOfStreet) {
-    return;
+  const distSq = nearestStreetDistanceSq(
+    streetNodeX,
+    streetNodeZ,
+    streetStarts,
+    streetCount,
+    centerX,
+    centerZ,
+    scratch,
+  );
+  if (isCity(site) && kind === KIND_TOWNHOUSE) {
+    // Dense polar grids make the village "clear of ANY street" test delete
+    // ribbon stations that sit legally on their own frontage; only refuse if
+    // the centre is still inside the carriageway.
+    if (distSq < streetHalf * streetHalf) return;
+  } else {
+    const clearOfStreet = streetHalf + halfDepth + (isCity(site) ? CITY_LOT_STREET_CLEAR : LOT_STREET_CLEAR);
+    if (distSq < clearOfStreet * clearOfStreet) return;
   }
 
   // Clear of the carriageway. `roadClearance` measures from the roadbed EDGE and
   // is exact well inside `ROAD_CLEARANCE_RANGE`, which this threshold is.
-  if (roadClearance(net, centerX, centerZ) < boundingRadius + LOT_ROAD_CLEAR) return;
+  if (!(isCity(site) && kind === KIND_TOWNHOUSE)) {
+    if (roadClearance(net, centerX, centerZ) < boundingRadius + LOT_ROAD_CLEAR) return;
+  }
 
   // Clear of every building already accepted. Bounding circles, because two
   // rectangles at arbitrary bearings need a separating-axis test to answer the
   // same question and the extra precision would buy nothing but denser villages.
-  for (let i = 0; i < lots.cx.length; i++) {
-    const ox = (lots.cx[i] as number) - centerX;
-    const oz = (lots.cz[i] as number) - centerZ;
-    const need = boundingRadius + (lots.br[i] as number) + LOT_GAP;
-    if (ox * ox + oz * oz < need * need) return;
+  const gap = isCity(site) ? CITY_LOT_GAP : LOT_GAP;
+  // City packing: axis-aligned in the street frame so abutting townhouses are not
+  // rejected by diagonal bounding circles (which dwarfed CITY_LOT_GAP).
+  if (isCity(site)) {
+    const nX = normalX;
+    const nZ = normalZ;
+    const aX = dirX;
+    const aZ = dirZ;
+    // Epsilon so station-pitch neighbours (dAlong ≈ needAlong) are not refused
+    // by float noise on the polyline walk — that punched one-lot ribbon holes.
+    const eps = 0.05;
+    for (let i = 0; i < lots.cx.length; i++) {
+      const ox = (lots.cx[i] as number) - centerX;
+      const oz = (lots.cz[i] as number) - centerZ;
+      const dAlong = ox * aX + oz * aZ;
+      const dAcross = ox * nX + oz * nZ;
+      const needAlong = halfWidth + (lots.hw[i] as number) + gap;
+      const needAcross = halfDepth + (lots.hd[i] as number) + gap;
+      if (
+        dAlong < needAlong - eps && dAlong > -(needAlong - eps) &&
+        dAcross < needAcross - eps && dAcross > -(needAcross - eps)
+      ) {
+        return;
+      }
+    }
+  } else {
+    for (let i = 0; i < lots.cx.length; i++) {
+      const ox = (lots.cx[i] as number) - centerX;
+      const oz = (lots.cz[i] as number) - centerZ;
+      const need = boundingRadius + (lots.br[i] as number) + gap;
+      if (ox * ox + oz * oz < need * need) return;
+    }
   }
 
   // -- the facing, turned slightly off the street -----------------------------
-  const skew = BUILDING_SKEW * (unitAt(site, index, worldSeed, SKEW_SALT) * 2 - 1);
+  const skew = isCity(site) ? 0 : BUILDING_SKEW * (unitAt(site, index, worldSeed, SKEW_SALT) * 2 - 1);
   const mixX = dirX + normalX * skew;
   const mixZ = dirZ + normalZ * skew;
   const mixLength = Math.sqrt(mixX * mixX + mixZ * mixZ);
@@ -726,7 +962,15 @@ function tryLot(
   // -- the ground, which is the test that actually refuses things -------------
   const floor = ground.height(centerX, centerZ);
   const target = ground.target(centerX, centerZ);
-  if (!(Math.abs(floor - target) <= LOT_UNLEVEL_MAX)) return;
+  // City townhouse ribbons prioritize continuous frontage over village-grade
+  // pad flatness; other city kinds and villages still take the level tests.
+  const skipLevel = isCity(site) && kind === KIND_TOWNHOUSE;
+  if (
+    !skipLevel &&
+    !(Math.abs(floor - target) <= (isCity(site) ? CITY_LOT_UNLEVEL_MAX : LOT_UNLEVEL_MAX))
+  ) {
+    return;
+  }
 
   const acrossX = -alongZ;
   const acrossZ = alongX;
@@ -741,8 +985,10 @@ function tryLot(
       if (h > high) high = h;
     }
   }
-  if (high - low > LOT_SPREAD_MAX) return;
+  if (!skipLevel && high - low > (isCity(site) ? CITY_LOT_SPREAD_MAX : LOT_SPREAD_MAX)) return;
 
+  // Always record into the accumulator for overlap (city shadow neighbours).
+  // Emit only when the centre is owned by this sector.
   lots.cx.push(centerX);
   lots.cz.push(centerZ);
   lots.fy.push(floor);
@@ -760,6 +1006,13 @@ function tryLot(
   lots.rt.push(unitAt(site, index, worldSeed, ROOF_SALT));
   lots.kd.push(kind);
   lots.br.push(boundingRadius);
+  if (!emitLot) {
+    // Shadow-only: keep for overlap, strip from the emitted record by marking
+    // kind as a tombstone consumed at finish. Cheaper than dual arrays: filter
+    // tombstones when packing the typed arrays below would need a second pass
+    // marker — use negative eaves as the out-of-sector flag.
+    lots.ev[lots.ev.length - 1] = -1;
+  }
 }
 
 // ---------------------------------------------------------------------------

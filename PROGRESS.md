@@ -19,6 +19,7 @@ state moves between sessions. Update both at the end of every phase.
 | 7b    | Variety (villages, buildings, props) | In progress (3/3: species code; validation deferred) |
 | 8     | Player controller and collision    | Done (code; soak deferred with city epic) |
 | City  | Medieval cities C0–C4              | Done (code; full soak/shots deferred) |
+| Visual| Settlement visuals (City C5–C7 + Village V1–V3) | C5 landmark kinds ACCEPT (prereq soak/shots:check housekeeping) |
 | 9     | NPCs                               | -      |
 | 10    | Lighting and atmosphere            | -      |
 | 11    | Materials and post-processing      | -      |
@@ -3911,4 +3912,420 @@ row here before marking 7b Done.
 - Run the full 300 s `npm run soak` from the new city route and re-derive every
   budget row; then capture/review the five new canonical views before committing
   their PNG baselines.
+- Visual follow-up is no longer an unnamed gap: see **Settlement Visual Epic**
+  below (City C5–C7 + Village V1–V3). Landmark towers/spires and village fabric
+  live there, not in Phase 9.
 
+## Settlement Visual Epic -- Planned (City C5–C7 + Village V1–V3)
+
+Cities and villages both landed as **identity + structure** first. They still
+look like Phase 6 gabled boxes. This epic is the silhouette and fabric pass.
+Binding acceptance: `docs/settlement-visual-acceptance.md` (in-repo). Cursor plan `settlement_visual_epic_a1b2c3d4.plan.md` is a convenience copy.
+
+### Why
+
+- City epic known gap: landmarks reuse cottage topology; walls are extruded
+  boxes; farmland barely reads; interiors stay double-skinned with exteriors.
+- Village 7b landed layouts/kinds/species but facades are still two paint quads
+  on one envelope; yards are sparse crates/posts, not composed plots.
+
+### City slices
+
+| Slice | Ships |
+|-------|--------|
+| **C5** | Bespoke keep / cathedral / townhall / guild / gatehouse **landmark shells**; kind-specific vertex budgets (gatehouse twin-tower shell; curtain cut is C6) |
+| **C6** | Crenellated curtain + wall-tower stations, align openings to C5 gatehouse, berm grading, market void + stalls, farmland palette/stamps *(walls landed; districts pending)* |
+| **C7** | Continuous artery clipping, townhouse rhythm, hide exterior when interior overlay active |
+
+### Village slices
+
+| Slice | Ships |
+|-------|--------|
+| **V1** | Cottage / barn / hall silhouette upgrades (real volume, not only facade paint) |
+| **V2** | Yard composition, fence/path clutter, layout-aware density + soak floors |
+| **V3** | Aerial/shallow readability; canonical village re-baselines; prove layouts distinct by eye |
+
+### Order
+
+1. Deferred soak/shots validation for 7b + City (debt before claiming budgets).
+2. C5 then V1 (serialized — both touch building-mesh.ts).
+3. C6, V2, C7, then V3 + mark Visual Done.
+
+### Non-goals
+
+NPCs (Phase 9), lighting (10), materials/post (11), enterable cottages, city
+economy sim, quiet budget raises.
+
+### Verifier gate
+
+Every C5–C7 / V1–V3 slice **must** pass a ruthless **v-critic** (Momus) pass with
+**rendered image evidence** before Done. Binding criteria:
+`docs/settlement-visual-acceptance.md`. Process rule:
+`.cursor/rules/settlement-visual-verifier.mdc`.
+
+- Diff-only visual approval is invalid.
+- Blockers require re-verify; nits only accepted by verifier or Dan.
+- C5 and V1 are **serialized** (shared `building-mesh.ts`).
+- Prerequisites: deferred city/7b soak + eye-reviewed captures **before** C5/V1 code.
+
+### Exit
+
+City aerial reads as fortification + civic skyline; village shallow shows kind
+silhouettes and yard life; tests/tsc/soak/shots green with re-derived budgets.
+
+
+
+## Canonical harness trim -- 51 to 47 views
+
+Removed four views whose claims are covered elsewhere, to cut SwiftShader
+capture time without weakening regression coverage:
+
+- `cube-seed-alpha` -- seed plumbing is `seed-canary-inland`'s job.
+- `cube-wireframe` -- wireframe URL/material plumbing is covered by
+  `chunks-wireframe` and every later `*-wireframe` view.
+- `cube-far` -- `?pos=` / `?look=` posing is exercised by dozens of
+  framed views; a near-cube framing added nothing unique.
+- `chunks-aerial-seed-beta` -- explicitly superseded by `seed-canary-inland`
+  (beta origin became featureless ocean after Phase 3a).
+
+PNG baselines deleted with the entries. Historical mentions in older phase
+sections are left as written.
+
+
+## Settlement Visual Epic C5 -- landmark shells (all kinds ACCEPT)
+
+### What landed
+- `building-mesh.ts`: `addLandmarkBuilding` multi-volume shells for keep /
+  cathedral / townhall / guildhall / gatehouse (early-branch off cottage path).
+- `city.ts`: larger landmark footprints (keep 22 m, cathedral 16x28, etc.).
+- `building-mesh.test.ts`: landmark-aware vertex budgets; known-city keep test.
+- Canonical: `city-keep-wireframe` added; keep camera still being retargeted.
+
+### Soak (300 s city/walk route)
+- **First attempt FAILED** (props 19515/20000; geometry hash 22/25) — contaminated
+  by mid-soak code edits.
+- **Clean re-run PASSED** (exit 0): props SEEN 20659; geometry hashes **25/25**;
+  citiesSeen 127, wallsSeen 510, interiorsEntered 1; buildings SEEN 7290.
+- Peaks: draw calls 315 (budget 680), tris 1.35 M, payload 101.5 MB; unexplained
+  heap trend -0.30 MB/min (limit 6). SwiftShader frame times still not GPU truth.
+
+### Verifier
+- KEEP: **ACCEPT** — see section below (Composer implementer + v-critic).
+- Other C5 landmark kinds: still open.
+
+### Next
+1. Re-soak on frozen HEAD; re-derive props floor if city route is legitimately
+   vegetation-light.
+2. Lock keep (and cathedral) proof cameras that show C5 massing.
+3. v-critic with PNG Read; fix blockers; then mark C5 Done and start V1.
+
+
+## Settlement Visual Epic C6 -- wall massing (walls ACCEPT; districts pending)
+
+### What landed
+- `wall-mesh.ts`: crenellated curtain (merlon / embrasure rhythm), multi-volume
+  projecting towers (base + inset cap + four-tooth crown), gate clearance of
+  `GATE_CLEAR_M` (12 m) at every gate vertex so the C5 gatehouse owns the
+  opening — removed the competing wall-mesh gatehouse box.
+- Closed-ring fix: wall polyline last sample duplicates vertex 0; gate trim and
+  collision both treat that as gate 0.
+- `collision.ts`: curtain collision matches mesh clearance (no full-segment
+  skip); uses `WALL_HALF_THICK`.
+- `wall-mesh.test.ts`: merlon-count floor on a long span, tower projection
+  vs curtain thickness, empty geometry inside gate clear radius.
+- Canonical `city-gate-approach` retargeted (absolute Y; yaw 90 = west toward
+  the eastern gate). Eye-check: crenellations and towers read; approach no
+  longer underground.
+
+### Judgment calls
+- Opening is `2 × GATE_CLEAR_M` around the gate vertex (~24 m), not the old
+  whole-segment hole (~100 m). Aligns curtain to the C5 gatehouse footprint
+  (halfW = 10) without a second silhouette.
+- Towers stay square-with-cap rather than octagon — no `sin`/`cos` on stored
+  verts; silhouette still distinct from curtain section.
+
+
+### Verifier
+- Agent: [v-critic](223e8dcf-b869-409d-89bd-654f8f000b65) (pass 3; after REVISE on cf00ba07, 34a7adc7)
+- Verdict: **ACCEPT** (wall massing only; market/farmland stamps still open)
+- Blockers fixed:
+  1. Wireframe proof views added (`city-gate-approach-wireframe`, `city-gatehouse-proof-wireframe`)
+  2. Eastern gate empty → C5 twin-tower gatehouse oriented to wall tangent, enlarged,
+     brighter stone; cameras aimed with correct yaw (~63°/55°) at the eastern gate
+- Nits (accepted by verifier): PROGRESS GATE_CLEAR note was stale (now 12);
+  shaded lintel weaker than wireframe; market/farmland unclaimed
+- Evidence sha256:
+  - `shots/city-gate-approach.png` df5e6030d6fa56cecf3f8b76f7083bef6eced05d341cfd3d7b365943e4301746
+  - `shots/city-gate-approach-wireframe.png` f9e24c941482b1cc6b69e7c80b37a288edde90554f6372971ace37bfb2333f03
+  - `shots/city-gatehouse-proof.png` ea86b0ce536c3e001ce3f5024aa0b409189d9152dc147dc5d2918f9abff22ddf
+  - `shots/city-gatehouse-proof-wireframe.png` 07a4d59fe15fb9b3f31b7c55ae56add12e7ee617a8e28739ff7ebe0275d9dd9a
+  - `shots/city-aerial.png` 1487c9278b464e9619dcfab25e8e1c767a4ba2c84bcaa5d3554f84e2f0cb4210
+  - `shots/city-farmland.png` fdf85b03d4ba49014110df6a4b723ad0153c5ee16f85c5e4983a8c066236eaa6
+### Continuity fix (open corner wedges)
+Dan rejected the curtain as disconnected slabs. Root cause: each segment was an
+open rectangular prism (no end caps, no miters), so every polyline turn left a
+visible outer wedge — clear in `city-aerial`.
+
+- Curtain ends now **miter** from the shared CityPlan directions so adjacent
+  segments meet at the same outer/inner corner (chunk-local; no neighbour-chunk
+  read). Gate ends stay square butts with end caps.
+- Per-endpoint ground heights + `WALL_BURY` (2.5 m) so the ribbon follows relief
+  and does not float open at the base.
+- Test: non-gate outer miter must have a mesh vertex within 5 cm (anti-vacuity
+  for "corners closed").
+- Recaptured `city-aerial`, `city-gate-approach`. Aerial ring reads continuous;
+  approach gap at the eastern gate is the intentional `GATE_CLEAR` opening.
+
+### Not yet (rest of C6)
+- Berm grading, market void + stalls, farmland palette/stamps.
+- Re-verifier after continuity (new evidence PNGs; prior ACCEPT was on the
+  gapped curtain).
+
+### Measured
+- `npx tsc --noEmit` clean; wall/city/collision tests green; full vitest 512
+  pass (pre-existing empty `shots-select.test.mjs` suite noise).
+- Recaptured `city-aerial`, `city-gate-approach`, `city-farmland` after massing.
+
+### Next
+1. v-critic on post-miter aerial + approach PNGs (continuity + merlons + towers).
+2. Market void / farmland stamps; then V2 or finish C5 verifier first per order.
+
+
+## Settlement Visual Epic -- city density (ACCEPT)
+
+### What landed and why
+Village-grade lot spacing on a thin arterial CityPlan left the curtain looking
+like spokes over lawn (~4.3 lots/ha). Density work packed the wall annulus:
+
+- `city.ts`: polar rings + radials (GRID_N=24) plus district block fabric on top
+  of gate→market→keep arteries (~27.8 km street inside the wall).
+- `road-mesh.ts`: multi-sector city deck load (mirrors `building-mesh`), so
+  decks no longer vanish outside the centre sector.
+- `lots.ts`: city stations walk the **full** Region-owned `CityPlan` (not
+  CSR-clipped street fragments). Clipped polylines restarted station phase at
+  every sector joint and punched one-pitch holes in ribbons. Ownership is by
+  lot centre; a 64 m overlap shadow keeps boundary ribbons from double-emitting
+  or ignoring a neighbour across the cut. Overlap AABB uses a 0.05 m epsilon so
+  float-equal pitch neighbours are not refused. City frontage is 100% townhouse
+  (civic kinds only via landmarks); halfWidth/halfDepth locked to the abut pitch.
+
+### Measured (default city, `city-density.test.ts`)
+| metric | before density | after ACCEPT |
+|---|---|---|
+| street m | ~7.1 km | ~27.8 km (~317 m/ha) |
+| lots / lots/ha | ~378 / ~4.3 | **9292 / ~105.9** |
+| townhouses | — | 9285 |
+| abutPct (slack 0.3 m) | ~0.60 | **0.98** (floor >0.75) |
+
+`npx tsc --noEmit` clean; lots + density tests green.
+
+### Judgment calls
+- Full-plan walk per overlapping sector (with centre ownership + shadow) rather
+  than region-tier lot generation — keeps Sector memo/cache, stays testable
+  without a new tier, and closes CSR holes without reshaping `ChunkData`.
+- Empty polar-block courtyards and the keep lawn are intentional; ACCEPT is about
+  street-frontage ribbons, not total fill of every polygon.
+- Rejected keeping village circle-overlap for city lots: diagonal bounding
+  circles dwarfed `CITY_LOT_GAP` and forbade abutting townhouses.
+
+### Verifier
+- Agent: [v-critic](173ac8f9-ab09-41c2-bad9-8b02bb7a58bf) (pass 6; after REVISE on
+  d61b56f2 / 6700d14b / 157dacb8 / 471e26db / 20f3cbdc)
+- Verdict: **ACCEPT**
+- Prior blockers cleared: market FOV pickets → continuous ribbons; abut metric
+  honesty + floor >0.75 (measured 0.98)
+- Nits (non-blocking): stale CSR comment in density test (fixed); landmark-only
+  civic mix by design
+- Evidence sha256:
+  - `shots/city-aerial.png` 34dd7c27613aa8878ffcbc41648894222c4963d90cb9ad7e95d146f5515dde2c
+  - `shots/city-aerial-wireframe.png` 0384af8633be6f210630324d9c0d4e2f56e91f2c40d5621942317750e6367474
+  - `shots/city-market.png` 567a9e91c6139e8199f98ba4a790c4314f6f76e5ee9db2525e910d3b022ac2e3
+- Canonical market camera: `?time=3&pos=-32350,72,-28788&look=-168,-28`
+
+### Known gaps, deliberately left
+- Market stall / farmland stamp half of C6 still open.
+- C5 keep verifier still unfinished.
+- Soak budgets not re-derived on this density HEAD (lot count ~3× prior density
+  attempt; expect payload/draw pressure — re-soak before raising floors).
+
+### For next
+1. Clean soak on frozen density HEAD; re-derive props/buildings floors if needed.
+2. Finish C5 keep proof cameras + verifier, or C6 market/farmland stamps.
+
+## Settlement Visual Epic C5 -- KEEP kind (ACCEPT)
+
+### What landed
+- `building-mesh.ts` KEEP shell: bailey (6 m), south gate barbican (two boxes),
+  tiered keep core (14 / 19 m), four corner towers to 28 m + crowns (~31 m).
+- Camera yaw fix: Three.js forward is `(sin yaw, 0, -cos yaw)` so aim uses
+  `atan2(dx, -dz)` — prior `-142°` pointed away from the keep.
+- Canonical proof views retargeted: approach ~72 m south face-on, top-down,
+  aerial, wireframe (`city-keep`, `city-keep-wireframe`, `city-keep-topdown`,
+  `city-keep-aerial`).
+- `building-mesh.test.ts`: keep verts + tower height ≥ bailey×1.2 / floor+28.
+
+### Judgment calls
+- Prefer few large overlapping volumes over tiny trim; crowns for wireframe
+  hierarchy only.
+- Gate projects south (+Z) so approach is face-on; flanking townhouses kept for
+  scale (open core, not empty lawn isolation).
+
+### Verifier
+- Implementer: [Composer massing](696226a9-5d4e-4523-8bf0-953494c71125)
+- Critic: [v-critic](924d491c-c37d-4714-9423-a6a4b087b04b)
+- Verdict: **ACCEPT** (C5 kind KEEP only — not full C5 slice)
+- Blockers fixed: wrong yaw / empty proof framing; multi-volume shell readable
+- Nits (accepted by verifier): PROGRESS was stale (this section); shots:check
+  housekeeping; tower test samples global maxY; other C5 kinds still open
+- Evidence sha256:
+  - `shots/city-keep.png` 9e308d969eb13e19089bc0e1c0605b3a498fff23cbe109c42f0b86557df4f49b
+  - `shots/city-keep-wireframe.png` d1c969f125926d9c29833a564fc9f1edffc7a2dfa71066e5c00d347b3f4220d7
+  - `shots/city-keep-topdown.png` 4f68ca3edce3a261c87568db69c3cdd64d34789463a7f13bec0ce1c0c3a408eb
+  - `shots/city-keep-aerial.png` 5d56d24670f58af1c37fd02a73d29da7e15bcad3a7e7a36615ac9a088c2e6d24
+
+### Not yet (rest of C5)
+- v-critic ACCEPT pending for cathedral, townhall, guildhall, gatehouse (proof
+  PNGs captured; implementer does not self-ACCEPT).
+- Do not mark C5 Done until all kinds ACCEPT.
+
+### Next
+1. v-critic with PNG Read on four new kind proof sets; fix REVISE blockers.
+2. Optional: tighten keep tower-height test to corner crowns only.
+
+## Settlement Visual Epic C5 -- cathedral / townhall / guildhall / gatehouse (verifier pending)
+
+### What landed
+- `building-mesh.ts` multi-volume shells for all four remaining C5 kinds (KEEP
+  block untouched). Stone/timber tints separate volumes in shaded proofs.
+- `building-mesh.test.ts`: per-kind positive + anti-vacuity (transept ratio,
+  plinth sides, loading gap, tower height vs `WALL_HEIGHT×1.25`).
+- Canonical proof views added: shaded approach, wireframe, top-down, aerial per
+  kind; gatehouse also retains `city-gatehouse-proof*`.
+
+### Volume lists (metres, lot-local along/across)
+**Cathedral** (lot −32766, −28518; hw=16 hd=28):
+- Nave 20×10 m, base→floor+16
+- Transept/crossing 10×26 m, floor→floor+18 (260% nave width)
+- Clerestory 16×7 m, floor+16→floor+25
+- West tower 12×16 m + crown, base→floor+38
+
+**Town hall** (−32706, −28339; hw=16 hd=12):
+- Plinth podium 32×24 m, base→floor+3 (all sides)
+- Main hall 28×20 m, floor+2.8→floor+8
+- Clock tower 12×10 m, floor+2.8→floor+21
+- Side annexes 10×17 m each, floor+2.8→floor+6.5
+
+**Guildhall** (−32612, −28691; hw=12 hd=10):
+- Hall 18×12 m setback, base→eaves
+- Workshop 22×16 m, floor→floor+11
+- Loading piers 9×4 m ×2 + lintel; ~6 m centre gap on approach
+
+**Gatehouse** (eastern −32074, −28416; hw=10 hd=12):
+- Twin towers 6.4×23 m each, base→floor+29 incl. crowns
+- Lintel 8.4×16.8 m band floor+11→floor+16; centre empty below
+- Approach buttresses on outer face
+
+### Evidence sha256 (2026-08-04 capture)
+- `shots/city-cathedral.png` a701240d02f436aed9d2159dc96747fb70f0b700b80440b8b17a98b51916ab6b
+- `shots/city-cathedral-wireframe.png` 87e45423d5950193dc4b1d75a2b72032f0e5f8637215951817896e628fd199fc
+- `shots/city-cathedral-topdown.png` 571db337678d711fa54b1ef6f99a11a7ab390d703887268be81fd6b75118254e
+- `shots/city-cathedral-aerial.png` 4f56d6d41a89a48b3cb4a3b04da543f1b3c8aebf4dc17487f1474f786f5719dc
+- `shots/city-townhall.png` cc0e5b9ef1f8e5d0e06ef1c73e1549ec8ca2bcedcb5c6f937d7e7802e769316b
+- `shots/city-townhall-wireframe.png` 67e29bbed91b44344c48a92401c0ef3f291ff37175448e21d256ccc048ffbf74
+- `shots/city-townhall-topdown.png` 0cf9781926e3fa7d27f095b5dcdacfdec64e6d73e0e2cd72d154c8d65a3bf03e
+- `shots/city-townhall-aerial.png` e1fb7ea3e05df6d26503938109bfc8312a4b10a77079561e86048b7b9d4ae0f8
+- `shots/city-guildhall.png` 3878458d2614177ba2de466a22fea66f21f2f609268cca20afd7c73316147a81
+- `shots/city-guildhall-wireframe.png` 701735785c59c63acc799c29d36d22fbc74d7919b92ac058934002ccb4edf575
+- `shots/city-guildhall-topdown.png` 4337e7af47282c9fbe713d9efe7358976e8ed2468b868206039e4745b7b4b3f1
+- `shots/city-guildhall-aerial.png` 8a02acfec38e4cfee5a101236c7701a29c661fd18184cc3dc3ce4d7b54391bf7
+- `shots/city-gatehouse-proof.png` 8e4cd4a603b6ed9cc9ee215e797bf6d080a076275c3e8d4e9e9ee13088ded062
+- `shots/city-gatehouse-proof-wireframe.png` 42270bc98c35faeaf51cf43500ea70f2239aef7b2696076dacb8638904b5825a
+- `shots/city-gatehouse-topdown.png` 19bd0f48606b73402549dfce849f3e82464b50ff33c73a1f5279ace6752b61bd
+- `shots/city-gatehouse-aerial.png` b671ecbff22f90dbc898b698218e7d69242fb39929537bf7f992dafa725e1f46
+
+### Measured
+- `npm test` building-mesh: 15/15 pass; `npx tsc --noEmit` clean.
+- Re-capture keep: topdown/aerial sha256 unchanged vs ACCEPT row; approach/
+  wireframe hashes shifted (background fabric); visual keep criteria still read.
+
+### Camera revise (v-critic 0a34e25f / b9973f7e)
+- Cathedral aerial: KEEP-aerial offset retargeted to lot (−32758,98,−28472 look=−15,−52).
+- Cathedral wireframe: south oblique on lot centre (−32766,78,−28452 look=0,−24).
+- Guildhall approach/wireframe: y=50 look=−10, 59 m standoff (−32612,50,−28632).
+
+### Verifier
+- Pending re-critic (implementer does not self-ACCEPT).
+
+### Known gaps
+- Guildhall IoU vs barn not scripted; envelope intentionally asymmetric.
+- Gatehouse test uses first plan gate (not necessarily eastern proof camera lot).
+
+### For next
+1. Parent runs v-critic on all 16 PNG paths above.
+2. If REVISE: retarget cameras before mesh if mass is off-frame.
+
+## Settlement Visual Epic C5 -- all landmark kinds (ACCEPT)
+
+KEEP was already ACCEPT. Remaining kinds shipped via Composer massing worker
+[0e375f8e](0e375f8e-9c79-4629-b457-505267f53e1d) then camera revise; each kind
+passed a separate Composer v-critic with PNG Read + sha256.
+
+### Kind verdicts
+
+| Kind | Implementer | Critic | Verdict |
+|------|-------------|--------|---------|
+| Keep | [696226a9](696226a9-5d4e-4523-8bf0-953494c71125) | [924d491c](924d491c-c37d-4714-9423-a6a4b087b04b) | **ACCEPT** |
+| Cathedral | [0e375f8e](0e375f8e-9c79-4629-b457-505267f53e1d) | [a2f0829e](a2f0829e-c0dc-4cc8-9f4d-f70e98bb5d38) (after REVISE [0a34e25f](0a34e25f-44aa-4b6a-a17c-87387a1b6059)) | **ACCEPT** |
+| Town hall | [0e375f8e](0e375f8e-9c79-4629-b457-505267f53e1d) | [af67d014](af67d014-e1d0-4ba7-8ac1-71fb67218fe1) | **ACCEPT** |
+| Guildhall | [0e375f8e](0e375f8e-9c79-4629-b457-505267f53e1d) | [6d758478](6d758478-7c38-4744-9c41-9347b6b0e4ea) (after REVISE [b9973f7e](b9973f7e-0b99-4604-9f7d-6e043e7f86fd)) | **ACCEPT** |
+| Gatehouse | [0e375f8e](0e375f8e-9c79-4629-b457-505267f53e1d) | [9433e357](9433e357-e6fd-4d5e-8e45-d4ba0621b094) | **ACCEPT** |
+
+### Blockers fixed (camera revises)
+- Cathedral aerial was framing plaza void; wireframe cruciform illegible →
+  retargeted aerial/wireframe to lot center.
+- Guildhall approach at y=80 missed loading opening → lowered to y=50 look=-10.
+
+### Evidence sha256 (final)
+
+**Keep**
+  - `shots/city-keep.png` e1b032f346ad5722d47f3d0e36d2d16749e89efaa4afe51bd0a8fd47b375c03a
+  - `shots/city-keep-wireframe.png` a6d0bfd2733f3e2b40c77d1861e26a7a92611a55b20c76adcbc98a0776cb5fed
+  - `shots/city-keep-topdown.png` 4f68ca3edce3a261c87568db69c3cdd64d34789463a7f13bec0ce1c0c3a408eb
+  - `shots/city-keep-aerial.png` 5d56d24670f58af1c37fd02a73d29da7e15bcad3a7e7a36615ac9a088c2e6d24
+
+**Cathedral**
+  - `shots/city-cathedral.png` a701240d02f436aed9d2159dc96747fb70f0b700b80440b8b17a98b51916ab6b
+  - `shots/city-cathedral-wireframe.png` 87e45423d5950193dc4b1d75a2b72032f0e5f8637215951817896e628fd199fc
+  - `shots/city-cathedral-topdown.png` 571db337678d711fa54b1ef6f99a11a7ab390d703887268be81fd6b75118254e
+  - `shots/city-cathedral-aerial.png` 4f56d6d41a89a48b3cb4a3b04da543f1b3c8aebf4dc17487f1474f786f5719dc
+
+**Town hall**
+  - `shots/city-townhall.png` cc0e5b9ef1f8e5d0e06ef1c73e1549ec8ca2bcedcb5c6f937d7e7802e769316b
+  - `shots/city-townhall-wireframe.png` 67e29bbed91b44344c48a92401c0ef3f291ff37175448e21d256ccc048ffbf74
+  - `shots/city-townhall-topdown.png` 0cf9781926e3fa7d27f095b5dcdacfdec64e6d73e0e2cd72d154c8d65a3bf03e
+  - `shots/city-townhall-aerial.png` e1fb7ea3e05df6d26503938109bfc8312a4b10a77079561e86048b7b9d4ae0f8
+
+**Guildhall**
+  - `shots/city-guildhall.png` 3878458d2614177ba2de466a22fea66f21f2f609268cca20afd7c73316147a81
+  - `shots/city-guildhall-wireframe.png` 701735785c59c63acc799c29d36d22fbc74d7919b92ac058934002ccb4edf575
+  - `shots/city-guildhall-topdown.png` 4337e7af47282c9fbe713d9efe7358976e8ed2468b868206039e4745b7b4b3f1
+  - `shots/city-guildhall-aerial.png` 8a02acfec38e4cfee5a101236c7701a29c661fd18184cc3dc3ce4d7b54391bf7
+
+**Gatehouse**
+  - `shots/city-gatehouse-proof.png` 8e4cd4a603b6ed9cc9ee215e797bf6d080a076275c3e8d4e9e9ee13088ded062
+  - `shots/city-gatehouse-proof-wireframe.png` 42270bc98c35faeaf51cf43500ea70f2239aef7b2696076dacb8638904b5825a
+  - `shots/city-gatehouse-topdown.png` 19bd0f48606b73402549dfce849f3e82464b50ff33c73a1f5279ace6752b61bd
+  - `shots/city-gatehouse-aerial.png` b671ecbff22f90dbc898b698218e7d69242fb39929537bf7f992dafa725e1f46
+
+### Nits accepted by verifiers (non-blocking)
+- Epic prerequisites (soak / eye-review / shots:check) still housekeeping for
+  full epic close — not kind silhouette blockers.
+- Manual IoU for guildhall vs barn (~0.55); script later with V1.
+- Optional approach tighten for cathedral / townhall top-down tower bump.
+
+### Status
+- **All five C5 landmark kinds: ACCEPT.**
+- Full Visual Epic C5 "Done" still may require recorded soak + shots:check per
+  acceptance prerequisites; silhouette work for C5 landmarks is complete.
+- Next epic slice per order: **V1** (village cottage/barn/hall) — serialized
+  with C5 on `building-mesh.ts`; C5 is clear to hand off.

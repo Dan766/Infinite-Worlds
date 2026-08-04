@@ -1,0 +1,22 @@
+---
+description: Settlement building massing - Opus designer skill, silhouette-first, no self-verify
+globs: "{src/world/building-mesh.ts,src/world/building-mesh.test.ts,src/world/city.ts,src/world/lots.ts,docs/settlement-visual-acceptance.md,shots/canonical.json}"
+alwaysApply: false
+---
+
+# Settlement massing
+
+When editing these files for **building / landmark silhouette** work:
+
+1. Follow `.cursor/skills/settlement-massing/SKILL.md`.
+2. Prefer **Claude Opus** (`claude-opus-5-thinking-high`) via Task for design
+   and implementation. Do not use Grok for first-pass massing.
+3. Binding criteria: `docs/settlement-visual-acceptance.md`.
+4. Geometry only through `face` / `addOrientedBox`. No `sin`/`cos`/`pow`/`exp`
+   on stored verts. No Three in gen modules.
+5. One kind at a time. **Never parallelize C5 and V1.**
+6. Proof = shaded + wireframe PNGs with masses in frame. Then **v-critic**
+   (separate agent) with PNG Read - implementers do not self-ACCEPT.
+7. Verifier process: `.cursor/rules/settlement-visual-verifier.mdc`.
+8. Siblings: walls -> `settlement-walls`; props -> `settlement-props`;
+   roads -> `infrastructure-massing`.

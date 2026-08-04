@@ -85,11 +85,12 @@ src/
     rivers.ts           Region-tier flow accumulation and the channel carve
     roads.ts            Region-tier settlement siting, road graph, routing, grading
     city.ts             Region-owned multi-sector CityPlan: walls/gates/districts/landmarks
+                    (Settlement Visual Epic C5–C7: landmark/wall/district silhouette polish)
     streets.ts          Sector-tier street layout inside a settlement
     lots.ts             Sector-tier building lots along streets
     road-mesh.ts        the road and street DECK: carriageway geometry, per chunk
     building-mesh.ts    batched building geometry, per chunk
-    wall-mesh.ts        pure batched curtain/tower/gate geometry, per chunk
+    wall-mesh.ts        pure batched crenellated curtain + projecting towers per chunk (gate opening cleared for landmark shell)
     collision.ts        pure terrain/building/wall/deck collision queries
     interior-mesh.ts    pure landmark interior geometry
     interior-overlay.ts Three-only near-player adapter for landmark interiors
@@ -191,12 +192,14 @@ grading.ts      pure functions   the blend rule; imports noise ONLY
 roads.ts        pure functions   Region tier; imports contracts + grading + noise
 city.ts         pure functions   Region-owned CityPlan from one city settlement
 streets.ts      pure functions   Sector tier; village plans or clipped CityPlans
-lots.ts         pure functions   Sector tier; street lots + reserved city landmarks
+lots.ts         pure functions   Sector tier; street lots + reserved city landmarks.
+                                 City lots walk the full CityPlan (centre-owned per
+                                 sector + margin shadow); villages keep clipped streets.
 road-mesh.ts    pure functions   deck geometry; imports contracts + roads + streets
 building-mesh.ts pure functions  building geometry; imports contracts + lots + roads
 props.ts        pure functions   prop placement; imports contracts + height + lots + roads + streets
 prop-mesh.ts    pure functions   prop geometry; imports contracts + props + lots + roads + streets
-wall-mesh.ts    pure functions   per-node city curtain/tower/gate geometry
+wall-mesh.ts    pure functions   per-node city crenellated curtain + tower geometry (gate mesh owned by landmarks)
 collision.ts    pure functions   player collision against generated records
 interior-mesh.ts pure functions  local landmark interior buffers
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
@@ -462,7 +465,9 @@ Region-owned `CityPlan` from `(worldSeed, settlement cell)`, including its wall,
 gates, districts, arteries, landmark reservations and farmland belt. Every
 sector whose square intersects that city reads the same coarser plan and clips
 its polylines to the sector's padded bounds. The centre sector uses this same
-clip path; it never runs a village layout for a city. Thus clipping does not ask
+clip path; it never runs a village layout for a city. Visual massing for landmarks,
+walls and village fabric is scheduled as the **Settlement Visual Epic** (see
+`PROGRESS.md`), not as Phase 9 NPCs. Thus clipping does not ask
 two sectors to independently decide halves of a whole: the Region tier already
 decided the whole, and sectors only refine it.
 
@@ -589,6 +594,9 @@ segment is emitted by the region containing its MIDPOINT — a purely positional
 rule, so exactly one region emits each. Village streets need nothing beyond
 centre ownership. City streets are clipped from one Region-owned CityPlan, so
 each sector emits only the clipped segments intersecting its padded square.
+City **lots** do not reuse those clipped polylines for station placement: they
+walk the full CityPlan and emit only buildings whose centre falls in the sector
+(with a margin shadow for overlap), so CSR joints cannot restart the abut pitch.
 
 **The sectors a node visits are enumerated, not searched for.** Sweeping the
 sector grid is what `sectorStreetField.accumulate` does per vertex and it is

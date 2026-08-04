@@ -1,0 +1,71 @@
+---
+description: Infinite World architecture rules, verification workflow, and doc-update discipline
+alwaysApply: true
+---
+
+# Before writing any code
+
+Read `ARCHITECTURE.md` and `PROGRESS.md` in the repo root. They are load-bearing,
+not background reading: `ARCHITECTURE.md` states the five non-negotiable rules
+below and the module map; `PROGRESS.md` is the phase-by-phase log of what was
+built, what was measured, and every judgment call and gap left behind. Update
+both when a phase of work is done.
+
+## The five rules (full detail in `ARCHITECTURE.md`)
+
+1. **Determinism.** Every piece of world content is a pure function of
+   `(worldSeed, coordinate)`. Use the counter-based hashes in `src/core/hash.ts`,
+   never a sequential PRNG. No `Math.pow`, `sin`, `cos`, or `exp` on any path that
+   ends in a stored vertex — ECMAScript only approximates those.
+2. **No global mutable world state.** Chunks unload and regenerate at any time
+   and must come back byte-identical.
+3. **Tiered generation.** `Region (4km) -> Sector (512m) -> Chunk (64m)`. A finer
+   tier may read a coarser one; a coarser tier may **never** read a finer one.
+4. **Stable interfaces.** `src/world/contracts.ts` is load-bearing. Adding a
+   field to `ChunkData` is normal; reshaping `ChunkCoord`, `ChunkProvider`, or
+   `TierContext` requires stopping to explain the change before writing code.
+5. **Hard budgets**, checked every phase: 60fps @ 1080p, <=1200 draw calls,
+   <=400MB heap after 5 min, <=16ms frame / no >4ms GC spike. Re-derive with a
+   measured number when a phase moves them; never raise a limit quietly.
+
+## Layering (`src/world/`)
+
+Only `chunk-mesh.ts` imports Three.js. Everything else — `contracts.ts`,
+`noise.ts`, `height-field.ts`, `rivers.ts`, `roads.ts`, `streets.ts`,
+`grading.ts`, `chunk-gen.ts` — is pure and runs identically in a worker and in
+a Node test. Keep it that way: the moment generation code imports Three, it
+stops being testable without a browser.
+
+## Verification, before calling anything done
+
+```
+npm test               # vitest; must pass
+npx tsc --noEmit        # must be clean
+npm run shots:check    # byte-identical screenshots; only if rendering changed
+npm run soak           # 5-minute flight; heap trend, budgets, anti-vacuity guards
+```
+
+Every check in this project pairs a positive assertion with an anti-vacuity
+guard (e.g. "roads exist" AND "the flight actually passed one"). When adding a
+feature, add both halves — a check that only ever proves absence passes
+perfectly on a world with none of the feature in it.
+
+## Update `PROGRESS.md` before calling a phase done
+
+This is not optional, and it is not a summary written from memory afterward —
+write it as you go, the way every existing phase entry reads. A phase is not
+finished until `PROGRESS.md` has a section covering:
+
+- **What was built and why**, plus every judgment call worth knowing (the
+  entries in this project favour "here is the alternative we rejected and why"
+  over "here is what we did").
+- **What was measured**, with real numbers: the soak's budget table (draw
+  calls, triangles, vertices, payload bytes, heap trend) re-derived and
+  compared against the previous phase's row, not just "unchanged" asserted.
+- **Known gaps, deliberately left**, so the next phase (or the next session)
+  does not have to rediscover them by reading code.
+- **A "for next phase" note** naming anything the next piece of work will need
+  to know that isn't obvious from the code alone.
+
+If `ARCHITECTURE.md` itself changed shape — a new module, a changed rule, a new
+non-negotiable boundary — update it too, in the same commit as the code.

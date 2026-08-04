@@ -5,6 +5,7 @@
  *
  *   npm run shots:check
  *   npm run shots:check -- --no-build
+ *   npm run shots:check -- --only=city-*
  *
  * This is the Phase 0 acceptance criterion turned into a command, and the
  * reason every later phase is cheap to verify: if this exits 0, nothing about
@@ -23,15 +24,15 @@ import {
   sha256File,
   SHOTS_DIR,
 } from './lib/canonical.mjs';
+import { parseShotArgs } from './lib/shots-select.mjs';
 
-const args = process.argv.slice(2);
-const build = !args.includes('--no-build');
+const { build, only } = parseShotArgs(process.argv.slice(2));
 
 const CHECK_DIR = join(SHOTS_DIR, '.check');
 
 rmSync(CHECK_DIR, { recursive: true, force: true });
 
-const results = await captureCanonicalViews(CHECK_DIR, { build });
+const results = await captureCanonicalViews(CHECK_DIR, { build, only });
 const pageProblemsClean = reportPageProblems(results);
 
 let mismatches = 0;

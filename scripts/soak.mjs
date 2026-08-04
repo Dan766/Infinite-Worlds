@@ -222,10 +222,13 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  * report after any future move: all four go quiet without failing if the route
  * stops being interesting.
  */
-// Seed `soak`, city cell (-19, 4). Starts at its keep (city centre + 0.08R)
-// so walls, city streets and one interior cannot pass vacuously.
-const START_X = -9603;
-const START_Z = 2310;
+// Seed `soak`, city cell (6, 22). Coastal keep so the round-tripped 5x5
+// still carries sea + river (anti-vacuity for Phase 3) while the camera starts
+// inside a landmark for interiorsEntered and within view of the curtain wall.
+// Measured 5x5 at keep: sea 9/25, river 13/25, road 24/25, street 14/25;
+// wall ring owns 26/28 segments. Flight corridor +X crosses ~20/27 sea samples.
+const START_X = 3291;
+const START_Z = 11651;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and

@@ -1,0 +1,56 @@
+---
+description: Settlement Visual Epic quality gate - v-critic with rendered image evidence required before any C5-C7 or V1-V3 slice is Done
+globs: "{src/world/**/*.ts,docs/settlement-visual-acceptance.md,PROGRESS.md,ARCHITECTURE.md,shots/**/*.png,shots/canonical.json,scripts/soak.mjs,scripts/shots*.mjs,.cursor/plans/*visual*}"
+alwaysApply: false
+---
+
+# Settlement Visual Epic - Verifier Gate
+
+Binding acceptance criteria: [`docs/settlement-visual-acceptance.md`](../../docs/settlement-visual-acceptance.md).
+Epic summary: `PROGRESS.md` -> Settlement Visual Epic.
+
+## Mandatory quality loop (every slice)
+
+Do **not** mark a slice Done until:
+
+1. **Prerequisites** in the acceptance spec are already recorded (passing soak +
+   named captures eye-reviewed) before C5/V1 starts.
+2. **Implement** against the numeric criteria in the acceptance spec.
+3. **Self-check:** `npm test`, `npx tsc --noEmit`, soak/shots claimed by the slice.
+4. **Capture evidence:** before/after shaded (+ wireframe if massing claimed).
+5. **Invoke v-critic** (`Task` / `subagent_type: "v-critic"`). The critic **must
+   be given image paths and Read the PNGs**. Diff-only review = invalid.
+6. **Fix blockers**; re-run v-critic after **every** blocker resolution (code or
+   docs). Implementers cannot waive blockers alone - see acceptance spec.
+7. **PROGRESS.md** slice section with **Verifier** subsection (agent id, verdict,
+   blockers fixed, who accepted nits, evidence paths + sha256).
+
+## Prompt skeleton
+
+```
+Settlement Visual Epic verifier for slice <ID>.
+Read docs/settlement-visual-acceptance.md (binding), PROGRESS.md, ARCHITECTURE.md.
+Inspect the listed PNG evidence paths by Read - do not judge from diff alone.
+Be ruthless. Assume mediocrity until proven otherwise.
+Return: Verdict REJECT|REVISE|ACCEPT; Blocking; Nits; sniff-test vs numeric criteria; concrete edits.
+```
+
+## Fail / do not
+
+- Skip critic because tests are green
+- Approve visuals without looking at images
+- Self-accept nits or unilaterally dismiss blockers
+- Parallelize C5 and V1 (both own `building-mesh.ts`)
+- Mark Visual Done while any slice lacks Verifier + evidence
+
+## Designer skills (separate from verifier)
+
+Prefer Claude Opus Task agents using these project skills. Designers must not
+self-ACCEPT; this verifier rule still owns Done.
+
+| Skill | Scope |
+|-------|--------|
+| `.cursor/skills/settlement-massing/` | C5 / V1 building shells |
+| `.cursor/skills/settlement-walls/` | C6 curtain, towers, berm, market, farmland |
+| `.cursor/skills/settlement-props/` | Vegetation, yards (V2), stalls |
+| `.cursor/skills/infrastructure-massing/` | Roads, streets, bridges, decks, C7 arteries |

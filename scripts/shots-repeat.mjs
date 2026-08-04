@@ -3,7 +3,7 @@
  * Capture the same canonical views repeatedly and report which ones came back
  * with a different hash.
  *
- *   npm run shots:repeat -- --repeat=2 cube-default cube-t0 cube-wireframe
+ *   npm run shots:repeat -- --repeat=2 cube-default cube-t0 chunks-wireframe
  *   npm run shots:repeat -- --repeat=3 --no-build road-bridge-wireframe
  *
  * THIS ASKS A QUESTION `shots:check` CANNOT. `shots:check` compares a view

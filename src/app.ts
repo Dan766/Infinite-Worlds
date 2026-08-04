@@ -380,6 +380,26 @@ export class App {
     this.rig.setLook(yaw, pitch);
   }
 
+  /**
+   * Reposition / re-aim without a page reload. The screenshot harness uses this
+   * to capture nearby views that share seed and sim time: the streamer keeps
+   * its cache, and only the new fringe has to generate.
+   *
+   * Calls `streamer.update` synchronously so `worldSettled()` reflects the
+   * new selection before the next animation frame.
+   */
+  seekCamera(
+    pos: { x: number; y: number; z: number },
+    look: { yaw: number; pitch: number },
+    wireframe?: boolean,
+  ): void {
+    this.rig.setPosition(pos.x, pos.y, pos.z);
+    this.rig.setLook(look.yaw, look.pitch);
+    if (wireframe !== undefined) this.renderer.setWireframe(wireframe);
+    this.streamer.update(this.rig.camera.position);
+    this.interiors.update(pos.x, pos.z, this.params.walk);
+  }
+
   /** Start a fresh worst-frame window, so warm-up hitches do not skew a soak run. */
   resetFrameStats(): void {
     this.frameTimer.resetPeak();

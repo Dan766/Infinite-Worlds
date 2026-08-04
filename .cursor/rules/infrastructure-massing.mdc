@@ -1,0 +1,17 @@
+---
+description: Roads streets bridges decks - Opus designer skill, tier-correct, no self-verify
+globs: "{src/world/roads.ts,src/world/roads.test.ts,src/world/streets.ts,src/world/streets.test.ts,src/world/road-mesh.ts,src/world/road-mesh.test.ts,src/world/grading.ts,src/world/grading.test.ts,docs/settlement-visual-acceptance.md,shots/canonical.json}"
+alwaysApply: false
+---
+
+# Infrastructure massing
+
+When editing these files for **roads / streets / bridges / decks / arteries**:
+
+1. Follow `.cursor/skills/infrastructure-massing/SKILL.md`.
+2. Prefer Claude Opus (`claude-opus-5-thinking-high`) via Task.
+3. Obey tier rule (Region -> Sector -> Chunk); coarser never reads finer.
+4. Preserve seam determinism; city roads terminate at gates.
+5. Proof PNGs then separate `v-critic`. No self-ACCEPT.
+6. Buildings -> `settlement-massing`. Walls -> `settlement-walls`. Props ->
+   `settlement-props`.

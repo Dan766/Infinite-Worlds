@@ -135,6 +135,7 @@ import {
   type SectorStreetField,
   type SectorStreets,
 } from './streets';
+import { cityInfluenceRadius, isCity } from './city';
 
 // ---------------------------------------------------------------------------
 // Tuning
@@ -885,27 +886,43 @@ export function buildDeckSurface(
 
       for (let i = 0; i < net.settlements.length; i++) {
         const s = net.settlements[i] as (typeof net.settlements)[number];
-        if (s.x + STREET_MAX_EXTENT < minX || s.x - STREET_MAX_EXTENT > maxX) continue;
-        if (s.z + STREET_MAX_EXTENT < minZ || s.z - STREET_MAX_EXTENT > maxZ) continue;
-        // Two regions can both list one settlement, and its own sector is
-        // unique, so the sector coordinate is the identity to deduplicate on.
-        const sx = Math.floor(s.x / SECTOR_SIZE);
-        const sz = Math.floor(s.z / SECTOR_SIZE);
-        const key = `${sx},${sz}`;
-        if (visited.has(key)) continue;
-        visited.add(key);
-        addSectorStreets(
-          b,
-          sectors.streetsAt(sx, sz),
-          minX,
-          minZ,
-          maxX,
-          maxZ,
-          stationStep,
-          groundAt,
-          targetAt,
-          palette,
-        );
+        // Cities span many sectors (wall R ≫ STREET_MAX_EXTENT). Mirror the
+        // building-mesh multi-sector load so outer arteries and rings get decks.
+        const reach = isCity(s) ? cityInfluenceRadius(s) : STREET_MAX_EXTENT;
+        if (s.x + reach < minX || s.x - reach > maxX) continue;
+        if (s.z + reach < minZ || s.z - reach > maxZ) continue;
+
+        if (!isCity(s)) {
+          const sx = Math.floor(s.x / SECTOR_SIZE);
+          const sz = Math.floor(s.z / SECTOR_SIZE);
+          const key = `${sx},${sz}`;
+          if (visited.has(key)) continue;
+          visited.add(key);
+          addSectorStreets(
+            b, sectors.streetsAt(sx, sz), minX, minZ, maxX, maxZ,
+            stationStep, groundAt, targetAt, palette,
+          );
+          continue;
+        }
+
+        const settleKey = `city:${s.cellX},${s.cellZ}`;
+        if (visited.has(settleKey)) continue;
+        visited.add(settleKey);
+        const s0x = Math.floor((Math.max(minX, s.x - reach) - 1) / SECTOR_SIZE);
+        const s1x = Math.floor((Math.min(maxX, s.x + reach) + 1) / SECTOR_SIZE);
+        const s0z = Math.floor((Math.max(minZ, s.z - reach) - 1) / SECTOR_SIZE);
+        const s1z = Math.floor((Math.min(maxZ, s.z + reach) + 1) / SECTOR_SIZE);
+        for (let sz = s0z; sz <= s1z; sz++) {
+          for (let sx = s0x; sx <= s1x; sx++) {
+            const key = `${sx},${sz}`;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            addSectorStreets(
+              b, sectors.streetsAt(sx, sz), minX, minZ, maxX, maxZ,
+              stationStep, groundAt, targetAt, palette,
+            );
+          }
+        }
       }
     }
   }
