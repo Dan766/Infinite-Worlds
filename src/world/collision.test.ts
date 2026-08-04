@@ -39,8 +39,8 @@ describe('pure collision proxies', () => {
     };
     const plan = generateCityPlan(city, 123);
     const gateIndex = plan.gateIndex[0] as number;
-    const gateX = ((plan.wallX[gateIndex] as number) + (plan.wallX[gateIndex + 1] as number)) * 0.5;
-    const gateZ = ((plan.wallZ[gateIndex] as number) + (plan.wallZ[gateIndex + 1] as number)) * 0.5;
+    const gateX = plan.wallX[gateIndex] as number;
+    const gateZ = plan.wallZ[gateIndex] as number;
     expect(collidesWithCityWall(gateX, gateZ, 0.5, plan)).toBe(false);
     let segment = 0;
     while (Array.from(plan.gateIndex).includes(segment)) segment++;

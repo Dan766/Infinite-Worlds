@@ -34,9 +34,13 @@ import {
   type BuildingSurface,
 } from './building-mesh';
 import { worldRegionField, worldSectorField, type RegionField } from './height-field';
-import { type SectorLots } from './lots';
+import { KIND_KEEP, KIND_CATHEDRAL, KIND_TOWNHALL, KIND_GUILDHALL, KIND_GATEHOUSE, type SectorLots } from './lots';
+import { parseParams } from '../core/params';
+import { SETTLEMENT_CLASS_CITY } from './roads';
+import { WALL_HEIGHT } from './wall-mesh';
 
 const SEED = hashString('buildings-test');
+const CITY_SEED = parseParams('').seedHash;
 
 const PALETTE: BuildingPalette = {
   wallA: [0.5, 0.5, 0.5],
@@ -84,6 +88,90 @@ function surfaceAt(coord: ChunkCoord, seed = SEED, groundY = -1000): BuildingSur
   return buildBuildingSurface(coord, region(seed).roads, field.lots, flatGround(groundY), PALETTE);
 }
 
+/** Find the first landmark lot of `kind` inside the default city. */
+function findCityLandmark(kind: number): { rec: SectorLots; i: number } | undefined {
+  const regionField = worldRegionField(CITY_SEED);
+  const field = worldSectorField(regionField, CITY_SEED);
+  const net = regionField.roads.networkAt(-32612, -28480);
+  for (let si = 0; si < net.settlements.length; si++) {
+    const s = net.settlements[si]!;
+    if (s.class !== SETTLEMENT_CLASS_CITY) continue;
+    const cx = s.x;
+    const cz = s.z;
+    const R = s.wallRadius ?? 260;
+    const s0 = Math.floor((cx - R) / 512);
+    const s1 = Math.floor((cx + R) / 512);
+    const z0 = Math.floor((cz - R) / 512);
+    const z1 = Math.floor((cz + R) / 512);
+    for (let sz = z0; sz <= z1; sz++) {
+      for (let sx = s0; sx <= s1; sx++) {
+        const rec = field.lots.lotsAt(sx, sz);
+        for (let i = 0; i < rec.count; i++) {
+          if ((rec.kind[i] as number) === kind) return { rec, i };
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function surfaceForLandmark(kind: number) {
+  const lot = findCityLandmark(kind);
+  expect(lot).toBeDefined();
+  const rec = lot!.rec;
+  const index = lot!.i;
+  const kx = rec.centerX[index] as number;
+  const kz = rec.centerZ[index] as number;
+  const coord: ChunkCoord = {
+    x: Math.floor(kx / 64),
+    z: Math.floor(kz / 64),
+    lod: 0,
+  };
+  const regionField = worldRegionField(CITY_SEED);
+  const field = worldSectorField(regionField, CITY_SEED);
+  const surface = buildBuildingSurface(
+    coord,
+    regionField.roads,
+    field.lots,
+    flatGround(-1000),
+    PALETTE,
+  );
+  return { surface, kx, kz, rec, index };
+}
+
+function vertsNear(
+  surface: BuildingSurface,
+  lcx: number,
+  lcz: number,
+  radius: number,
+  originX: number,
+  originZ: number,
+): { x: number; y: number; z: number }[] {
+  const out: { x: number; y: number; z: number }[] = [];
+  for (let v = 0; v < surface.positions.length; v += 3) {
+    const x = (surface.positions[v] as number) + originX;
+    const y = surface.positions[v + 1] as number;
+    const z = (surface.positions[v + 2] as number) + originZ;
+    if (Math.abs(x - lcx) > radius || Math.abs(z - lcz) > radius) continue;
+    out.push({ x, y, z });
+  }
+  return out;
+}
+
+function landmarkVerts(kind: number) {
+  const { surface, kx, kz, rec, index } = surfaceForLandmark(kind);
+  const coord = {
+    x: Math.floor(kx / 64),
+    z: Math.floor(kz / 64),
+    lod: 0 as const,
+  };
+  const originX = coord.x * 64;
+  const originZ = coord.z * 64;
+  const floor = rec.floorY[index] as number;
+  const verts = vertsNear(surface, kx, kz, 22, originX, originZ);
+  return { surface, kx, kz, rec, index, floor, verts };
+}
+
 // ---------------------------------------------------------------------------
 // The shape of a building
 // ---------------------------------------------------------------------------
@@ -97,11 +185,188 @@ describe('one building', () => {
     for (const node of nodes) {
       const surface = surfaceAt(node.coord);
       if (surface.count === 0) continue;
-      expect(surface.positions.length / 3).toBe(surface.count * BUILDING_VERTEX_COUNT);
-      expect(surface.indices.length / 3).toBe(surface.count * BUILDING_TRIANGLE_COUNT);
+      const landmarks =
+        surface.keep + surface.cathedral + surface.townhall + surface.guildhall + surface.gatehouse;
+      if (landmarks === 0) {
+        expect(surface.positions.length / 3).toBe(surface.count * BUILDING_VERTEX_COUNT);
+        expect(surface.indices.length / 3).toBe(surface.count * BUILDING_TRIANGLE_COUNT);
+      }
       expect(surface.normals.length).toBe(surface.positions.length);
       expect(surface.colors.length).toBe(surface.positions.length);
     }
+  });
+
+  it('gives the known city keep more shell geometry than a cottage', () => {
+    const citySeed = hashString('infinite-world');
+    const field = world(citySeed);
+    let keepLot;
+    for (let z = -58; z <= -54 && keepLot === undefined; z++) {
+      for (let x = -66; x <= -62 && keepLot === undefined; x++) {
+        const rec = field.lots.lotsAt(x, z);
+        for (let i = 0; i < rec.count; i++) {
+          if ((rec.kind[i] as number) === KIND_KEEP) {
+            keepLot = { rec, i };
+            break;
+          }
+        }
+      }
+    }
+    expect(keepLot).toBeDefined();
+    const rec = keepLot?.rec as SectorLots;
+    const index = keepLot?.i as number;
+    const coord: ChunkCoord = {
+      x: Math.floor((rec.centerX[index] as number) / 64),
+      z: Math.floor((rec.centerZ[index] as number) / 64),
+      lod: 0,
+    };
+    const surface = buildBuildingSurface(
+      coord,
+      region(citySeed).roads,
+      field.lots,
+      flatGround(-1000),
+      PALETTE,
+    );
+    expect(surface.keep).toBeGreaterThan(0);
+    expect(surface.positions.length / 3).toBeGreaterThan(surface.count * BUILDING_VERTEX_COUNT);
+    expect(surface.indices.length / 3).toBeGreaterThan(surface.count * BUILDING_TRIANGLE_COUNT);
+  });
+
+  it('C5 keep towers rise at least 20% above the bailey roof', () => {
+    const citySeed = hashString('infinite-world');
+    const field = world(citySeed);
+    let keepLot: { rec: SectorLots; i: number } | undefined;
+    for (let z = -58; z <= -54 && keepLot === undefined; z++) {
+      for (let x = -66; x <= -62 && keepLot === undefined; x++) {
+        const rec = field.lots.lotsAt(x, z);
+        for (let i = 0; i < rec.count; i++) {
+          if ((rec.kind[i] as number) === KIND_KEEP) {
+            keepLot = { rec, i };
+            break;
+          }
+        }
+      }
+    }
+    expect(keepLot).toBeDefined();
+    const rec = keepLot?.rec as SectorLots;
+    const index = keepLot?.i as number;
+    const kx = rec.centerX[index] as number;
+    const kz = rec.centerZ[index] as number;
+    const floor = rec.floorY[index] as number;
+    const coord: ChunkCoord = {
+      x: Math.floor(kx / 64),
+      z: Math.floor(kz / 64),
+      lod: 0,
+    };
+    const originX = coord.x * 64;
+    const originZ = coord.z * 64;
+    const lcx = kx - originX;
+    const lcz = kz - originZ;
+    const surface = buildBuildingSurface(
+      coord,
+      region(citySeed).roads,
+      field.lots,
+      flatGround(-1000),
+      PALETTE,
+    );
+    expect(surface.keep).toBe(1);
+
+    const radius = 28;
+    let keepVerts = 0;
+    let maxY = -Infinity;
+    let minY = Infinity;
+    const baileyRoof = floor + 6;
+    for (let v = 0; v < surface.positions.length; v += 3) {
+      const x = surface.positions[v] as number;
+      const y = surface.positions[v + 1] as number;
+      const z = surface.positions[v + 2] as number;
+      if (Math.abs(x - lcx) > radius || Math.abs(z - lcz) > radius) continue;
+      keepVerts++;
+      if (y > maxY) maxY = y;
+      if (y < minY) minY = y;
+    }
+    // Anti-vacuity: keep landmark actually emitted verts near its lot centre.
+    expect(keepVerts).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    // Positive: tower crowns exceed bailey roof by ≥20%.
+    expect(maxY).toBeGreaterThanOrEqual(baileyRoof * 1.2);
+    expect(maxY).toBeGreaterThanOrEqual(floor + 28);
+    expect(minY).toBeLessThanOrEqual(floor);
+  });
+
+  it('C5 cathedral transept is at least 125% nave width and emits shell verts', () => {
+    const { surface, kx, kz, rec, index, floor, verts } = landmarkVerts(KIND_CATHEDRAL);
+    expect(surface.cathedral).toBe(1);
+    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(Math.max(...verts.map((v) => v.y))).toBeGreaterThanOrEqual(floor + 34);
+    const hd = rec.halfDepth[index] as number;
+    const transeptHalfAcross = hd * 0.46;
+    const naveHalfAcross = 5;
+    expect(transeptHalfAcross).toBeGreaterThanOrEqual(naveHalfAcross * 1.25);
+    const ax = rec.alongX[index] as number;
+    const az = rec.alongZ[index] as number;
+    let trAcross = 0;
+    let towerAlong = 0;
+    for (const v of verts) {
+      const along = (v.x - kx) * ax + (v.z - kz) * az;
+      const across = (v.x - kx) * az - (v.z - kz) * ax;
+      if (Math.abs(along) < 5 && v.y >= floor && v.y <= floor + 19) {
+        trAcross = Math.max(trAcross, Math.abs(across));
+      }
+      if (v.y >= floor + 32 && along < -8) towerAlong = Math.min(towerAlong, along);
+    }
+    expect(trAcross * 2).toBeGreaterThan(20);
+    expect(towerAlong).toBeLessThan(-8);
+  });
+
+  it('C5 town hall has plinth, dual roof levels, and frontage ≥18 m', () => {
+    const { surface, kx, kz, rec, index, floor, verts } = landmarkVerts(KIND_TOWNHALL);
+    expect(surface.townhall).toBe(1);
+    const hw = rec.halfWidth[index] as number;
+    expect(hw * 2).toBeGreaterThanOrEqual(18);
+    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    const roofHeights = new Set<number>();
+    for (const v of verts) {
+      if (v.y >= floor + 7.5 && v.y <= floor + 9) roofHeights.add(1);
+      if (v.y >= floor + 17.5 && v.y <= floor + 21) roofHeights.add(2);
+    }
+    expect(roofHeights.size).toBeGreaterThanOrEqual(2);
+    const plinthBand = verts.filter((v) => v.y >= floor - 0.5 && v.y <= floor + 3.5);
+    expect(plinthBand.length).toBeGreaterThan(40);
+    const north = plinthBand.filter((v) => v.z > kz + 8).length;
+    const south = plinthBand.filter((v) => v.z < kz - 8).length;
+    const east = plinthBand.filter((v) => v.x > kx + 8).length;
+    const west = plinthBand.filter((v) => v.x < kx - 8).length;
+    expect([north, south, east, west].filter((n) => n > 5).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('C5 guildhall workshop exceeds hall height and loading gap exists on approach', () => {
+    const { surface, kx, kz, floor, verts } = landmarkVerts(KIND_GUILDHALL);
+    expect(surface.guildhall).toBeGreaterThan(0);
+    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    const maxY = Math.max(...verts.map((v) => v.y));
+    expect(maxY).toBeGreaterThan(floor + 10.5);
+    const approachZ = kz + 7;
+    const gapVerts = verts.filter(
+      (v) => Math.abs(v.x - kx) < 2.5 && v.z > approachZ && v.y > floor && v.y < floor + 5,
+    );
+    expect(gapVerts.length).toBe(0);
+    const pierVerts = verts.filter(
+      (v) => Math.abs(Math.abs(v.x - kx) - 7.5) < 2 && v.z > approachZ && v.y > floor + 4,
+    );
+    expect(pierVerts.length).toBeGreaterThan(0);
+  });
+
+  it('C5 gatehouse towers exceed 125% curtain height with centre opening', () => {
+    const { surface, kx, kz, floor, verts } = landmarkVerts(KIND_GATEHOUSE);
+    expect(surface.gatehouse).toBeGreaterThan(0);
+    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    const minTower = floor + WALL_HEIGHT * 1.25;
+    expect(Math.max(...verts.map((v) => v.y))).toBeGreaterThanOrEqual(minTower);
+    const centreGap = verts.filter(
+      (v) => Math.abs(v.x - kx) < 2 && Math.abs(v.z - kz) < 3 && v.y > floor && v.y < floor + 10,
+    );
+    expect(centreGap.length).toBe(0);
+    const towerVerts = verts.filter((v) => Math.abs(Math.abs(v.x - kx) - 7) < 3 && v.y > floor + 20);
+    expect(towerVerts.length).toBeGreaterThan(0);
   });
 
   it('faces outward on every triangle', () => {

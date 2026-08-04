@@ -89,6 +89,7 @@ import {
   type SectorLotField,
   type SectorLots,
 } from './lots';
+import { cityInfluenceRadius, isCity } from './city';
 import { type RegionRoadField } from './roads';
 
 // ---------------------------------------------------------------------------
@@ -172,7 +173,12 @@ export const BUILDING_TRIANGLE_COUNT = 18;
  * same lookup `road-mesh.ts` performs for streets, one number larger, and it is
  * why buildings cost no extra region build: the regions are already resident.
  */
-const REGION_SEARCH_PAD = LOT_MAX_EXTENT;
+/**
+ * Cities span multiple sectors (wall radius ~400-600 m + farm belt). Building
+ * lookup must reach the settlement centre from a rim chunk, and must load lots
+ * from EVERY overlapping sector — not only the centre cell.
+ */
+const CITY_BUILDING_SEARCH_PAD = 1200;
 
 // ---------------------------------------------------------------------------
 // What comes back
@@ -426,6 +432,204 @@ function face(
   }
 }
 
+/** Emit one flat-roofed box aligned to a lot's frontage and depth axes. */
+function addOrientedBox(
+  b: BuildingBuilder,
+  centerX: number,
+  centerZ: number,
+  alongX: number,
+  alongZ: number,
+  acrossX: number,
+  acrossZ: number,
+  offsetAlong: number,
+  offsetAcross: number,
+  halfAlong: number,
+  halfAcross: number,
+  bottom: number,
+  top: number,
+  wall: Rgb,
+  roof: Rgb,
+): void {
+  const at = (u: number, v: number, y: number): Corner => ({
+    x: centerX + alongX * (offsetAlong + halfAlong * u) + acrossX * (offsetAcross + halfAcross * v),
+    y,
+    z: centerZ + alongZ * (offsetAlong + halfAlong * u) + acrossZ * (offsetAcross + halfAcross * v),
+  });
+  const wallColors: readonly Rgb[] = [wall, wall, wall, wall];
+  face(b, [at(-1, -1, bottom), at(1, -1, bottom), at(1, -1, top), at(-1, -1, top)], wallColors, -acrossX, 0, -acrossZ);
+  face(b, [at(1, 1, bottom), at(-1, 1, bottom), at(-1, 1, top), at(1, 1, top)], wallColors, acrossX, 0, acrossZ);
+  face(b, [at(-1, 1, bottom), at(-1, -1, bottom), at(-1, -1, top), at(-1, 1, top)], wallColors, -alongX, 0, -alongZ);
+  face(b, [at(1, -1, bottom), at(1, 1, bottom), at(1, 1, top), at(1, -1, top)], wallColors, alongX, 0, alongZ);
+  face(b, [at(-1, -1, top), at(1, -1, top), at(1, 1, top), at(-1, 1, top)], [roof, roof, roof, roof], 0, 1, 0);
+}
+
+/**
+ * Landmark-only exterior shells. Several oriented volumes replace the cottage
+ * gable path, giving every civic kind its own footprint and skyline.
+ */
+function addLandmarkBuilding(
+  b: BuildingBuilder,
+  kind: number,
+  centerX: number,
+  centerZ: number,
+  alongX: number,
+  alongZ: number,
+  acrossX: number,
+  acrossZ: number,
+  halfWidth: number,
+  halfDepth: number,
+  base: number,
+  floor: number,
+  eaves: number,
+  _ridge: number,
+  wall: Rgb,
+  roof: Rgb,
+  plinth: Rgb,
+): void {
+  const box = (
+    offsetAlong: number,
+    offsetAcross: number,
+    halfAlong: number,
+    halfAcross: number,
+    bottom: number,
+    top: number,
+    side: Rgb = wall,
+    cap: Rgb = roof,
+  ): void => addOrientedBox(
+    b, centerX, centerZ, alongX, alongZ, acrossX, acrossZ,
+    offsetAlong, offsetAcross, halfAlong, halfAcross, bottom, top, side, cap,
+  );
+
+  if (kind === KIND_KEEP) {
+    // C5 keep: bailey, gate/approach, central keep, four corner towers (≥2 visible).
+    // Towers ≥20% taller than bailey roof (28 vs 6 m above floor). Stone tints
+    // separate volumes in shaded proofs. Gate projects toward +Z (approach from SE).
+    const stone: Rgb = [0.7, 0.66, 0.58];
+    const stoneDark: Rgb = [0.45, 0.42, 0.36];
+    const baileyTop = floor + 6;
+    const keepLowerTop = floor + 14;
+    const keepUpperTop = floor + 19;
+    const towerTop = floor + 28;
+    const gateTop = floor + 12;
+    // 1 Bailey platform — full 44×44 m footprint.
+    box(0, 0, halfWidth, halfDepth, base, baileyTop, plinth, stone);
+    // 2 Gate / approach barbican — projects toward +Z (negative across).
+    box(0, -halfDepth * 1.15, halfWidth * 0.36, halfDepth * 0.2, base, gateTop, stone, stoneDark);
+    box(0, -halfDepth * 1.02, halfWidth * 0.14, halfDepth * 0.1, floor, gateTop - 2, stoneDark, stone);
+    // 3 Central keep — offset toward gate so the mass reads from approach.
+    box(0, -halfDepth * 0.12, halfWidth * 0.42, halfDepth * 0.42, floor, keepLowerTop, stone, stoneDark);
+    box(0, -halfDepth * 0.12, halfWidth * 0.28, halfDepth * 0.28, keepLowerTop - 0.5, keepUpperTop, stoneDark, roof);
+    // 4 Four corner towers with crown caps (≥2 required; four for top-down readability).
+    for (const u of [-1, 1]) {
+      for (const v of [-1, 1]) {
+        box(
+          u * halfWidth * 0.76,
+          v * halfDepth * -0.76,
+          halfWidth * 0.18,
+          halfDepth * 0.18,
+          base,
+          towerTop,
+          stoneDark,
+          stone,
+        );
+        box(
+          u * halfWidth * 0.76,
+          v * halfDepth * -0.76,
+          halfWidth * 0.12,
+          halfDepth * 0.12,
+          towerTop - 0.5,
+          towerTop + 3,
+          stone,
+          stoneDark,
+        );
+      }
+    }
+    return;
+  }
+
+  if (kind === KIND_CATHEDRAL) {
+    // C5 cathedral: cruciform plan — nave, transept/crossing, west front tower.
+    // Transept halfAcross 13 m vs nave 5 m → 260% width ratio (≥125%). Stone
+    // tints separate volumes in shaded proofs. Approach from +Z (city core).
+    const stone: Rgb = [0.62, 0.6, 0.54];
+    const stoneDark: Rgb = [0.44, 0.42, 0.38];
+    const stoneLight: Rgb = [0.72, 0.7, 0.64];
+    const naveTop = floor + 16;
+    const clerestoryTop = floor + 25;
+    const transeptTop = floor + 18;
+    const towerTop = floor + 34;
+    // 1 Nave — long narrow volume along +X.
+    box(4, 0, halfWidth * 0.62, 5, base, naveTop, stone, stoneDark);
+    // 2 Transept / crossing — wider across, shorter along (cruciform top view).
+    box(0, 0, halfWidth * 0.32, halfDepth * 0.46, floor, transeptTop, stoneDark, stone);
+    // 3 Nave clerestory — raised centre ridge over the nave.
+    box(4, 0, halfWidth * 0.5, 3.5, naveTop - 0.5, clerestoryTop, stoneLight, roof);
+    // 4 West front tower — tall block at the −X (west) end.
+    box(-halfWidth * 0.68, 0, halfWidth * 0.38, halfDepth * 0.28, base, towerTop, stoneDark, stoneLight);
+    box(-halfWidth * 0.68, 0, halfWidth * 0.26, halfDepth * 0.18, towerTop - 0.5, towerTop + 4, stoneLight, stoneDark);
+    return;
+  }
+
+  if (kind === KIND_TOWNHALL) {
+    // C5 town hall: full plinth on all four sides, main hall + clock tower
+    // (≥2 roof levels). Frontage = 2×halfWidth along +X (≥18 m absolute).
+    const stone: Rgb = [0.58, 0.54, 0.48];
+    const stoneDark: Rgb = [0.4, 0.38, 0.34];
+    const hallTop = floor + 8;
+    const towerTop = floor + 18;
+    // 1 Plinth podium — full footprint, visible on every side.
+    box(0, 0, halfWidth, halfDepth, base, floor + 3, plinth, stone);
+    // 2 Main hall block — inset above plinth.
+    box(0, 0, halfWidth * 0.88, halfDepth * 0.82, floor + 2.8, hallTop, stone, stoneDark);
+    // 3 Clock tower — projects toward +Z (approach from city core).
+    box(0, -halfDepth * 0.28, halfWidth * 0.38, halfDepth * 0.42, floor + 2.8, towerTop, stoneDark, roof);
+    box(0, -halfDepth * 0.28, halfWidth * 0.24, halfDepth * 0.28, towerTop - 0.5, towerTop + 3, stone, stoneDark);
+    // 4 Side annex wings — lower flanking masses (second silhouette tier).
+    box(-halfWidth * 0.62, 0, halfWidth * 0.32, halfDepth * 0.72, floor + 2.8, floor + 6.5, stoneDark, stone);
+    box(halfWidth * 0.62, 0, halfWidth * 0.32, halfDepth * 0.72, floor + 2.8, floor + 6.5, stoneDark, stone);
+    return;
+  }
+
+  if (kind === KIND_GUILDHALL) {
+    // C5 guildhall: hall + deep workshop wing + flanking loading piers with
+    // gap on approach — envelope is wide and asymmetric, not barn-like.
+    const stone: Rgb = [0.55, 0.5, 0.44];
+    const stoneDark: Rgb = [0.38, 0.34, 0.3];
+    const timber: Rgb = [0.32, 0.22, 0.14];
+    // 1 Guild hall proper — set back from the street.
+    box(0, halfDepth * 0.22, halfWidth * 0.75, halfDepth * 0.58, base, eaves, stone, stoneDark);
+    // 2 Workshop mass — taller, deeper volume toward the approach (+Z).
+    box(0, -halfDepth * 0.28, halfWidth * 0.92, halfDepth * 0.78, floor, floor + 11, stoneDark, timber);
+    // 3 Loading piers flanking the yard opening (gap between = traversable slot).
+    box(-halfWidth * 0.62, -halfDepth * 0.88, halfWidth * 0.38, halfDepth * 0.22, floor, floor + 6, timber, stone);
+    box(halfWidth * 0.62, -halfDepth * 0.88, halfWidth * 0.38, halfDepth * 0.22, floor, floor + 6, timber, stone);
+    // 4 Loading lintel bridging the piers (opening reads below this band).
+    box(0, -halfDepth * 0.88, halfWidth * 0.22, halfDepth * 0.18, floor + 5.5, floor + 8.5, stoneDark, stone);
+    return;
+  }
+
+  if (kind === KIND_GATEHOUSE) {
+    // C5 gatehouse: twin towers + lintel; centre stays empty for the road.
+    // Towers ≥125% curtain height (WALL_HEIGHT=14 → top ≥ floor+17.5).
+    const stone: Rgb = [0.72, 0.68, 0.6];
+    const stoneDark: Rgb = [0.48, 0.44, 0.38];
+    const towerTop = floor + 26;
+    const lintelBot = floor + 11;
+    // 1 West tower (along −X in lot frame).
+    box(-halfWidth * 0.72, 0, halfWidth * 0.32, halfDepth * 0.95, base, towerTop, stone, stoneDark);
+    box(-halfWidth * 0.72, 0, halfWidth * 0.22, halfDepth * 0.72, towerTop - 0.5, towerTop + 3, stoneDark, stone);
+    // 2 East tower (along +X).
+    box(halfWidth * 0.72, 0, halfWidth * 0.32, halfDepth * 0.95, base, towerTop, stone, stoneDark);
+    box(halfWidth * 0.72, 0, halfWidth * 0.22, halfDepth * 0.72, towerTop - 0.5, towerTop + 3, stoneDark, stone);
+    // 3 Lintel / parapet band above the opening (no fill below lintelBot).
+    box(0, 0, halfWidth * 0.42, halfDepth * 0.7, lintelBot, floor + 16, stone, stoneDark);
+    // 4 Outer buttresses on the approach face for silhouette readability.
+    box(-halfWidth * 0.72, halfDepth * 0.7, halfWidth * 0.22, halfDepth * 0.28, floor, towerTop - 4, stoneDark, stone);
+    box(halfWidth * 0.72, halfDepth * 0.7, halfWidth * 0.22, halfDepth * 0.28, floor, towerTop - 4, stoneDark, stone);
+    return;
+  }
+}
+
 /**
  * Add one building to the node.
  *
@@ -434,6 +638,26 @@ function face(
  * read for the plinth and for the levelness count, never for the floor. See the
  * header.
  */
+
+function emitLotsInNode(
+  b: BuildingBuilder,
+  rec: SectorLots,
+  minX: number,
+  minZ: number,
+  maxX: number,
+  maxZ: number,
+  groundAt: (localX: number, localZ: number) => number,
+  palette: BuildingPalette,
+): void {
+  for (let k = 0; k < rec.count; k++) {
+    if (b.count >= BUILDING_MAX_PER_NODE) break;
+    const cx = rec.centerX[k] as number;
+    const cz = rec.centerZ[k] as number;
+    if (cx < minX || cx >= maxX || cz < minZ || cz >= maxZ) continue;
+    addBuilding(b, rec, k, minX, minZ, groundAt, palette);
+  }
+}
+
 function addBuilding(
   b: BuildingBuilder,
   lots: SectorLots,
@@ -493,6 +717,46 @@ function addBuilding(
     palette.roofA[1] + (palette.roofB[1] - palette.roofA[1]) * roofT,
     palette.roofA[2] + (palette.roofB[2] - palette.roofA[2]) * roofT,
   ];
+  const kind = lots.kind[i] as number;
+  if (kind === KIND_BARN) b.barn++;
+  else if (kind === KIND_HALL) b.hall++;
+  else if (kind === KIND_TOWNHOUSE) b.townhouse++;
+  else if (kind === KIND_GUILDHALL) b.guildhall++;
+  else if (kind === KIND_WAREHOUSE) b.warehouse++;
+  else if (kind === KIND_KEEP) b.keep++;
+  else if (kind === KIND_CATHEDRAL) b.cathedral++;
+  else if (kind === KIND_TOWNHALL) b.townhall++;
+  else if (kind === KIND_GATEHOUSE) b.gatehouse++;
+  else b.cottage++;
+
+  if (
+    kind === KIND_KEEP ||
+    kind === KIND_CATHEDRAL ||
+    kind === KIND_TOWNHALL ||
+    kind === KIND_GUILDHALL ||
+    kind === KIND_GATEHOUSE
+  ) {
+    addLandmarkBuilding(
+      b,
+      kind,
+      centerX,
+      centerZ,
+      alongX,
+      alongZ,
+      acrossX,
+      acrossZ,
+      halfWidth,
+      halfDepth,
+      base,
+      floor,
+      eaves,
+      ridge,
+      wall,
+      roof,
+      palette.plinth,
+    );
+    return;
+  }
 
   // -- the corners -----------------------------------------------------------
   //
@@ -551,21 +815,8 @@ function addBuilding(
   face(b, [at(-1, -1, eaves), at(1, -1, eaves), ridgeB, ridgeA], roofColors, -acrossX, 1, -acrossZ);
   face(b, [at(1, 1, eaves), at(-1, 1, eaves), ridgeA, ridgeB], roofColors, acrossX, 1, acrossZ);
 
-  const kind = lots.kind[i] as number;
-  if (kind === KIND_BARN) b.barn++;
-  else if (kind === KIND_HALL) b.hall++;
-  else if (kind === KIND_TOWNHOUSE) b.townhouse++;
-  else if (kind === KIND_GUILDHALL) b.guildhall++;
-  else if (kind === KIND_WAREHOUSE) b.warehouse++;
-  else if (kind === KIND_KEEP) b.keep++;
-  else if (kind === KIND_CATHEDRAL) b.cathedral++;
-  else if (kind === KIND_TOWNHALL) b.townhall++;
-  else if (kind === KIND_GATEHOUSE) b.gatehouse++;
-  else b.cottage++;
-
-  // Facade detail: exactly two quads for every kind so BUILDING_VERTEX_COUNT
-  // stays a single load-bearing number. The mesh decides nothing about which
-  // kind this is -- it only paints what `lots.kind` already chose.
+  // Facade detail: exactly two quads for every non-landmark kind, so
+  // BUILDING_VERTEX_COUNT stays load-bearing for the cottage-derived path.
   const wood: Rgb = [0.18, 0.11, 0.07];
   const glass: Rgb = [0.22, 0.28, 0.34];
   const stone: Rgb = [0.22, 0.2, 0.18];
@@ -682,12 +933,14 @@ export function buildBuildingSurface(
   const b = new BuildingBuilder();
   b.countLevel = coord.lod === BUILDING_LEVEL_LOD;
 
-  const r0X = Math.floor((minX - REGION_SEARCH_PAD) / REGION_SIZE);
-  const r1X = Math.floor((maxX + REGION_SEARCH_PAD) / REGION_SIZE);
-  const r0Z = Math.floor((minZ - REGION_SEARCH_PAD) / REGION_SIZE);
-  const r1Z = Math.floor((maxZ + REGION_SEARCH_PAD) / REGION_SIZE);
+  const searchPad = CITY_BUILDING_SEARCH_PAD;
+  const r0X = Math.floor((minX - searchPad) / REGION_SIZE);
+  const r1X = Math.floor((maxX + searchPad) / REGION_SIZE);
+  const r0Z = Math.floor((minZ - searchPad) / REGION_SIZE);
+  const r1Z = Math.floor((maxZ + searchPad) / REGION_SIZE);
 
-  const visited = new Set<string>();
+  const visitedSectors = new Set<string>();
+  const visitedSettlements = new Set<string>();
   for (let rz = r0Z; rz <= r1Z; rz++) {
     for (let rx = r0X; rx <= r1X; rx++) {
       const net = roads.networkAt(
@@ -695,28 +948,39 @@ export function buildBuildingSurface(
         rz * REGION_SIZE + REGION_SIZE / 2,
       );
       for (let i = 0; i < net.settlements.length; i++) {
-        const s = net.settlements[i] as (typeof net.settlements)[number];
-        if (s.x + LOT_MAX_EXTENT < minX || s.x - LOT_MAX_EXTENT > maxX) continue;
-        if (s.z + LOT_MAX_EXTENT < minZ || s.z - LOT_MAX_EXTENT > maxZ) continue;
-        // Two regions can both list one settlement, and its own sector is
-        // unique, so the sector coordinate is the identity to deduplicate on --
-        // the same rule `road-mesh.ts` uses for street plans.
-        const sx = Math.floor(s.x / SECTOR_SIZE);
-        const sz = Math.floor(s.z / SECTOR_SIZE);
-        const key = `${sx},${sz}`;
-        if (visited.has(key)) continue;
-        visited.add(key);
+        const site = net.settlements[i] as (typeof net.settlements)[number];
+        const reach = isCity(site) ? cityInfluenceRadius(site) : LOT_MAX_EXTENT;
+        if (site.x + reach < minX || site.x - reach > maxX) continue;
+        if (site.z + reach < minZ || site.z - reach > maxZ) continue;
 
-        const rec = lots.lotsAt(sx, sz);
-        for (let k = 0; k < rec.count; k++) {
-          if (b.count >= BUILDING_MAX_PER_NODE) break;
-          const cx = rec.centerX[k] as number;
-          const cz = rec.centerZ[k] as number;
-          // Half-open on the maximum edges, the same `[min, max)` convention
-          // `worldToChunk` and `clipSegmentToBox` use, so a building whose
-          // centre lands exactly on a boundary belongs to one node and not two.
-          if (cx < minX || cx >= maxX || cz < minZ || cz >= maxZ) continue;
-          addBuilding(b, rec, k, minX, minZ, groundAt, palette);
+        const settleKey = `${site.cellX},${site.cellZ}`;
+        if (visitedSettlements.has(settleKey)) continue;
+        visitedSettlements.add(settleKey);
+
+        // Villages: one sector owns all lots (centre cell).
+        // Cities: every sector overlapping the city may hold clipped lots —
+        // load each sector whose square intersects this node (and the city).
+        if (!isCity(site)) {
+          const sx = Math.floor(site.x / SECTOR_SIZE);
+          const sz = Math.floor(site.z / SECTOR_SIZE);
+          const key = `${sx},${sz}`;
+          if (visitedSectors.has(key)) continue;
+          visitedSectors.add(key);
+          emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette);
+          continue;
+        }
+
+        const s0x = Math.floor((Math.max(minX, site.x - reach) - 1) / SECTOR_SIZE);
+        const s1x = Math.floor((Math.min(maxX, site.x + reach) + 1) / SECTOR_SIZE);
+        const s0z = Math.floor((Math.max(minZ, site.z - reach) - 1) / SECTOR_SIZE);
+        const s1z = Math.floor((Math.min(maxZ, site.z + reach) + 1) / SECTOR_SIZE);
+        for (let sz = s0z; sz <= s1z; sz++) {
+          for (let sx = s0x; sx <= s1x; sx++) {
+            const key = `${sx},${sz}`;
+            if (visitedSectors.has(key)) continue;
+            visitedSectors.add(key);
+            emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette);
+          }
         }
       }
     }

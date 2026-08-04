@@ -1,0 +1,17 @@
+---
+description: City walls and C6 districts - Opus designer skill, continuous curtain, no self-verify
+globs: "{src/world/wall-mesh.ts,src/world/wall-mesh.test.ts,src/world/city.ts,src/world/collision.ts,src/world/grading.ts,docs/settlement-visual-acceptance.md,shots/canonical.json}"
+alwaysApply: false
+---
+
+# Settlement walls
+
+When editing these files for **curtain / tower / gate / berm / market / farmland**
+work:
+
+1. Follow `.cursor/skills/settlement-walls/SKILL.md`.
+2. Prefer Claude Opus (`claude-opus-5-thinking-high`) via Task.
+3. Keep curtain continuous (miters); square butts only at `GATE_CLEAR_M`.
+4. C5 owns gatehouse shell; C6 owns curtain cut - no second gatehouse mesh.
+5. Proof PNGs then separate `v-critic`. No self-ACCEPT.
+6. Building shells -> `settlement-massing`. Yard/veg props -> `settlement-props`.

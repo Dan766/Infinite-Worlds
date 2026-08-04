@@ -218,15 +218,15 @@ export function generateCityPlan(site: Settlement, worldSeed: number): CityPlan 
     lW.push(hw);
     lD.push(hd);
   };
-  pushL(LANDMARK_KEEP, dX[0] as number, dZ[0] as number, 14, 14);
-  pushL(LANDMARK_MARKET, dX[1] as number, dZ[1] as number, 18, 18);
-  pushL(LANDMARK_TOWNHALL, dX[2] as number, dZ[2] as number, 10, 8);
-  pushL(LANDMARK_CATHEDRAL, dX[3] as number, dZ[3] as number, 12, 20);
-  pushL(LANDMARK_GUILD, dX[4] as number, dZ[4] as number, 9, 7);
+  pushL(LANDMARK_KEEP, dX[0] as number, dZ[0] as number, 22, 22);
+  pushL(LANDMARK_MARKET, dX[1] as number, dZ[1] as number, 22, 22);
+  pushL(LANDMARK_TOWNHALL, dX[2] as number, dZ[2] as number, 16, 12);
+  pushL(LANDMARK_CATHEDRAL, dX[3] as number, dZ[3] as number, 16, 28);
+  pushL(LANDMARK_GUILD, dX[4] as number, dZ[4] as number, 12, 10);
   pushL(LANDMARK_GUILD, (dX[4] as number) + 22, (dZ[4] as number) - 10, 8, 6);
   for (let g = 0; g < gateCount; g++) {
     const gi = gateIndex[g] as number;
-    pushL(LANDMARK_GATEHOUSE, wallX[gi] as number, wallZ[gi] as number, 6, 8);
+    pushL(LANDMARK_GATEHOUSE, wallX[gi] as number, wallZ[gi] as number, 10, 12);
   }
 
   const nodeX: number[] = [];
@@ -256,39 +256,58 @@ export function generateCityPlan(site: Settlement, worldSeed: number): CityPlan 
       { x: keep.x, z: keep.z },
     ]);
   }
-  const ringPts: { x: number; z: number }[] = [];
-  for (let i = 0; i <= 16; i++) {
-    ringDirection(i / 16, dir);
-    ringPts.push({
-      x: cx + (dir[0] as number) * R * 0.7,
-      z: cz + (dir[1] as number) * R * 0.7,
-    });
+  // Polar street grid: dense rings + radials so lot frontage can pack the wall
+  // annulus. Arteries above still provide gate→market→keep spines.
+  const GRID_N = 24;
+  for (const frac of [0.3, 0.42, 0.54, 0.66, 0.78, 0.9] as const) {
+    const ringPts: { x: number; z: number }[] = [];
+    for (let i = 0; i <= GRID_N; i++) {
+      ringDirection(i / GRID_N, dir);
+      ringPts.push({
+        x: cx + (dir[0] as number) * R * frac,
+        z: cz + (dir[1] as number) * R * frac,
+      });
+    }
+    addStreet(ringPts);
   }
-  addStreet(ringPts);
+  for (let a = 0; a < GRID_N; a++) {
+    ringDirection(a / GRID_N, dir);
+    addStreet([
+      { x: cx + (dir[0] as number) * R * 0.3, z: cz + (dir[1] as number) * R * 0.3 },
+      { x: cx + (dir[0] as number) * R * 0.54, z: cz + (dir[1] as number) * R * 0.54 },
+      { x: cx + (dir[0] as number) * R * 0.78, z: cz + (dir[1] as number) * R * 0.78 },
+      { x: cx + (dir[0] as number) * R * 0.92, z: cz + (dir[1] as number) * R * 0.92 },
+    ]);
+  }
 
-  for (let d = 5; d < dKinds.length; d++) {
+  // Local block fabric around every district except the keep core.
+  for (let d = 1; d < dKinds.length; d++) {
     const dx0 = dX[d] as number;
     const dz0 = dZ[d] as number;
-    const rr = (dR[d] as number) * 0.8;
-    for (let lane = 0; lane < 3; lane++) {
+    const rr = (dR[d] as number) * 0.9;
+    for (let lane = 0; lane < 4; lane++) {
       const t0 = unitAt(cellX, cellZ, d * 10 + lane, worldSeed, BLOCK_SALT);
       ringDirection(t0, dir);
       const ox = -(dir[1] as number);
       const oz = dir[0] as number;
-      const along = rr * (0.6 + (0.3 * lane) / 3);
+      const along = rr * (0.5 + (0.4 * lane) / 4);
+      const lateral = rr * 0.28;
       addStreet([
         {
-          x: dx0 - (dir[0] as number) * along + ox * rr * 0.3,
-          z: dz0 - (dir[1] as number) * along + oz * rr * 0.3,
+          x: dx0 - (dir[0] as number) * along - ox * lateral,
+          z: dz0 - (dir[1] as number) * along - oz * lateral,
         },
         {
-          x: dx0 + (dir[0] as number) * along + ox * rr * 0.3,
-          z: dz0 + (dir[1] as number) * along + oz * rr * 0.3,
+          x: dx0 + (dir[0] as number) * along - ox * lateral,
+          z: dz0 + (dir[1] as number) * along - oz * lateral,
+        },
+        {
+          x: dx0 + (dir[0] as number) * along + ox * lateral,
+          z: dz0 + (dir[1] as number) * along + oz * lateral,
         },
       ]);
     }
   }
-
   const fX: number[] = [];
   const fZ: number[] = [];
   const fRad: number[] = [];

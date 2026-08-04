@@ -78,9 +78,9 @@ export function canonicalizeUrl(baseUrl, params = '') {
  * until green, which is exactly the trust problem the byte comparison exists to
  * avoid.
  */
-const READY_TIMEOUT_MS = 120000;
+const READY_TIMEOUT_MS = 180000;
 
-const SCREENSHOT_TIMEOUT_MS = 120000;
+const SCREENSHOT_TIMEOUT_MS = 180000;
 
 /**
  * Open a fresh context+page, navigate to `url`, wait until the app reports
@@ -215,6 +215,62 @@ export async function captureOnPage(session, url, outPath, { timeout = READY_TIM
     caret: 'hide',
     // Forest nodes after Phase 7a can make SwiftShader take longer than the
     // Playwright default 30s to rasterise a 1280x720 frame.
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
+  const { distinctColors } = await measureFrame(page);
+  return {
+    consoleErrors: [...consoleErrors],
+    failedRequests: [...failedRequests],
+    distinctColors,
+  };
+}
+
+/**
+ * Move the camera on an already-ready page, wait for the streamer to settle,
+ * screenshot. Used for later views in a same-seed cluster so the chunk cache
+ * survives between nearby viewpoints.
+ */
+export async function reseatAndCapture(session, camera, outPath, { timeout = READY_TIMEOUT_MS } = {}) {
+  const { page, consoleErrors, failedRequests } = session;
+  consoleErrors.length = 0;
+  failedRequests.length = 0;
+
+  await page.evaluate((cam) => {
+    const app = window.__app;
+    if (app === undefined || typeof app.seekCamera !== 'function') {
+      throw new Error('window.__app.seekCamera is missing; rebuild dist/');
+    }
+    app.seekCamera(cam.pos, cam.look, cam.wireframe);
+  }, camera);
+
+  await page.waitForFunction(
+    () => {
+      const app = window.__app;
+      return app !== undefined && app.worldSettled() === true;
+    },
+    undefined,
+    { timeout },
+  );
+
+  // Two painted frames after settle, matching READY_FRAME_COUNT, so the
+  // screenshot does not catch the first frame of a just-arrived mesh.
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        let n = 0;
+        const tick = () => {
+          n += 1;
+          if (n >= 2) resolve();
+          else requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }),
+  );
+
+  await page.screenshot({
+    path: outPath,
+    animations: 'disabled',
+    caret: 'hide',
     timeout: SCREENSHOT_TIMEOUT_MS,
   });
   const { distinctColors } = await measureFrame(page);

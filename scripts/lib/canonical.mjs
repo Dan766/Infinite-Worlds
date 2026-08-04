@@ -17,8 +17,10 @@ import {
   captureOnPage,
   launchBrowser,
   openCaptureSession,
+  reseatAndCapture,
 } from './browser.mjs';
 import { startStaticServer } from './static-server.mjs';
+import { clusterViews, filterViews, inPageCamera } from './shots-select.mjs';
 
 export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const SHOTS_DIR = join(PROJECT_ROOT, 'shots');
@@ -55,20 +57,28 @@ export function buildProject() {
 /**
  * Capture every canonical view into `outDir`.
  *
- * One Chromium process, one browser context, one page: each view is a
- * `page.goto` + `__worldReady` wait + screenshot on that same page. Reusing the
- * page avoids the per-view context teardown/startup tax without changing the
- * one-process sequential order that Phase 6a showed is load-bearing for
- * process-history flakes.
+ * One Chromium process, one browser context, one page. Views that share seed
+ * and sim time (and other non-camera params) form a cluster: the first is a
+ * `page.goto` + `__worldReady` wait; later ones call `App.seekCamera` and wait
+ * on `worldSettled()` so the streamer cache survives. Clusters stay in
+ * canonical order -- Phase 6a showed unordered capture flakes on wireframes.
+ *
+ * Pass `only: ['city-*']` (from `--only`) to capture a subset.
  *
  * @returns {Promise<Array<{ name: string, file: string, url: string, consoleErrors: string[], failedRequests: string[], distinctColors: number }>>}
  */
-export async function captureCanonicalViews(outDir, { build = true } = {}) {
+export async function captureCanonicalViews(outDir, { build = true, only = [] } = {}) {
   if (build) buildProject();
   mkdirSync(outDir, { recursive: true });
 
   const config = loadCanonical();
-  console.log(`capturing ${config.views.length} views (single browser, reused page)`);
+  const views = filterViews(config.views, only);
+  const clusters = clusterViews(views);
+  const onlyNote = only.length > 0 ? ` filtered by --only=${only.join(',')}` : '';
+  console.log(
+    `capturing ${views.length}/${config.views.length} views` +
+      ` (${clusters.length} load clusters, single browser)${onlyNote}`,
+  );
 
   const server = await startStaticServer(DIST_DIR);
   const browser = await launchBrowser();
@@ -84,40 +94,52 @@ export async function captureCanonicalViews(outDir, { build = true } = {}) {
     session = await openCaptureSession(browser, { viewport: config.viewport });
   }
 
+  let viewIndex = 0;
   try {
-    for (const [i, view] of config.views.entries()) {
-      const url = canonicalizeUrl(server.url, view.params ?? '');
-      const file = join(outDir, `${view.name}.png`);
-      const started = Date.now();
-      process.stdout.write(`${i + 1}/${config.views.length} ${view.name} ... `);
-      try {
-        let shot;
+    for (const cluster of clusters) {
+      for (let j = 0; j < cluster.views.length; j++) {
+        const view = cluster.views[j];
+        const url = canonicalizeUrl(server.url, view.params ?? '');
+        const file = join(outDir, `${view.name}.png`);
+        const started = Date.now();
+        const mode = j === 0 ? 'load' : 'seek';
+        process.stdout.write(
+          `${viewIndex + 1}/${views.length} ${view.name} [${mode}] ... `,
+        );
+        viewIndex += 1;
         try {
-          shot = await captureOnPage(session, url, file);
+          let shot;
+          try {
+            if (j === 0) {
+              shot = await captureOnPage(session, url, file);
+            } else {
+              shot = await reseatAndCapture(session, inPageCamera(view.params ?? ''), file);
+            }
+          } catch (error) {
+            // SwiftShader sometimes kills the renderer after several navigations
+            // on one page (seen on the first wireframe after shaded views). One
+            // fresh context+retry keeps the reused-page fast path without failing
+            // the whole run. Seek failures fall back to a full load.
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/Target crashed|has been closed|crash|Timeout/i.test(message)) throw error;
+            process.stdout.write(`retry after crash ... `);
+            await replaceSession();
+            shot = await captureOnPage(session, url, file);
+          }
+          console.log(`${((Date.now() - started) / 1000).toFixed(1)}s`);
+          results.push({
+            name: view.name,
+            file,
+            url,
+            consoleErrors: shot.consoleErrors,
+            failedRequests: shot.failedRequests,
+            distinctColors: shot.distinctColors,
+          });
         } catch (error) {
-          // SwiftShader sometimes kills the renderer after several navigations
-          // on one page (seen on the first wireframe after shaded views). One
-          // fresh context+retry keeps the reused-page fast path without failing
-          // the whole run.
           const message = error instanceof Error ? error.message : String(error);
-          if (!/Target crashed|has been closed|crash/i.test(message)) throw error;
-          process.stdout.write(`retry after crash ... `);
-          await replaceSession();
-          shot = await captureOnPage(session, url, file);
+          console.log(`FAILED after ${((Date.now() - started) / 1000).toFixed(1)}s`);
+          throw new Error(`${view.name}: ${message}`, { cause: error });
         }
-        console.log(`${((Date.now() - started) / 1000).toFixed(1)}s`);
-        results.push({
-          name: view.name,
-          file,
-          url,
-          consoleErrors: shot.consoleErrors,
-          failedRequests: shot.failedRequests,
-          distinctColors: shot.distinctColors,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.log(`FAILED after ${((Date.now() - started) / 1000).toFixed(1)}s`);
-        throw new Error(`${view.name}: ${message}`, { cause: error });
       }
     }
   } finally {
