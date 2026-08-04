@@ -17,6 +17,12 @@ import {
   PROP_KIND_POST,
   PROP_KIND_TREE,
   PROP_MAX_PER_NODE,
+  SPECIES_BROADLEAF,
+  SPECIES_BUSH_ROUND,
+  SPECIES_BUSH_TALL,
+  SPECIES_CRATE,
+  SPECIES_PINE,
+  SPECIES_POST,
   collectNodeProps,
   emptyPropField,
 } from './props';
@@ -58,6 +64,7 @@ describe('collectNodeProps', () => {
     expect(Array.from(a.centerX)).toEqual(Array.from(b.centerX));
     expect(Array.from(a.centerZ)).toEqual(Array.from(b.centerZ));
     expect(Array.from(a.kind)).toEqual(Array.from(b.kind));
+    expect(Array.from(a.species)).toEqual(Array.from(b.species));
     expect(Array.from(a.scale)).toEqual(Array.from(b.scale));
   });
 
@@ -120,10 +127,73 @@ describe('collectNodeProps', () => {
     }
   });
 
+  it('stores species in the allowed set and mixes tree/bush families', () => {
+    const { region, sector } = fields();
+    const allowed = new Set([
+      SPECIES_PINE,
+      SPECIES_BROADLEAF,
+      SPECIES_BUSH_ROUND,
+      SPECIES_BUSH_TALL,
+      SPECIES_CRATE,
+      SPECIES_POST,
+    ]);
+    let pine = 0;
+    let broadleaf = 0;
+    let bushRound = 0;
+    let bushTall = 0;
+    for (let z = -60; z <= 60; z++) {
+      for (let x = -60; x <= 60; x++) {
+        const props = collectNodeProps(
+          { x, z, lod: 0 },
+          SEED,
+          region.roads,
+          sector.streets,
+          sector.lots,
+        );
+        for (let i = 0; i < props.count; i++) {
+          const sp = props.species[i] as number;
+          expect(allowed.has(sp)).toBe(true);
+          if (sp === SPECIES_PINE) pine++;
+          if (sp === SPECIES_BROADLEAF) broadleaf++;
+          if (sp === SPECIES_BUSH_ROUND) bushRound++;
+          if (sp === SPECIES_BUSH_TALL) bushTall++;
+        }
+      }
+    }
+    expect(pine).toBeGreaterThan(0);
+    expect(broadleaf).toBeGreaterThan(0);
+    expect(bushRound).toBeGreaterThan(0);
+    expect(bushTall).toBeGreaterThan(0);
+  });
+
+  it('clusters world density by grove without emptying the lattice', () => {
+    const { region, sector } = fields();
+    let total = 0;
+    let nodes = 0;
+    for (let z = -30; z <= 30; z++) {
+      for (let x = -30; x <= 30; x++) {
+        const props = collectNodeProps(
+          { x, z, lod: 0 },
+          SEED,
+          region.roads,
+          sector.streets,
+          sector.lots,
+        );
+        if (props.count > 0) {
+          nodes++;
+          total += props.count;
+        }
+      }
+    }
+    expect(nodes).toBeGreaterThan(10);
+    expect(total / nodes).toBeGreaterThan(1);
+  });
+
   it('emptyPropField is zero-length everywhere', () => {
     const empty = emptyPropField();
     expect(empty.count).toBe(0);
     expect(empty.centerX).toHaveLength(0);
     expect(empty.kind).toHaveLength(0);
+    expect(empty.species).toHaveLength(0);
   });
 });

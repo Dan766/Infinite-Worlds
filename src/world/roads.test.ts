@@ -67,6 +67,9 @@ function site(x: number, z: number, y = 0, score = 0.7): Settlement {
     y,
     score,
     radius: 100,
+    class: 0,
+    wallRadius: 0,
+    farmRadius: 0,
   };
 }
 

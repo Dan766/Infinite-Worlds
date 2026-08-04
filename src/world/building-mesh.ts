@@ -75,7 +75,20 @@
  */
 
 import { chunkSizeAt, REGION_SIZE, SECTOR_SIZE, type ChunkCoord } from './contracts';
-import { LOT_MAX_EXTENT, type SectorLotField, type SectorLots } from './lots';
+import {
+  KIND_BARN,
+  KIND_HALL,
+  KIND_TOWNHOUSE,
+  KIND_GUILDHALL,
+  KIND_WAREHOUSE,
+  KIND_KEEP,
+  KIND_CATHEDRAL,
+  KIND_TOWNHALL,
+  KIND_GATEHOUSE,
+  LOT_MAX_EXTENT,
+  type SectorLotField,
+  type SectorLots,
+} from './lots';
 import { type RegionRoadField } from './roads';
 
 // ---------------------------------------------------------------------------
@@ -140,8 +153,15 @@ export const BUILDING_LEVEL_LOD = 0;
 export const BUILDING_MAX_PER_NODE = 1024;
 
 /** Vertices and triangles one building costs. Exported for the payload maths. */
-export const BUILDING_VERTEX_COUNT = 30;
-export const BUILDING_TRIANGLE_COUNT = 14;
+/**
+ * Vertices and triangles one building costs.
+ *
+ * Every kind (cottage / barn / hall) lands on the SAME budget: the base gabled
+ * box plus exactly two facade quads. Keeping the cost fixed keeps the payload
+ * maths and the winding tests load-bearing rather than kind-dependent.
+ */
+export const BUILDING_VERTEX_COUNT = 38;
+export const BUILDING_TRIANGLE_COUNT = 18;
 
 /**
  * Metres beyond the node square within which a region is consulted for
@@ -172,7 +192,7 @@ export interface BuildingSurface {
   indices: Uint32Array;
   /**
    * Buildings this node owns. Not derivable from the triangle count -- every
-   * building has the same 14 triangles, so a count of objects is the only thing
+   * building has the same 18 triangles, so a count of objects is the only thing
    * that distinguishes "forty houses" from "one enormous one".
    */
   count: number;
@@ -188,6 +208,17 @@ export interface BuildingSurface {
    * project would notice.
    */
   level: number;
+  /** Kind breakdown of `count` -- soak anti-vacuity per kind. */
+  cottage: number;
+  barn: number;
+  hall: number;
+  townhouse: number;
+  guildhall: number;
+  warehouse: number;
+  keep: number;
+  cathedral: number;
+  townhall: number;
+  gatehouse: number;
 }
 
 /** The palette a building is painted with, LINEAR rgb. */
@@ -209,6 +240,16 @@ const EMPTY_BUILDINGS: () => BuildingSurface = () => ({
   indices: new Uint32Array(0),
   count: 0,
   level: 0,
+  cottage: 0,
+  barn: 0,
+  hall: 0,
+  townhouse: 0,
+  guildhall: 0,
+  warehouse: 0,
+  keep: 0,
+  cathedral: 0,
+  townhall: 0,
+  gatehouse: 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -235,6 +276,16 @@ class BuildingBuilder {
   readonly indices: number[] = [];
   count = 0;
   level = 0;
+  cottage = 0;
+  barn = 0;
+  hall = 0;
+  townhouse = 0;
+  guildhall = 0;
+  warehouse = 0;
+  keep = 0;
+  cathedral = 0;
+  townhall = 0;
+  gatehouse = 0;
   /** See `BUILDING_LEVEL_LOD`. False on a coarse node, where the number would lie. */
   countLevel = true;
 
@@ -285,6 +336,16 @@ class BuildingBuilder {
       indices: Uint32Array.from(this.indices),
       count: this.count,
       level: this.level,
+      cottage: this.cottage,
+      barn: this.barn,
+      hall: this.hall,
+      townhouse: this.townhouse,
+      guildhall: this.guildhall,
+      warehouse: this.warehouse,
+      keep: this.keep,
+      cathedral: this.cathedral,
+      townhall: this.townhall,
+      gatehouse: this.gatehouse,
     };
   }
 }
@@ -489,6 +550,107 @@ function addBuilding(
   const roofColors: readonly Rgb[] = [roof, roof, roof, roof];
   face(b, [at(-1, -1, eaves), at(1, -1, eaves), ridgeB, ridgeA], roofColors, -acrossX, 1, -acrossZ);
   face(b, [at(1, 1, eaves), at(-1, 1, eaves), ridgeA, ridgeB], roofColors, acrossX, 1, acrossZ);
+
+  const kind = lots.kind[i] as number;
+  if (kind === KIND_BARN) b.barn++;
+  else if (kind === KIND_HALL) b.hall++;
+  else if (kind === KIND_TOWNHOUSE) b.townhouse++;
+  else if (kind === KIND_GUILDHALL) b.guildhall++;
+  else if (kind === KIND_WAREHOUSE) b.warehouse++;
+  else if (kind === KIND_KEEP) b.keep++;
+  else if (kind === KIND_CATHEDRAL) b.cathedral++;
+  else if (kind === KIND_TOWNHALL) b.townhall++;
+  else if (kind === KIND_GATEHOUSE) b.gatehouse++;
+  else b.cottage++;
+
+  // Facade detail: exactly two quads for every kind so BUILDING_VERTEX_COUNT
+  // stays a single load-bearing number. The mesh decides nothing about which
+  // kind this is -- it only paints what `lots.kind` already chose.
+  const wood: Rgb = [0.18, 0.11, 0.07];
+  const glass: Rgb = [0.22, 0.28, 0.34];
+  const stone: Rgb = [0.22, 0.2, 0.18];
+  const push = 0.05;
+  const panel = (
+    u0: number,
+    v0: number,
+    u1: number,
+    v1: number,
+    y0: number,
+    y1: number,
+    outX: number,
+    outZ: number,
+    color: Rgb,
+  ): void => {
+    const ox = outX * push;
+    const oz = outZ * push;
+    face(
+      b,
+      [
+        { x: cornerX(u0, v0) + ox, y: y0, z: cornerZ(u0, v0) + oz },
+        { x: cornerX(u1, v1) + ox, y: y0, z: cornerZ(u1, v1) + oz },
+        { x: cornerX(u1, v1) + ox, y: y1, z: cornerZ(u1, v1) + oz },
+        { x: cornerX(u0, v0) + ox, y: y1, z: cornerZ(u0, v0) + oz },
+      ],
+      [color, color, color, color],
+      outX,
+      0,
+      outZ,
+    );
+  };
+
+  if (kind === KIND_BARN) {
+    const y0 = floor + 0.05;
+    const y1 = floor + (eaves - floor) * 0.85;
+    panel(-0.85, -1, -0.05, -1, y0, y1, -acrossX, -acrossZ, wood);
+    panel(0.05, -1, 0.85, -1, y0, y1, -acrossX, -acrossZ, wood);
+  } else if (kind === KIND_HALL) {
+    // Door on the street front, chimney as an upward-facing cap on the ridge.
+    // The cap's +Y hint keeps the winding test honest (a vertical chimney slab
+    // on the roof pulled the vertex centroid and failed it).
+    const y0 = floor + 0.05;
+    const y1 = floor + (eaves - floor) * 0.55;
+    panel(-0.22, -1, 0.22, -1, y0, y1, -acrossX, -acrossZ, wood);
+    const cu = 0.4;
+    const half = 0.2;
+    const topY = ridge + 1.4;
+    face(
+      b,
+      [
+        {
+          x: cornerX(cu - half, -half),
+          y: topY,
+          z: cornerZ(cu - half, -half),
+        },
+        {
+          x: cornerX(cu + half, -half),
+          y: topY,
+          z: cornerZ(cu + half, -half),
+        },
+        {
+          x: cornerX(cu + half, half),
+          y: topY,
+          z: cornerZ(cu + half, half),
+        },
+        {
+          x: cornerX(cu - half, half),
+          y: topY,
+          z: cornerZ(cu - half, half),
+        },
+      ],
+      [stone, stone, stone, stone],
+      0,
+      1,
+      0,
+    );
+  } else {
+    const y0 = floor + 0.05;
+    const y1 = floor + (eaves - floor) * 0.55;
+    panel(-0.18, -1, 0.18, -1, y0, y1, -acrossX, -acrossZ, wood);
+    const wy0 = floor + (eaves - floor) * 0.35;
+    const wy1 = floor + (eaves - floor) * 0.7;
+    panel(1, -0.35, 1, 0.05, wy0, wy1, alongX, alongZ, glass);
+  }
+
 }
 
 // ---------------------------------------------------------------------------

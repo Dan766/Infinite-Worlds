@@ -245,4 +245,27 @@ describe('buildPropSurface', () => {
     // Silence unused helper under --noUnusedLocals if the file is tree-shaken.
     expect(typeof assertOutwardWinding).toBe('function');
   });
+
+  it('species counters sum to count when props exist', () => {
+    const coord = findPropNode();
+    const { region, sector } = fields();
+    const size = chunkSizeAt(coord.lod);
+    const originX = coord.x * size;
+    const originZ = coord.z * size;
+    const groundAt = (lx: number, lz: number) => sampleHeight(originX + lx, originZ + lz, SEED);
+    const surface = buildPropSurface(
+      coord,
+      SEED,
+      region.roads,
+      sector.streets,
+      sector.lots,
+      groundAt,
+      PALETTE,
+    );
+    expect(surface.count).toBeGreaterThan(0);
+    expect(
+      surface.pine + surface.broadleaf + surface.bushRound + surface.bushTall + surface.yard,
+    ).toBe(surface.count);
+  });
+
 });

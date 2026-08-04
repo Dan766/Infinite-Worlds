@@ -102,7 +102,8 @@
  */
 
 import { CellHeap } from './cell-heap';
-import { hash2i } from '../core/hash';
+import { hash2i, hash3i } from '../core/hash';
+import { cityPlanAt, nearestCityGate } from './city';
 import {
   createTierContext,
   REGION_SIZE,
@@ -262,6 +263,33 @@ export const SETTLEMENT_MIN_SCORE = 0.42;
 export const SETTLEMENT_RADIUS_MIN = 58;
 export const SETTLEMENT_RADIUS_MAX = 186;
 
+/** Village vs rare medieval city. */
+export const SETTLEMENT_CLASS_VILLAGE = 0;
+export const SETTLEMENT_CLASS_CITY = 1;
+
+/** Elite score band eligible for a city roll. */
+export const CITY_SCORE_MIN = 0.72;
+/** One in N elite local-maxima become cities. */
+export const CITY_ROLL_MOD = 7;
+const CITY_SALT = 0x4369_5479;
+
+export function cityRarityRoll(
+  cellX: number,
+  cellZ: number,
+  worldSeed: number,
+  score: number,
+): boolean {
+  return (
+    score >= CITY_SCORE_MIN &&
+    (hash3i(cellX, cellZ, (worldSeed ^ CITY_SALT) >>> 0) >>> 0) % CITY_ROLL_MOD === 0
+  );
+}
+
+export const CITY_WALL_RADIUS_MIN = 420;
+export const CITY_WALL_RADIUS_MAX = 580;
+export const CITY_FARM_BELT_MIN = 220;
+export const CITY_FARM_BELT_MAX = 360;
+
 /** Metres above sea level a settlement site must stand. */
 export const SETTLEMENT_MIN_ALTITUDE = 4;
 
@@ -382,8 +410,14 @@ export interface Settlement {
   readonly y: number;
   /** Site quality in [0, 1]. Sets the footprint and the road width. */
   readonly score: number;
-  /** Footprint radius in metres. */
+  /** Footprint radius in metres (wall radius for cities). */
   readonly radius: number;
+  /** `SETTLEMENT_CLASS_VILLAGE` or `SETTLEMENT_CLASS_CITY`. */
+  readonly class: number;
+  /** Curtain-wall radius; 0 on villages. */
+  readonly wallRadius: number;
+  /** Outer farmland belt radius; 0 on villages. */
+  readonly farmRadius: number;
 }
 
 /**
@@ -575,14 +609,29 @@ function siteSettlements(
       const x = pointX[at] as number;
       const z = pointZ[at] as number;
       const quality = clamp((score - SETTLEMENT_MIN_SCORE) / (1 - SETTLEMENT_MIN_SCORE), 0, 1);
+      const cellX = cell0X - 1 + col;
+      const cellZ = cell0Z - 1 + row;
+      let klass = SETTLEMENT_CLASS_VILLAGE;
+      let wallRadius = 0;
+      let farmRadius = 0;
+      let radius = lerp(SETTLEMENT_RADIUS_MIN, SETTLEMENT_RADIUS_MAX, quality);
+      if (cityRarityRoll(cellX, cellZ, worldSeed, score)) {
+        klass = SETTLEMENT_CLASS_CITY;
+        wallRadius = lerp(CITY_WALL_RADIUS_MIN, CITY_WALL_RADIUS_MAX, quality);
+        farmRadius = wallRadius + lerp(CITY_FARM_BELT_MIN, CITY_FARM_BELT_MAX, quality);
+        radius = wallRadius;
+      }
       out.push({
-        cellX: cell0X - 1 + col,
-        cellZ: cell0Z - 1 + row,
+        cellX,
+        cellZ,
         x,
         z,
         y: terrain.height(x, z, worldSeed),
         score,
-        radius: lerp(SETTLEMENT_RADIUS_MIN, SETTLEMENT_RADIUS_MAX, quality),
+        radius,
+        class: klass,
+        wallRadius,
+        farmRadius,
       });
     }
   }
@@ -658,7 +707,7 @@ class RoutingLattice {
     readonly cell0X: number,
     readonly cell0Z: number,
     cols: number,
-    private readonly worldSeed: number,
+    readonly worldSeed: number,
     private readonly terrain: RoadTerrain,
     private readonly rivers: RoadRivers,
   ) {
@@ -899,12 +948,16 @@ function routeEdge(
     x.push(grid.worldX(col));
     z.push(grid.worldZ(row));
   }
-  // The endpoints are the settlements themselves, not the cell centres nearest
-  // to them: a road has to arrive at the village, not near it.
-  x[0] = a.x;
-  z[0] = a.z;
-  x[x.length - 1] = b.x;
-  z[z.length - 1] = b.z;
+  // Villages terminate at their centre. City roads terminate at the nearest
+  // gate toward the other settlement, so no carriageway tunnels through a wall.
+  const aPlan = cityPlanAt(a, grid.worldSeed);
+  const bPlan = cityPlanAt(b, grid.worldSeed);
+  const aEnd = aPlan === undefined ? a : nearestCityGate(aPlan, b.x, b.z);
+  const bEnd = bPlan === undefined ? b : nearestCityGate(bPlan, a.x, a.z);
+  x[0] = aEnd.x;
+  z[0] = aEnd.z;
+  x[x.length - 1] = bEnd.x;
+  z[z.length - 1] = bEnd.z;
   return { x, z };
 }
 

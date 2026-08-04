@@ -106,6 +106,7 @@ import {
 } from './contracts';
 import { closestOnSegment, GradeBlend, SURFACE_STREET } from './grading';
 import { hashUnit, lerp, smoothstep } from './noise';
+import { cityPlanAt, isCity } from './city';
 import {
   SETTLEMENT_JITTER,
   SETTLEMENT_RADIUS_MAX,
@@ -258,6 +259,30 @@ export const STREET_CACHE_LIMIT = 192;
 const RING_SALT = 0x53_74_52_67;
 const LANE_SALT = 0x53_74_4c_6e;
 const ANGLE_SALT = 0x53_74_41_6e;
+/** Layout-family pick; must not collide with ring / lane / angle salts. */
+const LAYOUT_SALT = 0x53_74_4c_79;
+
+/** Village street-plan families. Selection is `(worldSeed, cell)` — never visit order. */
+export const LAYOUT_RING = 0;
+export const LAYOUT_LINEAR = 1;
+export const LAYOUT_GRID = 2;
+export const LAYOUT_HILLTOP = 3;
+export const LAYOUT_CITY = 4;
+
+/**
+ * Which street plan a settlement gets.
+ *
+ * Bucketed so ring stays the majority (~52%) and the other three share the rest
+ * evenly. Soak has to find each family without hunting forever; a uniform 25%
+ * split would starve the canonical ring views that Phase 4b still screenshots.
+ */
+export function layoutFamily(worldSeed: number, cellX: number, cellZ: number): number {
+  const bucket = (hash3i(cellX, cellZ, (worldSeed ^ LAYOUT_SALT) >>> 0) >>> 0) % 100;
+  if (bucket < 52) return LAYOUT_RING;
+  if (bucket < 68) return LAYOUT_LINEAR;
+  if (bucket < 84) return LAYOUT_GRID;
+  return LAYOUT_HILLTOP;
+}
 
 // ---------------------------------------------------------------------------
 // The laid-out streets of one sector
@@ -305,6 +330,12 @@ export interface SectorStreets {
    * point. Zero on an empty sector. The first thing a query tests.
    */
   readonly reachRadius: number;
+  /**
+   * Layout family for this sector's settlement (`LAYOUT_*`), or `-1` when the
+   * sector is empty. Additive field for soak / HUD anti-vacuity; CSR shape is
+   * unchanged so lots, decks and grading keep walking the same polylines.
+   */
+  readonly layout: number;
 }
 
 const EMPTY_NODES = new Float64Array(0);
@@ -329,6 +360,7 @@ function emptyStreets(
     segCount: 0,
     halfWidth: STREET_HALF_WIDTH,
     reachRadius: 0,
+    layout: -1,
   };
 }
 
@@ -507,11 +539,62 @@ export function generateSectorStreets(
   const centerZ = coord.z * SECTOR_SIZE + SECTOR_SIZE / 2;
   const net = roads.networkAt(centerX, centerZ);
 
+  // Cities are Region-owned and may cross many sectors. Every overlapping
+  // sector clips the same CityPlan; villages retain centre ownership below.
+  const minX = coord.x * SECTOR_SIZE;
+  const minZ = coord.z * SECTOR_SIZE;
+  const maxX = minX + SECTOR_SIZE;
+  const maxZ = minZ + SECTOR_SIZE;
+  const seenCities = new Set<string>();
+  const cityNodeX: number[] = [];
+  const cityNodeZ: number[] = [];
+  const cityStreetStart: number[] = [0];
+  let citySite: Settlement | undefined;
+  for (const candidate of net.settlements) {
+    if (!isCity(candidate)) continue;
+    const key = `${candidate.cellX},${candidate.cellZ}`;
+    if (seenCities.has(key)) continue;
+    seenCities.add(key);
+    const nearX = Math.max(minX, Math.min(candidate.x, maxX));
+    const nearZ = Math.max(minZ, Math.min(candidate.z, maxZ));
+    const dx = candidate.x - nearX;
+    const dz = candidate.z - nearZ;
+    if (dx * dx + dz * dz > candidate.farmRadius * candidate.farmRadius) continue;
+    const plan = cityPlanAt(candidate, worldSeed);
+    if (plan === undefined) continue;
+    citySite ??= candidate;
+    clipCityPlan(
+      plan.nodeX,
+      plan.nodeZ,
+      plan.streetStart,
+      minX - STREET_SHOULDER,
+      minZ - STREET_SHOULDER,
+      maxX + STREET_SHOULDER,
+      maxZ + STREET_SHOULDER,
+      cityNodeX,
+      cityNodeZ,
+      cityStreetStart,
+    );
+  }
+  if (citySite !== undefined) {
+    return finishStreets(
+      terrain,
+      worldSeed,
+      coord.x,
+      coord.z,
+      citySite,
+      LAYOUT_CITY,
+      cityNodeX,
+      cityNodeZ,
+      cityStreetStart,
+    );
+  }
+
   let site: Settlement | undefined;
   let found = 0;
   for (let i = 0; i < net.settlements.length; i++) {
     const s = net.settlements[i] as Settlement;
-    if (Math.floor(s.x / SECTOR_SIZE) !== coord.x) continue;
+    if (isCity(s) || Math.floor(s.x / SECTOR_SIZE) !== coord.x) continue;
     if (Math.floor(s.z / SECTOR_SIZE) !== coord.z) continue;
     found++;
     if (site === undefined) site = s;
@@ -528,14 +611,9 @@ export function generateSectorStreets(
   }
   if (site === undefined) return emptyStreets(terrain, worldSeed, coord.x, coord.z);
 
-  // -- the ring -------------------------------------------------------------
+  const layout = layoutFamily(worldSeed, site.cellX, site.cellZ);
   const quality =
     (site.radius - SETTLEMENT_RADIUS_MIN) / (SETTLEMENT_RADIUS_MAX - SETTLEMENT_RADIUS_MIN);
-  const ringNodes = Math.min(
-    STREET_RING_NODES_MAX,
-    STREET_RING_NODES_MIN +
-      Math.floor(quality * (STREET_RING_NODES_MAX - STREET_RING_NODES_MIN + 1)),
-  );
   const ringRadius = site.radius * STREET_RING_FRACTION;
   const rimRadius = site.radius * STREET_RIM_FRACTION;
 
@@ -544,17 +622,176 @@ export function generateSectorStreets(
 
   const nodeX: number[] = [];
   const nodeZ: number[] = [];
-  const streetStart: number[] = [];
+  const streetStart: number[] = [0];
+
+  if (layout === LAYOUT_LINEAR) {
+    layoutLinear(site, worldSeed, quality, rimRadius, bearings, bearingCount, nodeX, nodeZ, streetStart);
+  } else if (layout === LAYOUT_GRID) {
+    layoutGrid(site, worldSeed, quality, rimRadius, bearings, bearingCount, nodeX, nodeZ, streetStart);
+  } else if (layout === LAYOUT_HILLTOP) {
+    layoutHilltop(site, worldSeed, quality, bearings, bearingCount, nodeX, nodeZ, streetStart);
+  } else {
+    layoutRing(
+      site,
+      worldSeed,
+      quality,
+      ringRadius,
+      rimRadius,
+      bearings,
+      bearingCount,
+      nodeX,
+      nodeZ,
+      streetStart,
+    );
+  }
+
+  return finishStreets(terrain, worldSeed, coord.x, coord.z, site, layout, nodeX, nodeZ, streetStart);
+}
+
+/** Clip CityPlan segments to one sector's padded square. */
+function clipCityPlan(
+  x: Float64Array,
+  z: Float64Array,
+  starts: Uint32Array,
+  minX: number,
+  minZ: number,
+  maxX: number,
+  maxZ: number,
+  outX: number[],
+  outZ: number[],
+  outStarts: number[],
+): void {
+  for (let street = 0; street + 1 < starts.length; street++) {
+    const from = starts[street] as number;
+    const to = starts[street + 1] as number;
+    for (let i = from; i + 1 < to; i++) {
+      const ax = x[i] as number;
+      const az = z[i] as number;
+      const bx = x[i + 1] as number;
+      const bz = z[i + 1] as number;
+      const clipped = clipSegment(ax, az, bx, bz, minX, minZ, maxX, maxZ);
+      if (clipped === undefined) continue;
+      outX.push(clipped[0], clipped[2]);
+      outZ.push(clipped[1], clipped[3]);
+      outStarts.push(outX.length);
+    }
+  }
+}
+
+function clipSegment(
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+  minX: number,
+  minZ: number,
+  maxX: number,
+  maxZ: number,
+): readonly [number, number, number, number] | undefined {
+  const dx = bx - ax;
+  const dz = bz - az;
+  let t0 = 0;
+  let t1 = 1;
+  const p = [-dx, dx, -dz, dz];
+  const q = [ax - minX, maxX - ax, az - minZ, maxZ - az];
+  for (let i = 0; i < 4; i++) {
+    const pi = p[i] as number;
+    const qi = q[i] as number;
+    if (pi === 0) {
+      if (qi < 0) return undefined;
+      continue;
+    }
+    const r = qi / pi;
+    if (pi < 0) {
+      if (r > t1) return undefined;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return undefined;
+      if (r < t1) t1 = r;
+    }
+  }
+  return [ax + dx * t0, az + dz * t0, ax + dx * t1, az + dz * t1];
+}
+
+/**
+ * Finish a plan: every node targets the settlement altitude, reach is measured,
+ * CSR counts are derived. Shared by every layout family so grading stays step-free.
+ */
+function finishStreets(
+  terrain: RoadTerrain,
+  worldSeed: number,
+  sectorX: number,
+  sectorZ: number,
+  site: Settlement,
+  layout: number,
+  nodeX: number[],
+  nodeZ: number[],
+  streetStart: number[],
+): SectorStreets {
+  const count = nodeX.length;
+  const nodeY = new Float64Array(count);
+  nodeY.fill(site.y);
+
+  let reachSq = 0;
+  for (let i = 0; i < count; i++) {
+    const dx = (nodeX[i] as number) - site.x;
+    const dz = (nodeZ[i] as number) - site.z;
+    const d = dx * dx + dz * dz;
+    if (d > reachSq) reachSq = d;
+  }
+  const streetCount = streetStart.length - 1;
+  let segCount = 0;
+  for (let i = 0; i < streetCount; i++) {
+    segCount += (streetStart[i + 1] as number) - (streetStart[i] as number) - 1;
+  }
+
+  return {
+    terrain,
+    worldSeed,
+    sectorX,
+    sectorZ,
+    settlement: site,
+    nodeX: Float64Array.from(nodeX),
+    nodeZ: Float64Array.from(nodeZ),
+    nodeY,
+    streetStart: Int32Array.from(streetStart),
+    streetCount,
+    segCount,
+    halfWidth: STREET_HALF_WIDTH,
+    reachRadius: Math.sqrt(reachSq) + STREET_HALF_WIDTH + STREET_SHOULDER,
+    layout,
+  };
+}
+
+/** How many ring nodes a settlement of this quality gets (ring / hilltop). */
+function ringNodeCount(quality: number, min: number, max: number): number {
+  return Math.min(max, min + Math.floor(quality * (max - min + 1)));
+}
+
+/**
+ * The original Phase 4b plan: closed ring, outer lanes, spokes in. Extracted
+ * rather than rewritten so existing ring villages stay byte-identical for the
+ * same `(seed, cell)` that still hashes into family 0.
+ */
+function layoutRing(
+  site: Settlement,
+  worldSeed: number,
+  quality: number,
+  ringRadius: number,
+  rimRadius: number,
+  bearings: Float64Array,
+  bearingCount: number,
+  nodeX: number[],
+  nodeZ: number[],
+  streetStart: number[],
+): void {
+  const ringNodes = ringNodeCount(quality, STREET_RING_NODES_MIN, STREET_RING_NODES_MAX);
   const direction = new Float64Array(2);
-  // Ring node directions and positions are needed again when the lanes and
-  // spokes hang off them, so they are kept rather than recomputed -- one array
-  // of `ringNodes` entries, discarded with the function.
   const ringDX = new Float64Array(ringNodes);
   const ringDZ = new Float64Array(ringNodes);
   const ringX = new Float64Array(ringNodes);
   const ringZ = new Float64Array(ringNodes);
 
-  streetStart.push(0);
   for (let k = 0; k < ringNodes; k++) {
     const around =
       STREET_ANGULAR_JITTER * jitterAt(site.cellX, site.cellZ, k, worldSeed, ANGLE_SALT);
@@ -571,19 +808,11 @@ export function generateSectorStreets(
     nodeX.push(ringX[k] as number);
     nodeZ.push(ringZ[k] as number);
   }
-  // The ring closes by repeating its first node, so every street in the record
-  // is an open polyline and nothing downstream needs a wrap-around case.
+  // Closed by repeating the first node: open polyline, no wrap-around downstream.
   nodeX.push(ringX[0] as number);
   nodeZ.push(ringZ[0] as number);
   streetStart.push(nodeX.length);
 
-  // -- lanes out to the rim, and spokes in to the centre ---------------------
-  //
-  // Alternating around the ring so the two never come off the same node, and
-  // both skipped wherever a road already runs on that bearing -- which is what
-  // stops a street being a second corridor on top of a road. A settlement with
-  // no roads at all therefore still gets a full plan, which matters: those are
-  // the ones a Gabriel graph leaves isolated.
   for (let k = 0; k < ringNodes; k++) {
     const dx = ringDX[k] as number;
     const dz = ringDZ[k] as number;
@@ -605,46 +834,209 @@ export function generateSectorStreets(
     }
     streetStart.push(nodeX.length);
   }
+}
 
-  // -- the profile ----------------------------------------------------------
-  //
-  // Every node targets the settlement's own altitude -- the SAME target the pad
-  // uses, and the same one the roads leaving the settlement are pinned to at
-  // their first node. That is what makes the junction between a street, the pad
-  // and a road step-free by construction rather than by tuning, and it is why
-  // this file needs no gradient limiter of its own: a plane has no gradient.
-  const count = nodeX.length;
-  const nodeY = new Float64Array(count);
-  nodeY.fill(site.y);
+/** Compact hill enclosure: smaller closed ring, few spokes, almost no outer lanes. */
+function layoutHilltop(
+  site: Settlement,
+  worldSeed: number,
+  quality: number,
+  bearings: Float64Array,
+  bearingCount: number,
+  nodeX: number[],
+  nodeZ: number[],
+  streetStart: number[],
+): void {
+  const hillNodes = ringNodeCount(quality, 5, 8);
+  const hillRadius = site.radius * 0.42;
+  const direction = new Float64Array(2);
+  const ringDX = new Float64Array(hillNodes);
+  const ringDZ = new Float64Array(hillNodes);
+  const ringX = new Float64Array(hillNodes);
+  const ringZ = new Float64Array(hillNodes);
 
-  let reachSq = 0;
-  for (let i = 0; i < count; i++) {
-    const dx = (nodeX[i] as number) - site.x;
-    const dz = (nodeZ[i] as number) - site.z;
-    const d = dx * dx + dz * dz;
-    if (d > reachSq) reachSq = d;
+  for (let k = 0; k < hillNodes; k++) {
+    const around =
+      STREET_ANGULAR_JITTER * jitterAt(site.cellX, site.cellZ, k, worldSeed, ANGLE_SALT);
+    ringDirection((k + around) / hillNodes, direction);
+    const dx = direction[0] as number;
+    const dz = direction[1] as number;
+    const radius =
+      hillRadius *
+      (1 + STREET_RADIAL_JITTER * 0.7 * jitterAt(site.cellX, site.cellZ, k, worldSeed, RING_SALT));
+    ringDX[k] = dx;
+    ringDZ[k] = dz;
+    ringX[k] = site.x + dx * radius;
+    ringZ[k] = site.z + dz * radius;
+    nodeX.push(ringX[k] as number);
+    nodeZ.push(ringZ[k] as number);
   }
-  const streetCount = streetStart.length - 1;
-  let segCount = 0;
-  for (let i = 0; i < streetCount; i++) {
-    segCount += (streetStart[i + 1] as number) - (streetStart[i] as number) - 1;
+  nodeX.push(ringX[0] as number);
+  nodeZ.push(ringZ[0] as number);
+  streetStart.push(nodeX.length);
+
+  // Spokes only, and only every other node that clears a road — compact, not a cartwheel.
+  for (let k = 0; k < hillNodes; k++) {
+    if (k % 2 === 0) continue;
+    const dx = ringDX[k] as number;
+    const dz = ringDZ[k] as number;
+    if (alignmentWithRoads(dx, dz, bearings, bearingCount) >= STREET_ROAD_CLEARANCE_DOT) continue;
+    nodeX.push(site.x);
+    nodeZ.push(site.z);
+    nodeX.push(ringX[k] as number);
+    nodeZ.push(ringZ[k] as number);
+    streetStart.push(nodeX.length);
+  }
+}
+
+/**
+ * Primary road bearing through the pad, or axis +X when the settlement is isolated.
+ * Written into `out` as a unit xz pair.
+ */
+function primaryBearing(
+  bearings: Float64Array,
+  bearingCount: number,
+  out: Float64Array,
+): void {
+  if (bearingCount <= 0) {
+    out[0] = 1;
+    out[1] = 0;
+    return;
+  }
+  out[0] = bearings[0] as number;
+  out[1] = bearings[1] as number;
+}
+
+/**
+ * Linear village: a long spine along the strongest road bearing, short spurs
+ * on both sides. The spine IS the street that follows the road corridor; spurs
+ * still honour road clearance so they do not stack a second lane on another road.
+ */
+function layoutLinear(
+  site: Settlement,
+  worldSeed: number,
+  quality: number,
+  rimRadius: number,
+  bearings: Float64Array,
+  bearingCount: number,
+  nodeX: number[],
+  nodeZ: number[],
+  streetStart: number[],
+): void {
+  const along = new Float64Array(2);
+  primaryBearing(bearings, bearingCount, along);
+  const ax = along[0] as number;
+  const az = along[1] as number;
+  const px = -az;
+  const pz = ax;
+
+  const halfLen = rimRadius * (0.85 + 0.1 * quality);
+  const spineNodes = 4 + Math.floor(quality * 2);
+  for (let i = 0; i < spineNodes; i++) {
+    const t = spineNodes === 1 ? 0 : (i / (spineNodes - 1)) * 2 - 1;
+    const jitter =
+      STREET_RADIAL_JITTER *
+      0.35 *
+      halfLen *
+      jitterAt(site.cellX, site.cellZ, i, worldSeed, RING_SALT);
+    nodeX.push(site.x + ax * halfLen * t + px * jitter);
+    nodeZ.push(site.z + az * halfLen * t + pz * jitter);
+  }
+  streetStart.push(nodeX.length);
+
+  const spurLen = rimRadius * (0.32 + 0.08 * quality);
+  const spurCount = 3 + Math.floor(quality * 2);
+  for (let i = 0; i < spurCount; i++) {
+    const t = spurCount === 1 ? 0 : (i / (spurCount - 1)) * 2 - 1;
+    const sx = site.x + ax * halfLen * t * 0.85;
+    const sz = site.z + az * halfLen * t * 0.85;
+    const len =
+      spurLen *
+      (1 + STREET_RADIAL_JITTER * jitterAt(site.cellX, site.cellZ, i + 40, worldSeed, LANE_SALT));
+    for (const sign of [1, -1] as const) {
+      const dx = px * sign;
+      const dz = pz * sign;
+      if (alignmentWithRoads(dx, dz, bearings, bearingCount) >= STREET_ROAD_CLEARANCE_DOT) continue;
+      nodeX.push(sx);
+      nodeZ.push(sz);
+      nodeX.push(sx + dx * len);
+      nodeZ.push(sz + dz * len);
+      streetStart.push(nodeX.length);
+    }
+  }
+}
+
+/**
+ * Small road-aligned grid inside the rim: 2–3 streets each way. The centre line
+ * along the primary road is omitted — the road already is that corridor.
+ */
+function layoutGrid(
+  site: Settlement,
+  worldSeed: number,
+  quality: number,
+  rimRadius: number,
+  bearings: Float64Array,
+  bearingCount: number,
+  nodeX: number[],
+  nodeZ: number[],
+  streetStart: number[],
+): void {
+  const along = new Float64Array(2);
+  primaryBearing(bearings, bearingCount, along);
+  const ax = along[0] as number;
+  const az = along[1] as number;
+  const px = -az;
+  const pz = ax;
+
+  const n = 2 + (quality > 0.45 ? 1 : 0);
+  const half = rimRadius * 0.72;
+
+  // Streets parallel to the road (across offsets). Skip offset ≈ 0: that is the road.
+  for (let i = 0; i < n; i++) {
+    const u = n === 1 ? 0 : (i / (n - 1)) * 2 - 1;
+    if (Math.abs(u) < 0.2) continue;
+    const ox = px * half * u;
+    const oz = pz * half * u;
+    const jitter =
+      STREET_RADIAL_JITTER *
+      0.15 *
+      half *
+      jitterAt(site.cellX, site.cellZ, i, worldSeed, RING_SALT);
+    nodeX.push(site.x + ox - ax * half + px * jitter);
+    nodeZ.push(site.z + oz - az * half + pz * jitter);
+    nodeX.push(site.x + ox + ax * half + px * jitter);
+    nodeZ.push(site.z + oz + az * half + pz * jitter);
+    streetStart.push(nodeX.length);
   }
 
-  return {
-    terrain,
-    worldSeed,
-    sectorX: coord.x,
-    sectorZ: coord.z,
-    settlement: site,
-    nodeX: Float64Array.from(nodeX),
-    nodeZ: Float64Array.from(nodeZ),
-    nodeY,
-    streetStart: Int32Array.from(streetStart),
-    streetCount,
-    segCount,
-    halfWidth: STREET_HALF_WIDTH,
-    reachRadius: Math.sqrt(reachSq) + STREET_HALF_WIDTH + STREET_SHOULDER,
-  };
+  // Cross streets (along offsets). Skip the centre line — that may be a leaving
+  // road on the perpendicular bearing; the outer crosses still give lot frontage.
+  for (let j = 0; j < n; j++) {
+    const v = n === 1 ? 0 : (j / (n - 1)) * 2 - 1;
+    if (Math.abs(v) < 0.2) continue;
+    const ox = ax * half * v;
+    const oz = az * half * v;
+    const jitter =
+      STREET_RADIAL_JITTER *
+      0.15 *
+      half *
+      jitterAt(site.cellX, site.cellZ, j + 20, worldSeed, LANE_SALT);
+    nodeX.push(site.x + ox - px * half + ax * jitter);
+    nodeZ.push(site.z + oz - pz * half + az * jitter);
+    nodeX.push(site.x + ox + px * half + ax * jitter);
+    nodeZ.push(site.z + oz + pz * half + az * jitter);
+    streetStart.push(nodeX.length);
+  }
+
+  // A grid that somehow emitted nothing (isolated + bad luck) still needs lot
+  // frontage: fall back to one short cross through the centre.
+  if (streetStart.length <= 1) {
+    nodeX.push(site.x - px * half);
+    nodeZ.push(site.z - pz * half);
+    nodeX.push(site.x + px * half);
+    nodeZ.push(site.z + pz * half);
+    streetStart.push(nodeX.length);
+  }
 }
 
 // ---------------------------------------------------------------------------

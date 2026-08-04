@@ -222,8 +222,10 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  * report after any future move: all four go quiet without failing if the route
  * stops being interesting.
  */
-const START_X = -6749;
-const START_Z = -4140;
+// Seed `soak`, city cell (-19, 4). Starts at its keep (city centre + 0.08R)
+// so walls, city streets and one interior cannot pass vacuously.
+const START_X = -9603;
+const START_Z = 2310;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and
@@ -367,6 +369,9 @@ const MIN_BUILDING_NODES = 12; //            measured    42 peak of 309 live
 const MIN_BUILDINGS_SEEN = 3000; //          measured 12,012 over the run
 const MIN_BUILDING_DRAW_CALLS = 4; //        measured    12 peak
 const MIN_BUILDINGS_LEVEL_FRACTION = 0.6; // measured  0.96 of lod-0 building-samples
+const MIN_CITIES_SEEN = 1;
+const MIN_WALL_NODES = 1;
+const MIN_INTERIORS_ENTERED = 1;
 
 /**
  * PHASE 7a: THE SAME GUARD FOR PROPS, ON DENSER CONTENT.
@@ -385,6 +390,20 @@ const MIN_PROP_NODES = 60; //                 measured   201 peak of 309 live
 const MIN_PROPS_SEEN = 20000; //              measured 66,719 over the run
 const MIN_PROP_DRAW_CALLS = 20; //            measured    68 peak
 const MIN_PROPS_SEATED_FRACTION = 0.7; //     measured  1.00 of lod-0 prop-samples
+
+/**
+ * PHASE 7b: EACH VILLAGE LAYOUT FAMILY MUST APPEAR.
+ *
+ * Street vertices alone cannot tell a ring-only world from a mixed one. The
+ * streamer counts chunks generated per `streetLayout` family; a floor of one
+ * on each is the anti-vacuity half. Re-derive after a measured run if the
+ * flight corridor stops hitting a family.
+ */
+const MIN_LAYOUT_SEEN = 1;
+/** Per building kind. A cottage-only world must fail, not pass on total count. */
+const MIN_KIND_SEEN = 1;
+/** Per prop species / yard role. A pine-only world must fail, not pass on total. */
+const MIN_PROP_SPECIES_SEEN = 1;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -461,7 +480,7 @@ const url =
   `${server.url}?seed=${encodeURIComponent(SEED)}&panel=0&hud=1` +
   // yaw -90 faces +X, which is the direction the autopilot travels, so chunks
   // stream in ahead of the camera rather than behind it.
-  `&fly=${SPEED}&flyleg=${legSeconds}&pos=${START_X},90,${START_Z}&look=-90,${OUTBOUND_PITCH}`;
+  `&fly=${SPEED}&flyleg=${legSeconds}&walk=1&pos=${START_X},90,${START_Z}&look=-90,${OUTBOUND_PITCH}`;
 
 let exitCode = 0;
 const failures = [];
@@ -480,7 +499,9 @@ console.log('');
 
 try {
   const { context, page, consoleErrors, failedRequests } = await openPage(browser, url, {
-    timeout: 60000,
+    // Match READY_TIMEOUT_MS in browser.mjs -- 60s was a coin flip under a
+    // loaded SwiftShader host once building kind variety raised first-frame work.
+    timeout: 120000,
     // The flight stays parked at `?pos=` until every baseline below has been
     // read. See `holdFlight` in `lib/browser.mjs` for the run that made this
     // necessary and for why `__worldReady` alone was not enough.
@@ -889,6 +910,14 @@ try {
   console.log(
     `  houses at the start ${buildingChunksAtStart}/${buildingsBefore.length} round-tripped chunks`,
   );
+  console.log('medieval cities (C1)');
+  console.log(`  city nodes SEEN   ${finalSnapshot.citiesSeen} (floor ${MIN_CITIES_SEEN})`);
+  console.log(`  city layouts SEEN ${finalSnapshot.layoutSeenCity}`);
+  console.log(`  wall nodes live   ${finalSnapshot.wallNodes}`);
+  console.log(`  walls SEEN        ${finalSnapshot.wallsSeen} (floor ${MIN_WALL_NODES})`);
+  console.log(
+    `  interiors ENTERED ${finalSnapshot.interiorsEntered} (floor ${MIN_INTERIORS_ENTERED})`,
+  );
 
   console.log('props (Phase 7a)');
   console.log(
@@ -907,6 +936,29 @@ try {
   console.log(`  props SEEN        ${finalSnapshot.propsSeen} over the run (floor ${MIN_PROPS_SEEN})`);
   console.log(
     `  props at the start ${propChunksAtStart}/${propsBefore.length} round-tripped chunks`,
+  );
+
+  console.log('village layouts (Phase 7b)');
+  console.log(
+    `  ring / linear / grid / hilltop seen  ` +
+      `${finalSnapshot.layoutSeenRing} / ${finalSnapshot.layoutSeenLinear} / ` +
+      `${finalSnapshot.layoutSeenGrid} / ${finalSnapshot.layoutSeenHilltop}` +
+      ` (floor ${MIN_LAYOUT_SEEN} each)`,
+  );
+  console.log('building kinds (Phase 7b)');
+  console.log(
+    `  cottage / barn / hall seen  ` +
+      `${finalSnapshot.buildingsSeenCottage} / ${finalSnapshot.buildingsSeenBarn} / ` +
+      `${finalSnapshot.buildingsSeenHall}` +
+      ` (floor ${MIN_KIND_SEEN} each)`,
+  );
+  console.log('prop species (Phase 7c / 7b slice 3)');
+  console.log(
+    `  pine / broadleaf / bushR / bushT / yard seen  ` +
+      `${finalSnapshot.propsSeenPine} / ${finalSnapshot.propsSeenBroadleaf} / ` +
+      `${finalSnapshot.propsSeenBushRound} / ${finalSnapshot.propsSeenBushTall} / ` +
+      `${finalSnapshot.propsSeenYard}` +
+      ` (floor ${MIN_PROP_SPECIES_SEEN} each)`,
   );
 
   console.log('');
@@ -1251,6 +1303,24 @@ try {
         'rather than dropping this check.',
     );
   }
+  if (finalSnapshot.citiesSeen < MIN_CITIES_SEEN) {
+    failures.push(
+      `the flight generated ${finalSnapshot.citiesSeen} city-touching nodes (floor ` +
+        `${MIN_CITIES_SEEN}); all city checks would otherwise be vacuous.`,
+    );
+  }
+  if (finalSnapshot.wallsSeen < MIN_WALL_NODES) {
+    failures.push(
+      `only ${finalSnapshot.wallsSeen} wall primitives were generated (floor ` +
+        `${MIN_WALL_NODES}); the flight did not exercise city walls.`,
+    );
+  }
+  if (finalSnapshot.interiorsEntered < MIN_INTERIORS_ENTERED) {
+    failures.push(
+      `the walk flight entered ${finalSnapshot.interiorsEntered} interiors (floor ` +
+        `${MIN_INTERIORS_ENTERED}); the landmark overlay was not exercised.`,
+    );
+  }
 
   // ---- props, and the vacuity guards around them -------------------------
   if (max(propTris) === 0) {
@@ -1303,6 +1373,56 @@ try {
         'geometry the hash now covers. Move the flight start, deliberately, ' +
         'rather than dropping this check.',
     );
+  }
+
+  // ---- village layouts (Phase 7b) ----------------------------------------
+  const kindSeen = [
+    ['cottage', finalSnapshot.buildingsSeenCottage],
+    ['barn', finalSnapshot.buildingsSeenBarn],
+    ['hall', finalSnapshot.buildingsSeenHall],
+  ];
+  for (const [name, count] of kindSeen) {
+    if (count < MIN_KIND_SEEN) {
+      failures.push(
+        `building kind '${name}' was seen only ${count} time(s) ` +
+          `(floor ${MIN_KIND_SEEN}). A cottage-only world would pass every building ` +
+          'budget while proving nothing about kinds.',
+      );
+    }
+  }
+
+  const propSpeciesSeen = [
+    ['pine', finalSnapshot.propsSeenPine],
+    ['broadleaf', finalSnapshot.propsSeenBroadleaf],
+    ['bush-round', finalSnapshot.propsSeenBushRound],
+    ['bush-tall', finalSnapshot.propsSeenBushTall],
+    ['yard', finalSnapshot.propsSeenYard],
+  ];
+  for (const [name, count] of propSpeciesSeen) {
+    if (count < MIN_PROP_SPECIES_SEEN) {
+      failures.push(
+        `prop species '${name}' was seen only ${count} time(s) ` +
+          `(floor ${MIN_PROP_SPECIES_SEEN}). A pine-only world would pass every prop ` +
+          'budget while proving nothing about species variety.',
+      );
+    }
+  }
+
+  const layoutSeen = [
+    ['ring', finalSnapshot.layoutSeenRing],
+    ['linear', finalSnapshot.layoutSeenLinear],
+    ['grid', finalSnapshot.layoutSeenGrid],
+    ['hilltop', finalSnapshot.layoutSeenHilltop],
+  ];
+  for (const [name, count] of layoutSeen) {
+    if (count < MIN_LAYOUT_SEEN) {
+      failures.push(
+        `village layout '${name}' was seen on only ${count} generated chunk(s) ` +
+          `(floor ${MIN_LAYOUT_SEEN}). A ring-only world would pass every street ` +
+          'and building check while proving nothing about layout variety — look ' +
+          'at layoutFamily / generateSectorStreets, or move the flight corridor.',
+      );
+    }
   }
 
   if (riverChunksAtStart === 0) {

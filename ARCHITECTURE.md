@@ -76,6 +76,7 @@ src/
     loop.ts             fixed-timestep loop; pausable, single-steppable
     params.ts           URL parameters in and out
     camera-rig.ts       free-fly camera
+    player-controller.ts grounded ?walk=1 controller; gravity and mouse look
     autopilot.ts        deterministic ?fly= flight path, for the soak test
   world/
     contracts.ts        ChunkCoord / ChunkData / ChunkProvider / TierContext
@@ -83,10 +84,15 @@ src/
     height-field.ts     baseHeight + sampleHeight + SEA_LEVEL + the biome fields. THE terrain.
     rivers.ts           Region-tier flow accumulation and the channel carve
     roads.ts            Region-tier settlement siting, road graph, routing, grading
+    city.ts             Region-owned multi-sector CityPlan: walls/gates/districts/landmarks
     streets.ts          Sector-tier street layout inside a settlement
     lots.ts             Sector-tier building lots along streets
     road-mesh.ts        the road and street DECK: carriageway geometry, per chunk
     building-mesh.ts    batched building geometry, per chunk
+    wall-mesh.ts        pure batched curtain/tower/gate geometry, per chunk
+    collision.ts        pure terrain/building/wall/deck collision queries
+    interior-mesh.ts    pure landmark interior geometry
+    interior-overlay.ts Three-only near-player adapter for landmark interiors
     props.ts            world vegetation + yard prop placement (pure)
     prop-mesh.ts        batched prop / vegetation geometry, per chunk
     grading.ts          the one weighted-average blend everything that moves ground joins
@@ -173,7 +179,9 @@ placeholder `chunks` and `worker queue` lines without editing `app.ts`.
 
 ### World generation never touches the main thread
 
-`src/world/` is layered so that only one file in it knows about Three.js:
+`src/world/` is layered so generation remains Three-free. Three.js is confined
+to upload/residency adapters (`chunk-mesh.ts`, `chunk-streamer.ts`, and the
+near-player `interior-overlay.ts`):
 
 ```
 contracts.ts    types only       importable from a worker and from Node
@@ -181,16 +189,21 @@ noise.ts        pure functions   no Three, no DOM, built on core/hash.ts
 rivers.ts       pure functions   Region tier; imports contracts + noise ONLY
 grading.ts      pure functions   the blend rule; imports noise ONLY
 roads.ts        pure functions   Region tier; imports contracts + grading + noise
-streets.ts      pure functions   Sector tier; imports contracts + grading + roads
-lots.ts         pure functions   Sector tier; imports contracts + grading + roads + streets
+city.ts         pure functions   Region-owned CityPlan from one city settlement
+streets.ts      pure functions   Sector tier; village plans or clipped CityPlans
+lots.ts         pure functions   Sector tier; street lots + reserved city landmarks
 road-mesh.ts    pure functions   deck geometry; imports contracts + roads + streets
 building-mesh.ts pure functions  building geometry; imports contracts + lots + roads
 props.ts        pure functions   prop placement; imports contracts + height + lots + roads + streets
 prop-mesh.ts    pure functions   prop geometry; imports contracts + props + lots + roads + streets
+wall-mesh.ts    pure functions   per-node city curtain/tower/gate geometry
+collision.ts    pure functions   player collision against generated records
+interior-mesh.ts pure functions  local landmark interior buffers
 height-field.ts pure functions   sampleHeight; the single source of terrain truth
 chunk-gen.ts    pure functions   the worker and the unit tests run the same code
 worker-pool.ts  scheduling       no DOM, no Three; `spawn` is injectable
 chunk-mesh.ts   Three.js         the boundary where payloads become GPU objects
+interior-overlay.ts Three.js     near-player upload/disposal of pure interior buffers
 ```
 
 That layering is what lets `npm test` cover determinism, priority ordering,
@@ -430,18 +443,28 @@ declared since Phase 1 and read by nothing. Per sector:
    ever finds two, because that would mean the alignment had broken;
 2. take the **bearings of the roads leaving** that settlement, from the Region
    record read through `coarser('region')`;
-3. lay a **ring** at 0.58 of the footprint radius, jittered radially and
-   angularly so it is a village and not a cartwheel;
-4. hang **lanes** outward to 0.78 of the radius and **spokes** inward to the
-   centre off alternating ring nodes, dropping any whose bearing is within about
-   37 degrees of a road -- so a street never duplicates a road;
+3. pick a **layout family** as a pure function of `(worldSeed, cellX, cellZ)` —
+   ring (~52%), linear, grid, or hilltop — and emit the same CSR
+   `SectorStreets` shape every family shares (`layout` is an additive scalar for
+   soak / HUD; lots and decks keep walking polylines);
+4. for **ring** (the Phase 4b default, still the majority): lay a ring at 0.58 of
+   the footprint radius, jittered radially and angularly; hang lanes outward to
+   0.78 and spokes inward, dropping any whose bearing is within about 37 degrees
+   of a road. **Linear** is a spine along the primary road bearing with short
+   spurs; **grid** is a small road-aligned block of lanes (centre line along the
+   road omitted); **hilltop** is a smaller closed enclosure with few spokes;
 5. give every node the settlement's own altitude as its grading target.
 
-**A sector lays out the settlement whose centre it contains; it does not clip.**
-Clipping was the alternative and is rejected on the same grounds the Gabriel
-graph was chosen on in Phase 4a: a street plan is a whole-settlement structure,
-so two sectors each owning half of one would each need the other half's
-information to decide its own.
+**Village ownership remains centre-only; cities are the explicit exception.**
+A village sector lays out the one village whose centre it contains and does not
+clip it. A medieval city is too large for that rule: `city.ts` creates one
+Region-owned `CityPlan` from `(worldSeed, settlement cell)`, including its wall,
+gates, districts, arteries, landmark reservations and farmland belt. Every
+sector whose square intersects that city reads the same coarser plan and clips
+its polylines to the sector's padded bounds. The centre sector uses this same
+clip path; it never runs a village layout for a city. Thus clipping does not ask
+two sectors to independently decide halves of a whole: the Region tier already
+decided the whole, and sectors only refine it.
 
 **The consequence is that a query reads up to four sectors, and there is no
 blend.** A settlement's streets overhang its sector by up to `STREET_REACH`
@@ -560,12 +583,12 @@ so the deck is partitioned rather than shared or dropped: no seam, no
 double-drawn overlap. The box is half-open on its maximum edges so a segment
 running exactly along a boundary belongs to one neighbour and not both.
 
-**Ownership needs one rule for roads and none for streets.** Two regions both
+**Ownership needs one rule for roads; street ownership depends on settlement class.** Two regions both
 route a road near their shared boundary and hold bit-identical copies of it, so a
 segment is emitted by the region containing its MIDPOINT — a purely positional
-rule, so exactly one region emits each. Streets need nothing: a sector lays out
-only the settlement whose centre it contains, so two sectors never hold the same
-street.
+rule, so exactly one region emits each. Village streets need nothing beyond
+centre ownership. City streets are clipped from one Region-owned CityPlan, so
+each sector emits only the clipped segments intersecting its padded square.
 
 **The sectors a node visits are enumerated, not searched for.** Sweeping the
 sector grid is what `sectorStreetField.accumulate` does per vertex and it is
@@ -583,10 +606,11 @@ them. Buildings are the first content in the project whose placement is decided
 by evaluating the *finished* height field rather than by routing from
 `baseHeight` and then moving the ground.
 
-**Everything a building is is fixed at the Sector tier.** Position, footprint,
-facing, eaves, ridge, wall and roof tint, and the altitude of the floor are all
-pure functions of `(worldSeed, sector)`. `building-mesh.ts` places geometry and
-decides nothing. That is a deliberate departure from the deck: a ribbon hundreds
+**Everything a building is is fixed at the Sector tier.** Kind (cottage / barn /
+hall), position, footprint, facing, eaves, ridge, wall and roof tint, and the
+altitude of the floor are all pure functions of `(worldSeed, sector)`.
+`building-mesh.ts` places geometry and decides nothing -- facade detail (door,
+barn doors, chimney cap) is painted from `SectorLots.kind`, never re-rolled. That is a deliberate departure from the deck: a ribbon hundreds
 of metres long must follow each node's own lattice or it sinks into a coarse
 hillside; an eight-metre house that followed the lattice would jump vertically
 every time the quadtree changed level under it. What varies per node is only how
@@ -617,9 +641,11 @@ way rivers and roads do in `RegionField`. They are not symmetric: streets grade
 the ground and lots read the finished ground, so the lot field is built from an
 already-built street field.
 
-**`ChunkData.buildings` and `buildingsLevel` are the anti-vacuity pair.**
-`buildings` says houses were placed; `buildingsLevel` says they stand on ground
-this lod-0 node renders within tolerance of their floor. A regression in the
+**`ChunkData.buildings` / `buildingsLevel` and the kind counters are the
+anti-vacuity set.** `buildings` says houses were placed; `buildingsLevel` says
+they stand on ground this lod-0 node renders within tolerance of their floor;
+`buildingsCottage` / `buildingsBarn` / `buildingsHall` say the kinds variety
+slice is not a cottage-only world. A regression in the
 grading, in `gradeTarget` or in the lot acceptance tests leaves the count
 untouched and drives levelness to zero. Levelness is measured at lod 0 only -- a
 coarse lattice cannot describe an 8 m footprint, so the number would be about
@@ -645,7 +671,22 @@ lies in the node goes into one buffer with per-vertex colour (+1 draw call per
 prop-bearing node). Nodes coarser than `PROP_MESH_MAX_LOD` (2) emit empty arrays
 -- a root node would otherwise own every tree in 4 km. `props` / `propsSeated` /
 `propsMeasured` are the anti-vacuity trio: placed, seated on ground this node
-renders, counted at lod 0 only. Species variety and layout families stay Phase 7b.
+renders, counted at lod 0 only. Village **layout** families shipped in 7b
+slice 1; building kinds in slice 2.
+
+**Species, size class, and clustering are decided in `props.ts`; the mesh only
+reads them.** `species` is a SoA column beside `kind`. Trees pick pine (~55%) /
+broadleaf (~45%); bushes pick round (~55%) / tall (~45%); yard crate/post map
+to `SPECIES_CRATE` / `SPECIES_POST`. Size uses sapling/adult/elder bands from
+the existing scale salt inside each kind's `PROP_*_SCALE_MIN/MAX`. World props
+(only) multiply the accept threshold by a grove factor over `CLUSTER_STRIDE`
+(= 3) cells, softened with a 4-neighbour blend, tuned so total density stays
+near the 7a baseline. `prop-mesh.ts` branches pine vs broadleaf (still 2 boxes)
+and bush round vs tall (still 1 box) and exposes `pine` / `broadleaf` /
+`bushRound` / `bushTall` / `yard` counters on `PropSurface`, mapped to
+`ChunkData.propsPine` etc. (`CHUNK_DATA_VERSION` 12). Streamer cumulative
+`propsSeen*` + HUD `prop-species` + soak floor of one each are the anti-vacuity
+half: a pine-only world fails.
 
 ### The region memo is derived data, and it is bounded
 
@@ -930,6 +971,12 @@ npm run shots:diff -- <a.png> <b.png> [mask.png]   # HOW two captures differ
 npm run shots:repeat -- --repeat=3 [view...]       # is a view reproducible AT ALL
 ```
 
+`shots` and `shots:check` accept `--no-build` to skip the rebuild when `dist/`
+is already current. They capture every view in **one Chromium process on one
+reused page** (`page.goto` + `__worldReady` + screenshot per view), which drops
+the per-view context teardown/startup tax while keeping the one-process
+sequential order Phase 6a showed is load-bearing.
+
 The last two were added in Phase 6a and each answers a question `shots:check`
 cannot. `shots:check` compares a view against its **baseline**, so "this view
 changed" and "this view is not reproducible" are the same red line, and when it
@@ -971,7 +1018,7 @@ and the check now catches it.
 `--raw` skips canonicalisation so the HUD and panel can be captured while
 debugging. Never use a `--raw` shot as a baseline.
 
-**All canonical views are reproducible again as of Phase 6a** (43 as of Phase 7a),
+**All canonical views are reproducible again as of Phase 6a** (46 as of Phase 7b),
 and the rule that keeps
 them that way is stated once, in `renderer.ts`: **wireframe mode must not leave a
 polygon offset enabled.** WebGL has no `GL_POLYGON_OFFSET_LINE`, so what a line

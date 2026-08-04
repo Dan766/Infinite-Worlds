@@ -775,7 +775,7 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(9);
+    expect(CHUNK_DATA_VERSION).toBe(14);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -791,6 +791,10 @@ describe('generateChunk', () => {
     expect(data.buildingNormals).toBeInstanceOf(Float32Array);
     expect(data.buildingColors).toBeInstanceOf(Float32Array);
     expect(data.buildingIndices).toBeInstanceOf(Uint32Array);
+    expect(data.wallPositions).toBeInstanceOf(Float32Array);
+    expect(data.wallNormals).toBeInstanceOf(Float32Array);
+    expect(data.wallColors).toBeInstanceOf(Float32Array);
+    expect(data.wallIndices).toBeInstanceOf(Uint32Array);
     expect(data.propPositions).toBeInstanceOf(Float32Array);
     expect(data.propNormals).toBeInstanceOf(Float32Array);
     expect(data.propColors).toBeInstanceOf(Float32Array);
@@ -821,11 +825,15 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.buildingNormals.buffer);
     expect(transferables).toContain(data.buildingColors.buffer);
     expect(transferables).toContain(data.buildingIndices.buffer);
+    expect(transferables).toContain(data.wallPositions.buffer);
+    expect(transferables).toContain(data.wallNormals.buffer);
+    expect(transferables).toContain(data.wallColors.buffer);
+    expect(transferables).toContain(data.wallIndices.buffer);
     expect(transferables).toContain(data.propPositions.buffer);
     expect(transferables).toContain(data.propNormals.buffer);
     expect(transferables).toContain(data.propColors.buffer);
     expect(transferables).toContain(data.propIndices.buffer);
-    expect(transferables).toHaveLength(19);
+    expect(transferables).toHaveLength(23);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
@@ -842,6 +850,10 @@ describe('generateChunk', () => {
         data.buildingNormals.byteLength +
         data.buildingColors.byteLength +
         data.buildingIndices.byteLength +
+        data.wallPositions.byteLength +
+        data.wallNormals.byteLength +
+        data.wallColors.byteLength +
+        data.wallIndices.byteLength +
         data.propPositions.byteLength +
         data.propNormals.byteLength +
         data.propColors.byteLength +
@@ -856,11 +868,12 @@ describe('generateChunk', () => {
     const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
     expect(data.waterIndices).toHaveLength(0);
     const transferables = chunkDataTransferables(data);
-    expect(transferables).toHaveLength(19);
-    expect(new Set(transferables).size).toBe(19);
+    expect(transferables).toHaveLength(23);
+    expect(new Set(transferables).size).toBe(23);
     expect(transferables).toContain(data.waterPositions.buffer);
     expect(transferables).toContain(data.deckPositions.buffer);
     expect(transferables).toContain(data.buildingPositions.buffer);
+    expect(transferables).toContain(data.wallPositions.buffer);
     expect(transferables).toContain(data.propPositions.buffer);
     // ...and an empty water surface, an empty deck, no buildings AND no props
     // must add exactly nothing to the payload. That discipline is the whole

@@ -11,10 +11,10 @@
  * ---------------------------------------------------------------------------
  * A LOT IS DECIDED HERE AND NOWHERE ELSE, AND THAT IS WHAT MAKES IT STABLE
  *
- * Everything a building IS -- its position, its footprint, its facing, its
- * height, the altitude of its floor -- is fixed at this tier, from
- * `(worldSeed, sector)` alone. `building-mesh.ts` places geometry and decides
- * nothing.
+ * Everything a building IS -- its kind (cottage / barn / hall), its position,
+ * its footprint, its facing, its height, the altitude of its floor -- is fixed
+ * at this tier, from `(worldSeed, sector)` alone. `building-mesh.ts` places
+ * geometry and decides nothing.
  *
  * That is a deliberate departure from Phase 5's deck, which is fitted per node
  * to that node's own rendered ground, and the reason is the difference between a
@@ -80,6 +80,16 @@ import {
   type Settlement,
 } from './roads';
 import { STREET_MAX_EXTENT, type SectorStreetField, type SectorStreets } from './streets';
+import {
+  cityPlanAt,
+  isCity,
+  LANDMARK_CATHEDRAL,
+  LANDMARK_GATEHOUSE,
+  LANDMARK_GUILD,
+  LANDMARK_KEEP,
+  LANDMARK_MARKET,
+  LANDMARK_TOWNHALL,
+} from './city';
 
 // ---------------------------------------------------------------------------
 // What this tier is allowed to read
@@ -178,16 +188,49 @@ export const LOT_SPREAD_MAX = 2.5;
 export const LOT_MAX_BUILDINGS = 256;
 
 /** Footprint, in metres. Width runs ALONG the frontage, depth back from it. */
-export const BUILDING_HALF_WIDTH_MIN = 2.8;
-export const BUILDING_HALF_WIDTH_MAX = 5.4;
-export const BUILDING_HALF_DEPTH_MIN = 2.4;
-export const BUILDING_HALF_DEPTH_MAX = 4.2;
+/**
+ * Building kinds. Chosen here; the mesh only reads them.
+ *
+ * Cottage is the majority (~62%) so a village still reads as houses from the
+ * air; barn and hall share the rest so soak can find each without hunting.
+ */
+export const KIND_COTTAGE = 0;
+export const KIND_BARN = 1;
+export const KIND_HALL = 2;
+export const KIND_TOWNHOUSE = 3;
+export const KIND_GUILDHALL = 4;
+export const KIND_WAREHOUSE = 5;
+export const KIND_KEEP = 6;
+export const KIND_CATHEDRAL = 7;
+export const KIND_TOWNHALL = 8;
+export const KIND_GATEHOUSE = 9;
+
+/** Half-footprint ranges per kind, metres. The exported MAX below is the global cap. */
+const COTTAGE_HALF_WIDTH = { min: 2.6, max: 4.8 };
+const COTTAGE_HALF_DEPTH = { min: 2.2, max: 3.8 };
+const BARN_HALF_WIDTH = { min: 4.5, max: 7.2 };
+const BARN_HALF_DEPTH = { min: 3.5, max: 5.8 };
+const HALL_HALF_WIDTH = { min: 3.5, max: 6.0 };
+const HALL_HALF_DEPTH = { min: 3.0, max: 5.0 };
+
+/** Global footprint caps -- used by `LOT_MAX_EXTENT` and rim shrink. */
+export const BUILDING_HALF_WIDTH_MIN = COTTAGE_HALF_WIDTH.min;
+export const BUILDING_HALF_WIDTH_MAX = BARN_HALF_WIDTH.max;
+export const BUILDING_HALF_DEPTH_MIN = COTTAGE_HALF_DEPTH.min;
+export const BUILDING_HALF_DEPTH_MAX = BARN_HALF_DEPTH.max;
 
 /** Metres from the floor to the eaves, and from the eaves to the ridge. */
-export const BUILDING_EAVES_MIN = 3.1;
-export const BUILDING_EAVES_MAX = 6.3;
-export const BUILDING_RIDGE_MIN = 1.7;
-export const BUILDING_RIDGE_MAX = 3.5;
+const COTTAGE_EAVES = { min: 3.0, max: 5.2 };
+const COTTAGE_RIDGE = { min: 1.5, max: 3.0 };
+const BARN_EAVES = { min: 3.5, max: 5.0 };
+const BARN_RIDGE = { min: 2.0, max: 3.8 };
+const HALL_EAVES = { min: 5.5, max: 8.5 };
+const HALL_RIDGE = { min: 2.0, max: 3.5 };
+
+export const BUILDING_EAVES_MIN = COTTAGE_EAVES.min;
+export const BUILDING_EAVES_MAX = HALL_EAVES.max;
+export const BUILDING_RIDGE_MIN = COTTAGE_RIDGE.min;
+export const BUILDING_RIDGE_MAX = BARN_RIDGE.max;
 
 /**
  * How far a building may turn off the street it fronts, as the fraction of the
@@ -230,6 +273,7 @@ export const LOT_CACHE_LIMIT = 64;
  * would make every building in the world exactly as deep as it is wide.
  */
 const STATION_SALT = 0x4c_6f_53_74;
+const KIND_SALT = 0x4c_6f_4b_64;
 const WIDTH_SALT = 0x4c_6f_57_64;
 const DEPTH_SALT = 0x4c_6f_44_70;
 const EAVES_SALT = 0x4c_6f_45_76;
@@ -280,6 +324,11 @@ export interface SectorLots {
   /** Two independent picks in [0, 1) for the wall and roof palettes. */
   readonly wallTint: Float64Array;
   readonly roofTint: Float64Array;
+  /**
+   * Building kind per lot (`KIND_COTTAGE` / `KIND_BARN` / `KIND_HALL`).
+   * Decided here; `building-mesh.ts` only reads it.
+   */
+  readonly kind: Uint8Array;
   readonly count: number;
   /**
    * Distance from the settlement centre beyond which no building of this sector
@@ -289,6 +338,7 @@ export interface SectorLots {
 }
 
 const EMPTY_F64 = new Float64Array(0);
+const EMPTY_U8 = new Uint8Array(0);
 
 function emptyLots(
   terrain: RoadTerrain,
@@ -313,6 +363,7 @@ function emptyLots(
     ridge: EMPTY_F64,
     wallTint: EMPTY_F64,
     roofTint: EMPTY_F64,
+    kind: EMPTY_U8,
     count: 0,
     reachRadius: 0,
   };
@@ -321,6 +372,26 @@ function emptyLots(
 /** A unit value in [0, 1) for one settlement cell, one lot index and one salt. */
 function unitAt(site: Settlement, index: number, worldSeed: number, salt: number): number {
   return hashUnit(hash3i(site.cellX, site.cellZ, index, (worldSeed ^ salt) >>> 0));
+}
+
+/**
+ * Which building this lot is.
+ *
+ * Bucketed so cottage stays the majority (~62%) and barn / hall share the rest.
+ * Pure function of `(worldSeed, settlement cell, lot index)` -- the mesh must
+ * not re-roll this.
+ */
+export function pickBuildingKind(site: Settlement, index: number, worldSeed: number): number {
+  const bucket = Math.floor(unitAt(site, index, worldSeed, KIND_SALT) * 100);
+  if (isCity(site)) {
+    if (bucket < 68) return KIND_TOWNHOUSE;
+    if (bucket < 84) return KIND_WAREHOUSE;
+    if (bucket < 94) return KIND_GUILDHALL;
+    return KIND_HALL;
+  }
+  if (bucket < 62) return KIND_COTTAGE;
+  if (bucket < 84) return KIND_BARN;
+  return KIND_HALL;
 }
 
 /**
@@ -360,6 +431,7 @@ interface LotAccumulator {
   readonly rg: number[];
   readonly wt: number[];
   readonly rt: number[];
+  readonly kd: number[];
   /** Bounding circle radius of each accepted building, for the overlap test. */
   readonly br: number[];
 }
@@ -428,9 +500,44 @@ export function generateSectorLots(
   const net = region.roads.networkAt(site.x, site.z);
 
   const lots: LotAccumulator = {
-    cx: [], cz: [], fy: [], ax: [], az: [], hw: [], hd: [], ev: [], rg: [], wt: [], rt: [], br: [],
+    cx: [], cz: [], fy: [], ax: [], az: [], hw: [], hd: [], ev: [], rg: [], wt: [], rt: [], kd: [], br: [],
   };
   const scratch = new Float64Array(2);
+
+  // Landmark lots are Region-owned reservations. The sector containing each
+  // landmark centre emits it first, so random frontage lots collide with and
+  // yield to the reserved footprint.
+  if (isCity(site)) {
+    const plan = cityPlanAt(site, worldSeed);
+    if (plan !== undefined) {
+      const minX = coord.x * 512;
+      const minZ = coord.z * 512;
+      for (let landmark = 0; landmark < plan.landmarkCount; landmark++) {
+        const x = plan.landmarkX[landmark] as number;
+        const z = plan.landmarkZ[landmark] as number;
+        if (x < minX || x >= minX + 512 || z < minZ || z >= minZ + 512) continue;
+        const landmarkKind = plan.landmarkKind[landmark] as number;
+        if (landmarkKind === LANDMARK_MARKET) continue;
+        const kind =
+          landmarkKind === LANDMARK_KEEP ? KIND_KEEP :
+          landmarkKind === LANDMARK_CATHEDRAL ? KIND_CATHEDRAL :
+          landmarkKind === LANDMARK_TOWNHALL ? KIND_TOWNHALL :
+          landmarkKind === LANDMARK_GATEHOUSE ? KIND_GATEHOUSE :
+          landmarkKind === LANDMARK_GUILD ? KIND_GUILDHALL : KIND_TOWNHOUSE;
+        const hw = plan.landmarkHalfW[landmark] as number;
+        const hd = plan.landmarkHalfD[landmark] as number;
+        lots.cx.push(x); lots.cz.push(z); lots.fy.push(ground.height(x, z));
+        lots.ax.push(1); lots.az.push(0); lots.hw.push(hw); lots.hd.push(hd);
+        lots.ev.push(kind === KIND_KEEP ? 12 : kind === KIND_CATHEDRAL ? 14 : 8);
+        lots.rg.push(kind === KIND_CATHEDRAL ? 8 : 5);
+        lots.wt.push(unitAt(site, 10_000 + landmark, worldSeed, WALL_SALT));
+        lots.rt.push(unitAt(site, 10_000 + landmark, worldSeed, ROOF_SALT));
+        lots.kd.push(kind);
+        lots.br.push(Math.sqrt(hw * hw + hd * hd));
+      }
+    }
+  }
+
   const rimRadius = site.radius * LOT_RIM_FRACTION;
   const streetHalf = rec.halfWidth;
   let index = 0;
@@ -519,6 +626,7 @@ export function generateSectorLots(
     ridge: Float64Array.from(lots.rg),
     wallTint: Float64Array.from(lots.wt),
     roofTint: Float64Array.from(lots.rt),
+    kind: Uint8Array.from(lots.kd),
     count,
     reachRadius: Math.sqrt(reachSq),
   };
@@ -548,25 +656,27 @@ function tryLot(
   rimRadius: number,
   scratch: Float64Array,
 ): void {
-  // -- size, from the seed and from how central the frontage is ---------------
+  // -- kind, then size from the seed and how central the frontage is ----------
+  const kind = pickBuildingKind(site, index, worldSeed);
   const stationDistance = Math.sqrt(
     (stationX - site.x) * (stationX - site.x) + (stationZ - site.z) * (stationZ - site.z),
   );
   const central = site.radius > 0 ? clamp(1 - stationDistance / site.radius, 0, 1) : 1;
   const scale = 1 - BUILDING_RIM_SHRINK * (1 - central);
 
+  const widthRange =
+    kind === KIND_BARN ? BARN_HALF_WIDTH : kind === KIND_HALL ? HALL_HALF_WIDTH : COTTAGE_HALF_WIDTH;
+  const depthRange =
+    kind === KIND_BARN ? BARN_HALF_DEPTH : kind === KIND_HALL ? HALL_HALF_DEPTH : COTTAGE_HALF_DEPTH;
+  const eavesRange =
+    kind === KIND_BARN ? BARN_EAVES : kind === KIND_HALL ? HALL_EAVES : COTTAGE_EAVES;
+  const ridgeRange =
+    kind === KIND_BARN ? BARN_RIDGE : kind === KIND_HALL ? HALL_RIDGE : COTTAGE_RIDGE;
+
   const halfWidth =
-    lerp(
-      BUILDING_HALF_WIDTH_MIN,
-      BUILDING_HALF_WIDTH_MAX,
-      unitAt(site, index, worldSeed, WIDTH_SALT),
-    ) * scale;
+    lerp(widthRange.min, widthRange.max, unitAt(site, index, worldSeed, WIDTH_SALT)) * scale;
   const halfDepth =
-    lerp(
-      BUILDING_HALF_DEPTH_MIN,
-      BUILDING_HALF_DEPTH_MAX,
-      unitAt(site, index, worldSeed, DEPTH_SALT),
-    ) * scale;
+    lerp(depthRange.min, depthRange.max, unitAt(site, index, worldSeed, DEPTH_SALT)) * scale;
   const boundingRadius = Math.sqrt(halfWidth * halfWidth + halfDepth * halfDepth);
 
   // -- where it stands --------------------------------------------------------
@@ -641,15 +751,14 @@ function tryLot(
   lots.hw.push(halfWidth);
   lots.hd.push(halfDepth);
   lots.ev.push(
-    lerp(BUILDING_EAVES_MIN, BUILDING_EAVES_MAX, unitAt(site, index, worldSeed, EAVES_SALT)) *
-      scale,
+    lerp(eavesRange.min, eavesRange.max, unitAt(site, index, worldSeed, EAVES_SALT)) * scale,
   );
   lots.rg.push(
-    lerp(BUILDING_RIDGE_MIN, BUILDING_RIDGE_MAX, unitAt(site, index, worldSeed, RIDGE_SALT)) *
-      scale,
+    lerp(ridgeRange.min, ridgeRange.max, unitAt(site, index, worldSeed, RIDGE_SALT)) * scale,
   );
   lots.wt.push(unitAt(site, index, worldSeed, WALL_SALT));
   lots.rt.push(unitAt(site, index, worldSeed, ROOF_SALT));
+  lots.kd.push(kind);
   lots.br.push(boundingRadius);
 }
 

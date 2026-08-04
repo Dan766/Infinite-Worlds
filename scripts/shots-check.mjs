@@ -4,6 +4,7 @@
  * committed baselines in `shots/`.
  *
  *   npm run shots:check
+ *   npm run shots:check -- --no-build
  *
  * This is the Phase 0 acceptance criterion turned into a command, and the
  * reason every later phase is cheap to verify: if this exits 0, nothing about
@@ -23,11 +24,14 @@ import {
   SHOTS_DIR,
 } from './lib/canonical.mjs';
 
+const args = process.argv.slice(2);
+const build = !args.includes('--no-build');
+
 const CHECK_DIR = join(SHOTS_DIR, '.check');
 
 rmSync(CHECK_DIR, { recursive: true, force: true });
 
-const results = await captureCanonicalViews(CHECK_DIR);
+const results = await captureCanonicalViews(CHECK_DIR, { build });
 const pageProblemsClean = reportPageProblems(results);
 
 let mismatches = 0;

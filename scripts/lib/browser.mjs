@@ -67,10 +67,6 @@ export function canonicalizeUrl(baseUrl, params = '') {
 }
 
 /**
- * Open a URL, wait until the app reports itself ready, and return the page plus
- * anything that went wrong while loading.
- */
-/**
  * How long a view gets to reach `window.__worldReady`.
  *
  * Raised from 30 s in Phase 3a. This is a wall-clock allowance for a software
@@ -84,10 +80,39 @@ export function canonicalizeUrl(baseUrl, params = '') {
  */
 const READY_TIMEOUT_MS = 120000;
 
+const SCREENSHOT_TIMEOUT_MS = 120000;
+
+/**
+ * Open a fresh context+page, navigate to `url`, wait until the app reports
+ * itself ready, and return the page plus anything that went wrong while loading.
+ *
+ * Used by the soak and by one-off `capture()`. The canonical sequence uses
+ * {@link openCaptureSession} + {@link captureOnPage} instead, so it does not
+ * pay for a new context per view.
+ */
 export async function openPage(
   browser,
   url,
   { viewport = VIEWPORT, timeout = READY_TIMEOUT_MS, holdFlight = false } = {},
+) {
+  const session = await openCaptureSession(browser, { viewport, holdFlight });
+  try {
+    await navigateReady(session.page, url, timeout);
+  } catch (error) {
+    await session.context.close();
+    throw error;
+  }
+  return session;
+}
+
+/**
+ * Create one context+page with error collectors. Caller owns closing `context`.
+ *
+ * @param {import('playwright').Browser} browser
+ */
+export async function openCaptureSession(
+  browser,
+  { viewport = VIEWPORT, holdFlight = false } = {},
 ) {
   const context = await browser.newContext({
     viewport,
@@ -130,10 +155,12 @@ export async function openPage(
     if (response.status() >= 400) failedRequests.push(`${response.url()} (HTTP ${response.status()})`);
   });
 
+  return { context, page, consoleErrors, failedRequests };
+}
+
+async function navigateReady(page, url, timeout = READY_TIMEOUT_MS) {
   await page.goto(url, { waitUntil: 'load', timeout });
   await page.waitForFunction(() => window.__worldReady === true, undefined, { timeout });
-
-  return { context, page, consoleErrors, failedRequests };
 }
 
 /**
@@ -170,21 +197,51 @@ async function measureFrame(page) {
   });
 }
 
-/** Capture a canonical screenshot to `outPath`. */
+/**
+ * Navigate an existing page to `url`, wait for readiness, screenshot, measure.
+ *
+ * Clears the session's error collectors first so each view reports only its own
+ * console/request problems.
+ */
+export async function captureOnPage(session, url, outPath, { timeout = READY_TIMEOUT_MS } = {}) {
+  const { page, consoleErrors, failedRequests } = session;
+  consoleErrors.length = 0;
+  failedRequests.length = 0;
+
+  await navigateReady(page, url, timeout);
+  await page.screenshot({
+    path: outPath,
+    animations: 'disabled',
+    caret: 'hide',
+    // Forest nodes after Phase 7a can make SwiftShader take longer than the
+    // Playwright default 30s to rasterise a 1280x720 frame.
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
+  const { distinctColors } = await measureFrame(page);
+  return {
+    consoleErrors: [...consoleErrors],
+    failedRequests: [...failedRequests],
+    distinctColors,
+  };
+}
+
+/** Capture a single screenshot on a fresh context (one-off `shot`, `shots:repeat`). */
 export async function capture(browser, url, outPath, options = {}) {
-  const { context, page, consoleErrors, failedRequests } = await openPage(browser, url, options);
+  const session = await openPage(browser, url, options);
   try {
-    await page.screenshot({
+    await session.page.screenshot({
       path: outPath,
       animations: 'disabled',
       caret: 'hide',
-      // Forest nodes after Phase 7a can make SwiftShader take longer than the
-      // Playwright default 30s to rasterise a 1280x720 frame.
-      timeout: 120_000,
+      timeout: SCREENSHOT_TIMEOUT_MS,
     });
-    const { distinctColors } = await measureFrame(page);
-    return { consoleErrors, failedRequests, distinctColors };
+    const { distinctColors } = await measureFrame(session.page);
+    return {
+      consoleErrors: [...session.consoleErrors],
+      failedRequests: [...session.failedRequests],
+      distinctColors,
+    };
   } finally {
-    await context.close();
+    await session.context.close();
   }
 }

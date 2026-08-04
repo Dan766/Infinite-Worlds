@@ -31,6 +31,9 @@ import {
 import {
   BUILDING_HALF_DEPTH_MAX,
   BUILDING_HALF_WIDTH_MAX,
+  KIND_BARN,
+  KIND_COTTAGE,
+  KIND_HALL,
   BUILDING_SKEW,
   clearLotCache,
   generateSectorLots,
@@ -49,6 +52,7 @@ import {
 } from './lots';
 import { roadClearance, SETTLEMENT_JITTER } from './roads';
 import { sectorStreetField } from './streets';
+import { isCity } from './city';
 
 const SEED = hashString('lots-test');
 
@@ -74,7 +78,7 @@ function populated(seed = SEED, x0 = -6, z0 = -6, count = 12): SectorLots[] {
   for (let z = z0; z < z0 + count; z++) {
     for (let x = x0; x < x0 + count; x++) {
       const rec = field.lotsAt(x, z);
-      if (rec.count > 0) out.push(rec);
+      if (rec.count > 0 && rec.settlement !== undefined && !isCity(rec.settlement)) out.push(rec);
     }
   }
   return out;
@@ -212,6 +216,7 @@ describe('determinism', () => {
     expect(Array.from(second.floorY)).toEqual(Array.from(first.floorY));
     expect(Array.from(second.alongX)).toEqual(Array.from(first.alongX));
     expect(Array.from(second.halfWidth)).toEqual(Array.from(first.halfWidth));
+    expect(Array.from(second.kind)).toEqual(Array.from(first.kind));
     expect(Array.from(second.ridge)).toEqual(Array.from(first.ridge));
   });
 
@@ -535,3 +540,72 @@ function pointToSegment(
   const cz = az + dz * t - pz;
   return Math.sqrt(cx * cx + cz * cz);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7b: lots still form on every street layout family
+// ---------------------------------------------------------------------------
+
+describe('lots across layout families', () => {
+  it('places at least one building on each of ring, linear, grid and hilltop', () => {
+    const field = sectors();
+    const byFamily = [0, 0, 0, 0];
+    for (let z = -14; z < 14; z++) {
+      for (let x = -14; x < 14; x++) {
+        const streets = field.streets.streetsAt(x, z);
+        if (streets.settlement === undefined || streets.layout < 0) continue;
+        const lots = field.lots.lotsAt(x, z);
+        if (lots.count > 0) byFamily[streets.layout]! += lots.count;
+      }
+    }
+    for (const family of [0, 1, 2, 3]) {
+      expect(byFamily[family]!).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('building kinds', () => {
+  it('emits only cottage / barn / hall, and every kind appears', () => {
+    const records = populated();
+    const seen = [0, 0, 0];
+    let total = 0;
+    for (const rec of records) {
+      for (let i = 0; i < rec.count; i++) {
+        const k = rec.kind[i] as number;
+        expect(k === KIND_COTTAGE || k === KIND_BARN || k === KIND_HALL).toBe(true);
+        seen[k]!++;
+        total++;
+      }
+    }
+    expect(total).toBeGreaterThan(60);
+    expect(seen[KIND_COTTAGE]).toBeGreaterThan(0);
+    expect(seen[KIND_BARN]).toBeGreaterThan(0);
+    expect(seen[KIND_HALL]).toBeGreaterThan(0);
+    // Cottage stays the majority so a village still reads as houses.
+    expect(seen[KIND_COTTAGE]!).toBeGreaterThan(seen[KIND_BARN]!);
+    expect(seen[KIND_COTTAGE]!).toBeGreaterThan(seen[KIND_HALL]!);
+  });
+
+  it('gives barns a wider footprint than cottages on average', () => {
+    const records = populated();
+    let cottageW = 0;
+    let cottageN = 0;
+    let barnW = 0;
+    let barnN = 0;
+    for (const rec of records) {
+      for (let i = 0; i < rec.count; i++) {
+        const w = rec.halfWidth[i] as number;
+        if (rec.kind[i] === KIND_COTTAGE) {
+          cottageW += w;
+          cottageN++;
+        } else if (rec.kind[i] === KIND_BARN) {
+          barnW += w;
+          barnN++;
+        }
+      }
+    }
+    expect(cottageN).toBeGreaterThan(0);
+    expect(barnN).toBeGreaterThan(0);
+    expect(barnW / barnN).toBeGreaterThan(cottageW / cottageN);
+  });
+});
+
