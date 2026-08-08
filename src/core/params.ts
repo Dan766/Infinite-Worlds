@@ -17,6 +17,7 @@
  *                         P4). Off by default and deliberately excluded from
  *                         `shots/canonical.json` -- see `src/debug/world-map.ts`.
  *   ?wireframe=1          start in wireframe
+ *   ?npc=0                disable NPC crowds (Phase 9a/9b). On by default.
  *   ?fly=<m/s>            deterministic autopilot along X; 0 is off
  *   ?flyleg=<seconds>     seconds per autopilot leg before it reverses
  *
@@ -55,6 +56,8 @@ export interface AppParams {
   wireframe: boolean;
   /** Grounded first-person movement and collision. */
   walk: boolean;
+  /** NPC crowds (Phase 9a/9b). On by default. */
+  npc: boolean;
   /**
    * Autopilot speed in m/s along X. Zero means off. Used by `npm run soak` to
    * fly a repeatable path with no human at the keyboard.
@@ -77,6 +80,7 @@ export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
   map: false,
   wireframe: false,
   walk: false,
+  npc: true,
   fly: 0,
   flyLeg: 120,
 };
@@ -153,6 +157,7 @@ export function parseParams(search: string): AppParams {
     map: parseBool(q.get('map'), DEFAULT_PARAMS.map),
     wireframe: parseBool(q.get('wireframe'), DEFAULT_PARAMS.wireframe),
     walk: parseBool(q.get('walk'), DEFAULT_PARAMS.walk),
+    npc: parseBool(q.get('npc'), DEFAULT_PARAMS.npc),
     fly: parseNumber(q.get('fly'), DEFAULT_PARAMS.fly),
     flyLeg: Math.max(1, parseNumber(q.get('flyleg'), DEFAULT_PARAMS.flyLeg)),
   };
@@ -195,6 +200,7 @@ export function serializeParams(params: AppParams): string {
     q.set('wireframe', params.wireframe ? '1' : '0');
   }
   if (params.walk !== DEFAULT_PARAMS.walk) q.set('walk', params.walk ? '1' : '0');
+  if (params.npc !== DEFAULT_PARAMS.npc) q.set('npc', params.npc ? '1' : '0');
   if (round(params.fly) !== DEFAULT_PARAMS.fly) q.set('fly', String(round(params.fly)));
   if (round(params.flyLeg) !== DEFAULT_PARAMS.flyLeg) q.set('flyleg', String(round(params.flyLeg)));
 

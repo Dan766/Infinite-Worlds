@@ -113,6 +113,10 @@ src/
     collision.ts        pure terrain/building/wall/deck collision queries
     interior-mesh.ts    pure landmark interior geometry
     interior-overlay.ts Three-only near-player adapter for landmark interiors
+    npcs.ts              Sector-tier NPC crowds: birthCrowd / stepCrowd (RULE 2 exception, see there)
+    npc-route.ts         pure walkable graph over a settlement's streets; Dijkstra routing
+    npc-mesh.ts          pure villager body geometry (six boxes, exact vertex count)
+    npc-overlay.ts       Three-only instanced-mesh adapter; owns sector residency
     props.ts            world vegetation + yard prop placement (pure)
     prop-mesh.ts        batched prop / vegetation geometry, per chunk
     grading.ts          the one weighted-average blend everything that moves ground joins

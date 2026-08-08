@@ -40,6 +40,7 @@ import {
 import { sampleHeight } from './world/height-field';
 import { createWorldCollision } from './world/collision';
 import { InteriorOverlay } from './world/interior-overlay';
+import { NpcOverlay, npcDrawsSinceReset, resetNpcDraws } from './world/npc-overlay';
 import { WorldMap } from './debug/world-map';
 
 declare global {
@@ -86,6 +87,7 @@ export class App {
   private readonly loop: Loop;
   private readonly player: PlayerController | null;
   private readonly interiors: InteriorOverlay;
+  private readonly npcs: NpcOverlay;
   private readonly worldMap: WorldMap;
 
   private renderedFrames = 0;
@@ -136,6 +138,7 @@ export class App {
   private buildingDrawCalls = 0;
   private wallDrawCalls = 0;
   private propDrawCalls = 0;
+  private npcDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -172,8 +175,9 @@ export class App {
     });
     this.autopilot = new Autopilot(this.params.fly, this.params.flyLeg);
     this.interiors = new InteriorOverlay(this.params.seedHash);
+    this.npcs = new NpcOverlay(this.params.seedHash);
 
-    this.scene.add(this.cube.root, this.streamer.root, this.interiors.root);
+    this.scene.add(this.cube.root, this.streamer.root, this.interiors.root, this.npcs.root);
     this.addLighting();
 
     this.renderer.setWireframe(this.params.wireframe);
@@ -181,7 +185,18 @@ export class App {
     // `?time=` seeks to an absolute simulation tick, so the pose in a
     // screenshot is a function of the URL rather than of elapsed wall time.
     this.loop = new Loop(
-      (_dt, tick) => this.cube.update(tick * (1 / 60)),
+      (_dt, tick) => {
+        this.cube.update(tick * (1 / 60));
+        // NPCs step from the FIXED update only, never from `renderFrame`. A
+        // paused Loop (canonical screenshots force `freeze=1`) runs zero
+        // fixed updates, so every capture sees only a crowd's tick-pure
+        // birth state -- see `npcs.ts`'s header and the Phase 9 entry in
+        // `PROGRESS.md`.
+        if (this.params.npc) {
+          const p = this.rig.position;
+          this.npcs.step(tick, p.x, p.z);
+        }
+      },
       (_alpha, wallDt) => this.renderFrame(wallDt),
       {
         startTick: Math.round(this.params.time * 60),
@@ -219,6 +234,7 @@ export class App {
     this.cube.dispose();
     this.streamer.dispose();
     this.interiors.dispose();
+    this.npcs.dispose();
     this.worldMap.dispose();
     this.renderer.dispose();
   }
@@ -365,6 +381,15 @@ export class App {
       propsSeenBushRound: chunks.propsSeenBushRound,
       propsSeenBushTall: chunks.propsSeenBushTall,
       propsSeenYard: chunks.propsSeenYard,
+      // Phase 9a/9b. NPCs are a main-thread overlay, not chunk content, so
+      // these come from `NpcOverlay` rather than the streamer's stats --
+      // see its header for why `npcsMoved`/`npcsArrived` are CUMULATIVE
+      // rather than instantaneous (the same reasoning `bridgeNodes` uses).
+      npcsRostered: this.npcs.npcsRostered,
+      npcsVisible: this.npcs.npcsVisible,
+      npcDrawCalls: this.npcDrawCalls,
+      npcsMoved: this.npcs.npcsMoved,
+      npcsArrived: this.npcs.npcsArrived,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -559,6 +584,9 @@ export class App {
       this.rig.camera.position.z,
       this.params.walk,
     );
+    // Residency and instance upload only -- simulation already advanced in
+    // the fixed update above. See `NpcOverlay`'s header.
+    this.npcs.update(this.rig.camera.position.x, this.rig.camera.position.z, this.params.npc);
     // A couple of milliseconds of budget: enough to finish a 256x256 build
     // over a few dozen frames, never enough to show up in the frame budget.
     // A no-op call (hidden, or the current view already fully built) is a
@@ -573,6 +601,7 @@ export class App {
     resetBuildingDraws();
     resetWallDraws();
     resetPropDraws();
+    resetNpcDraws();
     this.renderer.render(this.scene, this.rig.camera);
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
@@ -582,6 +611,7 @@ export class App {
     this.buildingDrawCalls = buildingDrawsSinceReset();
     this.wallDrawCalls = wallDrawsSinceReset();
     this.propDrawCalls = propDrawsSinceReset();
+    this.npcDrawCalls = npcDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -633,6 +663,12 @@ export class App {
     hud.register('wall draws', () => this.wallDrawCalls, HudOrder.render);
     hud.register('interiors entered', () => this.interiors.interiorsEntered, HudOrder.world);
     hud.register('prop draws', () => this.propDrawCalls, HudOrder.render);
+    hud.register('npc draws', () => this.npcDrawCalls, HudOrder.render);
+    hud.register(
+      'npcs',
+      () => `${this.npcs.npcsVisible}/${this.npcs.npcsRostered} moved ${this.npcs.npcsMoved} arrived ${this.npcs.npcsArrived}`,
+      HudOrder.world,
+    );
 
     hud.register(
       'js heap',
