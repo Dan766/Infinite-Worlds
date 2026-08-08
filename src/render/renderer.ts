@@ -37,6 +37,19 @@ const DEFAULT_OPTIONS: RendererOptions = {
   maxPixelRatio: 2,
 };
 
+/**
+ * Tone mapping exposure. Phase 10.
+ *
+ * ACES compresses highlights and darkens midtones, so the world needs more
+ * light through it than it did through the passthrough it replaces. That extra
+ * light is spent HERE rather than in `chunk-gen.ts`'s palette: the palette is
+ * the single source of truth for what the world is MADE of, and re-tuning it to
+ * cancel a tone curve would put a second, hidden copy of the lighting model in
+ * the generator -- the same mistake Phase 3a rejected for the sea. One exposure
+ * number and one `SUN_INTENSITY_NOON` are the whole compensation.
+ */
+const TONE_MAPPING_EXPOSURE = 1.35;
+
 export class Renderer {
   private readonly gl: THREE.WebGLRenderer;
   private readonly maxPixelRatio: number;
@@ -56,7 +69,69 @@ export class Renderer {
       preserveDrawingBuffer: true,
       powerPreference: 'high-performance',
     });
+    // Kept from Phase 0, and kept deliberately. Once Phase 10's sky dome covers
+    // every pixel this colour is invisible -- which makes it a free diagnostic:
+    // a flat dark-blue frame means the dome failed to draw, rather than being a
+    // mystery to bisect.
     this.gl.setClearColor(0x0d1218, 1);
+
+    // ------------------------------------------------------------------
+    // Phase 10. The output pipeline.
+    // ------------------------------------------------------------------
+    //
+    // Set explicitly even though this is already r185's default. This one
+    // setting decides the pixel value of every committed baseline in `shots/`,
+    // and a value that important should not be an inherited library default
+    // that a `three` minor bump is free to move. Same argument the polygon
+    // offset rule below makes about relying on unstated behaviour.
+    this.gl.outputColorSpace = THREE.SRGBColorSpace;
+
+    // A physical sky has a sun in it, and a sun without a tone curve clips to a
+    // white disc surrounded by a white sky. ACES is the curve the rest of the
+    // industry reaches for and, more usefully here, the one `three`'s own
+    // `Sky` shader already ends with -- so the dome and the world agree by
+    // construction rather than by two tunings that have to be kept in step.
+    this.gl.toneMapping = THREE.ACESFilmicToneMapping;
+    this.gl.toneMappingExposure = TONE_MAPPING_EXPOSURE;
+
+    // Inert until Phase 10's slice 10.5 gives a light `castShadow` and gives
+    // meshes `castShadow` / `receiveShadow`: with no shadow-casting light in
+    // the scene, `WebGLShadowMap.render` returns without doing anything and no
+    // material gains `USE_SHADOWMAP`. Configured here anyway, because shadow
+    // map type is a statement about the graphics API and this is the only file
+    // allowed to make one.
+    this.gl.shadowMap.enabled = true;
+    this.gl.shadowMap.type = THREE.PCFSoftShadowMap;
+  }
+
+  /**
+   * Exposure, in stops-ish. A uniform, so changing it costs no recompile --
+   * which is what makes it safe to put on a debug slider.
+   */
+  setToneMappingExposure(value: number): void {
+    this.gl.toneMappingExposure = value;
+  }
+
+  get toneMappingExposure(): number {
+    return this.gl.toneMappingExposure;
+  }
+
+  /**
+   * Turn the shadow pass on or off.
+   *
+   * Raises `materialsDirty` as well as flipping the flag, because
+   * `USE_SHADOWMAP` is part of the program cache key: a material compiled while
+   * shadows were off has no shadow code in it and will not grow any just
+   * because the renderer changed its mind.
+   */
+  setShadowsEnabled(enabled: boolean): void {
+    if (this.gl.shadowMap.enabled === enabled) return;
+    this.gl.shadowMap.enabled = enabled;
+    this.materialsDirty = true;
+  }
+
+  get shadowsEnabled(): boolean {
+    return this.gl.shadowMap.enabled;
   }
 
   /** Which backend is live. Reported in the HUD so a WebGPU swap is visible. */

@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+// `vitest`, not `node:test`. `npm test` is `vitest run`, and vitest's default
+// include glob picks up `.mjs` -- so under `node:test` these seven tests ran
+// (inside vitest's own import of the file) while vitest found no suite of its
+// own and failed the file outright. The assertions stay on `node:assert/strict`
+// rather than moving to `expect`: they are the only thing in this repo testing
+// a `scripts/` module, and they read the same under either runner.
+import { describe, it } from 'vitest';
 import {
   clusterViews,
   filterViews,
@@ -45,6 +51,11 @@ describe('reloadKey / clusterViews', () => {
   });
   it('treats walk as a reload boundary', () => {
     assert.notEqual(reloadKey('?time=3'), reloadKey('?time=3&walk=1'));
+  });
+  it('treats tod as a reload boundary, so a view cannot inherit the wrong sky', () => {
+    assert.notEqual(reloadKey('?time=3'), reloadKey('?time=3&tod=21'));
+    assert.notEqual(reloadKey('?time=3&tod=12'), reloadKey('?time=3&tod=21'));
+    assert.equal(reloadKey('?time=3&tod=12&pos=1,2,3'), reloadKey('?time=3&tod=12&pos=9,9,9'));
   });
   it('clusters consecutive same-key views only', () => {
     const views = [

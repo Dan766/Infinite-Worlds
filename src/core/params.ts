@@ -10,6 +10,10 @@
  *   ?look=yaw,pitch       camera orientation, degrees
  *   ?freeze=1             start paused, so the frame is a still
  *   ?time=<seconds>       seek the simulation to an absolute time
+ *   ?tod=<hours>          time of day at sim time zero, 0-24 (Phase 10). Sets
+ *                         the PHASE of the day/night cycle; it does not stop it.
+ *                         The cycle still runs from there, so with `freeze=1`
+ *                         the hour is fixed because the sim time is.
  *   ?hud=0                hide the perf HUD -- required for stable screenshots,
  *                         because fps and heap can never match between runs
  *   ?panel=0              hide the debug panel
@@ -26,6 +30,9 @@
  */
 
 import { hashString } from './hash';
+// One copy of the default hour, owned by the module that defines the cycle.
+// A second literal here would be a number that silently disagrees with the sky.
+import { TOD_AT_TIME_ZERO } from '../sky/celestial';
 
 export interface Vec3Params {
   x: number;
@@ -49,6 +56,11 @@ export interface AppParams {
   freeze: boolean;
   /** Simulation time in seconds to start at. */
   time: number;
+  /**
+   * Time of day in hours at sim time zero (Phase 10). The day/night cycle runs
+   * from here; this is its phase, not a freeze. See `src/sky/celestial.ts`.
+   */
+  tod: number;
   hud: boolean;
   panel: boolean;
   /** Debug political world map overlay (Phase Politics P4). Off by default. */
@@ -75,6 +87,7 @@ export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
   look: { yaw: 32.5, pitch: -21 },
   freeze: false,
   time: 0,
+  tod: TOD_AT_TIME_ZERO,
   hud: true,
   panel: true,
   map: false,
@@ -102,6 +115,26 @@ function parseNumber(raw: string | null, fallback: number): number {
   if (raw === null) return fallback;
   const v = Number(raw.trim());
   return Number.isFinite(v) ? v : fallback;
+}
+
+/**
+ * An hour of the day, wrapped into [0, 24).
+ *
+ * Wrapped rather than clamped. `?tod=25` meaning 01:00 is the only reading
+ * under which arithmetic on an hour behaves, and it makes `?tod=-3` meaning
+ * 21:00 fall out of the same rule for free -- whereas clamping would quietly
+ * turn both into a different time of day than the one asked for.
+ */
+function parseHour(raw: string | null, fallback: number): number {
+  if (raw === null) return fallback;
+  const text = raw.trim();
+  // `Number('')` is 0, so an empty `?tod=` would otherwise parse as midnight --
+  // a value nobody asked for, and the one value that turns every canonical
+  // screenshot black. A valueless parameter means "not specified".
+  if (text === '') return fallback;
+  const v = Number(text);
+  if (!Number.isFinite(v)) return fallback;
+  return v - Math.floor(v / 24) * 24;
 }
 
 function parseNumberList(raw: string | null, count: number): number[] | null {
@@ -152,6 +185,7 @@ export function parseParams(search: string): AppParams {
     look: parseLook(q.get('look'), DEFAULT_PARAMS.look),
     freeze: parseBool(q.get('freeze'), DEFAULT_PARAMS.freeze),
     time: Math.max(0, parseNumber(q.get('time'), DEFAULT_PARAMS.time)),
+    tod: parseHour(q.get('tod'), DEFAULT_PARAMS.tod),
     hud: parseBool(q.get('hud'), DEFAULT_PARAMS.hud),
     panel: parseBool(q.get('panel'), DEFAULT_PARAMS.panel),
     map: parseBool(q.get('map'), DEFAULT_PARAMS.map),
@@ -193,6 +227,7 @@ export function serializeParams(params: AppParams): string {
 
   if (params.freeze !== DEFAULT_PARAMS.freeze) q.set('freeze', params.freeze ? '1' : '0');
   if (round(params.time) !== DEFAULT_PARAMS.time) q.set('time', String(round(params.time)));
+  if (round(params.tod) !== round(DEFAULT_PARAMS.tod)) q.set('tod', String(round(params.tod)));
   if (params.hud !== DEFAULT_PARAMS.hud) q.set('hud', params.hud ? '1' : '0');
   if (params.panel !== DEFAULT_PARAMS.panel) q.set('panel', params.panel ? '1' : '0');
   if (params.map !== DEFAULT_PARAMS.map) q.set('map', params.map ? '1' : '0');

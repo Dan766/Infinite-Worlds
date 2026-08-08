@@ -70,6 +70,10 @@ export function filterViews(views, patterns) {
 const RELOAD_PARAM_KEYS = [
   'seed',
   'time',
+  // Phase 10. The unknown-key fallback below would already bucket `tod`
+  // correctly, but the sky is the one thing a shared page would get wrong most
+  // visibly, so it is named rather than left to a catch-all.
+  'tod',
   'walk',
   'fly',
   'flyleg',
