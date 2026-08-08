@@ -21,7 +21,7 @@ state moves between sessions. Update both at the end of every phase.
 | City  | Medieval cities C0–C4              | Done (code; full soak/shots deferred) |
 | Visual| Settlement visuals (City C5–C7 + Village V1–V3) | C5 landmark kinds ACCEPT (prereq soak/shots:check housekeeping) |
 | Politics | Nations, cities, culture, names (Phase P) | P1–P4 done. Phase S (siting wired into the real world) done: code, tests, city screenshots re-aimed with evidence. Soak flight-start and 11 non-city baseline diffs are open -- see Phase S entry |
-| 9     | NPCs                               | -      |
+| 9     | NPCs                               | Planned: 9a (ambient walkers) + 9b (roles/culture/guards) design settled, not yet built. See entry below |
 | 10    | Lighting and atmosphere            | -      |
 | 11    | Materials and post-processing      | -      |
 | 12    | Ship                               | -      |
@@ -5559,3 +5559,160 @@ blocking back in the B2 entry.
    Phase B3's `civicRoofs`/barn-townhouse-hall culture bias, B4's block
    impostors and further budget tightening, and the roof-type/terrain-
    fitted-wall/parcel-subdivision gaps carried from even earlier phases.
+
+## Phase 9 -- NPCs (planned, not yet built)
+
+Design settled with the user before any code. Recorded here so the decision
+survives a fresh session rather than being re-derived or silently drifted
+from.
+
+### The one decision that defines the phase
+
+**NPCs are simulated agents, not closed-form functions of `(worldSeed,
+npcId, simTime)`.** That is a deliberate, informed departure from the
+pattern every other moving/animated thing in this project uses (`cube.ts`'s
+rotation, the autopilot's flight path) and from RULE 1's "pure function of
+seed and coordinate" -- chosen because the alternative (ambient walkers
+whose *position* is a pure function of tick, only orientation/animation
+allowed to react) was judged too lifeless for what "add NPCs" is actually
+asking for. The user chose this explicitly after being shown the
+determinism cost.
+
+**What is given up, stated precisely:** an NPC's position is NOT a pure
+function of `(worldSeed, coordinate)`. It is a pure function of
+`(worldSeed, sector, birthTick)` plus the number of fixed ticks the crowd
+has been resident since birth. Walk away from a village for ten minutes and
+come back: the crowd was evicted and re-births at the current tick, not
+where continuous simulation would have left it. This is the first content
+in the project for which RULE 2 ("chunks may be unloaded and regenerated at
+any time and must come back identical") does not hold, and it is a **named,
+bounded exception**, the same way the Phase 2a `ChunkCoord` reshape is a
+named, bounded exception to RULE 4 -- not a precedent for anything else to
+quietly drift the same way.
+
+**Two things keep this from destroying the verification apparatus anyway:**
+
+- **NPCs step from the FIXED update, never from `renderFrame`.** Every
+  canonical screenshot forces `freeze=1` (`canonicalizeUrl`), and a paused
+  `Loop` runs zero fixed updates, so every canonical capture sees a crowd's
+  **birth state** -- itself a pure function of `(worldSeed, sector,
+  birthTick)` -- and nothing else. The 68 canonical views stay
+  byte-reproducible by construction, with no `?npc=0` escape hatch needed
+  to protect them.
+- **NPCs are a main-thread overlay, not chunk content.** No
+  `contracts.ts` change, no `CHUNK_DATA_VERSION` bump, no worker-protocol
+  change, zero bytes added to any chunk payload. The soak's round-trip hash
+  (chunk position buffers) is the project's strongest RULE 2 statement and
+  is completely untouched by this phase.
+
+### Module map (planned)
+
+```
+npcs.ts        pure. birthCrowd(worldSeed, sector, streets, lots, tick) ->
+               CrowdState. stepCrowd(state, tick) -> CrowdState, ONE fixed
+               integer tick at a time -- no wall dt, no Math.random, no
+               Date.now. Reads SectorStreets + SectorLots as ARGUMENTS
+               (same tier-injection pattern RoadTerrain/RiverTerrain/
+               LotGround already use), not via coarser() -- coarser()
+               throws for a generator's own tier and Sector is where this
+               lives.
+npc-route.ts   A* over the street CSR node graph, on the existing
+               CellHeap (already "deterministic (key, index)-ordered" --
+               built for exactly this kind of use).
+npc-mesh.ts    pure typed-array body geometry, modelled on
+               interior-mesh.ts. Node-testable, no Three.
+npc-overlay.ts the ONLY Three file. Owns live CrowdState per resident
+               sector in a capped cache (every other memo in this project
+               is capped for the same soak-leak-margin reason); births on
+               sector entry, steps once per fixed tick, disposes on evict.
+               Renders via one InstancedMesh per body part (~4-6 draw
+               calls for the whole crowd against a 680 budget currently
+               peaking at 398).
+```
+
+### Determinism rules for the simulation itself
+
+- **Agents read `nodeY` off the street CSR, never `sampleHeight`.** 160
+  live agents at 60 Hz would be ~9,600 `sampleHeight` calls/second on the
+  hottest function in the codebase; street nodes already carry the graded
+  altitude the deck itself uses, so an agent on a street interpolates two
+  numbers and calls nothing. Same class of fix as the `sectorStreetField`
+  11x11-sweep problem Phase 5 hit.
+- **Update order is sequential by agent index, and that is the
+  determinism rule, not an implementation detail.** Agent `i` sees agents
+  `0..i-1` already moved this tick. Simultaneous update would need a
+  double buffer and buys nothing; sequential is deterministic and cheap,
+  but has to be written down explicitly or a later "optimisation" will
+  parallelise it and silently break replay-identity.
+- Avoidance and building collision reuse `collision.ts` unchanged -- it is
+  already pure and already queries lots, city walls and gate openings.
+- Culling in `npc-overlay.ts` is **3D** distance, not the quadtree's
+  horizontal distance. The quadtree's reason for horizontal (don't coarsen
+  the ground under your own feet from a mountain peak) does not transfer
+  to a 1.8 m object far below the camera.
+
+### Slices
+
+| Slice | Ships |
+|-------|-------|
+| **9a** | `npcs.ts` / `npc-route.ts` / `npc-mesh.ts` / `npc-overlay.ts`. Villages only, one archetype. Goal-directed: pick a destination (home lot door, well, street end), A* the street graph, walk, idle, repeat. Player and inter-agent avoidance. `?npc=` toggle, instanced rendering, four counters, HUD lines, soak floors, Node tests. |
+| **9b** | Roles (villager / guard / merchant / child) with role-specific goal sets. Culture-tinted clothing from `culture.ts` palettes. City crowd density weighted to `DISTRICT_MARKET`. Guards posted at `nearestCityGate` and patrolling the wall walk from `CityPlan`. Per-role counters and soak floors. |
+
+Non-goals for both slices: dialogue, quests, economy sim, combat, runtime
+pathfinding beyond the street graph, NPC-vs-player physical collision,
+day/night schedules (there is no day/night until Phase 10), skeletal
+animation.
+
+### Anti-vacuity (planned)
+
+`npcsRostered` (villages produce people), `npcsVisible` (instances
+uploaded), `npcDrawCalls` (via the existing `onBeforeRender` counter
+pattern every other mesh type uses), and two sharp counters simulation
+adds for free: **`npcsMoved`** (agents whose position changed by more than
+epsilon across a sampled tick interval -- without this a frozen crowd and
+a walking crowd are byte-identical evidence, the exact trap this project
+has been caught by five times already) and **`npcsArrived`** (monotone
+goal completions -- goes to zero if routing silently returns no path and
+every agent stands still holding an unreachable goal).
+
+Planned Node tests: birth purity across a cache drop; `stepCrowd` purity
+and evaluation-order independence; 1,000-tick replay identity (same birth,
+same tick count, identical resulting state); sampled poses within
+`STREET_HALF_WIDTH + ε` of a real street segment; `collidesWithLots` false
+at every sampled pose; exact vertex count per archetype.
+
+### Sequencing against open debt (user decision)
+
+The 68-view screenshot re-sync has been blocked since the B2 entry and
+last failed three times in a row on a slowed-down machine (see the "Phase
+B -- verify" entry above). The user chose to start 9a now rather than
+block on that re-sync. Mitigation that costs nothing extra: **capture
+every canonical view twice on the same machine, `?npc=1` and `?npc=0`**,
+the same before/after-on-one-machine technique Phase 4b used to separate a
+real change from a platform change. That keeps the eventual re-sync able
+to attribute which of the 68 views moved because of NPCs versus B1
+roofs / B3 palettes / B4 LOD, at 2x capture cost instead of a guess.
+
+Two carried items 9a does not fix and should not be read as fixing:
+
+- The soak is already red on two budgets (peak vertices 1,108,944 vs.
+  1,040,000; peak payload 130.5 MB vs. 120 MB, both from the B4 entry).
+  NPCs add no chunk payload so they cannot make either worse, but Phase 9
+  opens without a green gate to protect regressions against.
+- The flight-start re-derivation has been open since Phase S (no
+  water/river in the round-tripped chunks, zero interiors entered). NPC
+  coverage is now a ninth constraint on that search. 9a's soak evidence
+  should ride the existing 300 s city/walk route rather than launch an
+  independent start-point search.
+
+### For next
+
+1. Build 9a: `npcs.ts`, `npc-route.ts`, `npc-mesh.ts`, `npc-overlay.ts`,
+   wired into `app.ts` behind `?npc=`, with the full counter/HUD/test/soak
+   apparatus described above.
+2. `ARCHITECTURE.md` gets the RULE 2 exception written up formally (see
+   the note added alongside RULE 2 in this same commit) plus a module-map
+   entry once `npcs.ts` exists.
+3. 9b (roles, culture tinting, city density, gate/wall guards) follows 9a
+   in the same session or the next, per the user's "9a + 9b" scope
+   decision.

@@ -30,6 +30,25 @@ No game engine, no React, no state library.
    state depends on call order.
 2. **No global mutable world state.** Chunks may be unloaded and regenerated at
    any time and must come back identical.
+
+   **One exception is planned, for Phase 9's NPCs, and it is named and bounded
+   rather than a precedent.** An NPC's position will be a pure function of
+   `(worldSeed, sector, birthTick)` plus fixed ticks elapsed since birth, not of
+   `(worldSeed, coordinate)` alone — crowds are simulated agents that step once
+   per fixed tick (`stepCrowd`), not closed-form functions of `simTime` the way
+   `cube.ts`'s rotation and the autopilot's flight path are. Leave a village and
+   come back later and the crowd re-births at the current tick rather than
+   picking up where continuous simulation would have left it. This was chosen
+   deliberately over a closed-form "ambient walker" design (position fixed by
+   tick, only orientation/animation allowed to react) because the latter was
+   judged too lifeless for what NPCs are for — see the Phase 9 entry in
+   `PROGRESS.md` for the full tradeoff. Two things keep it from breaking the
+   verification apparatus RULE 2 exists to protect: NPCs step from the FIXED
+   update, so every canonical screenshot (`freeze=1`, zero fixed updates) sees
+   only a crowd's tick-pure birth state; and NPCs are a main-thread overlay, not
+   chunk content, so they add nothing to `ChunkData`, to `CHUNK_DATA_VERSION`, or
+   to the chunk payload the soak's round-trip hash actually covers. RULE 2 still
+   stands for everything else, including RULE 4's own precedent-immune reshape.
 3. **Tiered generation.** Content is generated coarse to fine:
    `Region (4km) -> Sector (512m) -> Chunk (64m)`. A finer tier may read from
    coarser tiers. A coarser tier may **never** read from a finer one. Anything
