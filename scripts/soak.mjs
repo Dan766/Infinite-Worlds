@@ -222,13 +222,30 @@ const MIN_SHALLOW_DRAW_CALLS = 55;
  * report after any future move: all four go quiet without failing if the route
  * stops being interesting.
  */
-// Seed `soak`, city cell (6, 22). Coastal keep so the round-tripped 5x5
-// still carries sea + river (anti-vacuity for Phase 3) while the camera starts
-// inside a landmark for interiorsEntered and within view of the curtain wall.
-// Measured 5x5 at keep: sea 9/25, river 13/25, road 24/25, street 14/25;
-// wall ring owns 26/28 segments. Flight corridor +X crosses ~20/27 sea samples.
-const START_X = 3291;
-const START_Z = 11651;
+// PHASE POLITICS S MOVED IT A FIFTH TIME, AND THE OLD "city cell (6, 22)"
+// coordinate is not even a meaningful concept any more: cities now come from
+// polity.ts's own 8192 m lattice (Phase Politics S1), not the old 512 m
+// rarity roll, so the old start is very unlikely to still be near a city at
+// all, let alone inside a landmark.
+//
+// This replacement was found the same way `baseHeight`/`polity.ts` are used
+// everywhere else -- pure, Node-computable, no browser needed: `polity.ts`'s
+// `citiesInBox` located a real city on this seed, and its `CityPlan` (from
+// `city.ts`, unchanged this phase) gives the exact position of its keep
+// landmark. The player therefore starts inside a real interior-worthy
+// landmark, guaranteeing `citiesSeen`/`interiorsEntered` are non-zero by
+// construction rather than by luck.
+//
+// WHAT THIS DOES NOT YET CLAIM, unlike every prior move recorded above: the
+// round-tripped-5x5 sea/river/road/street counts and the flight-corridor sea
+// count were NOT measured against a live run -- the search for a *coastal*
+// keep (this seed's equivalent of the property every earlier move fought to
+// keep) timed out before finding one; this keep measured 0/25 sea in its own
+// 5x5. A live `npm run soak` on this coordinate is the next step, the same
+// way every earlier move here was confirmed, before trusting the full budget
+// table this script prints.
+const START_X = -57726;
+const START_Z = -149811;
 
 /**
  * Water submeshes that must actually reach the rasteriser at some point, and
@@ -372,9 +389,33 @@ const MIN_BUILDING_NODES = 12; //            measured    42 peak of 309 live
 const MIN_BUILDINGS_SEEN = 3000; //          measured 12,012 over the run
 const MIN_BUILDING_DRAW_CALLS = 4; //        measured    12 peak
 const MIN_BUILDINGS_LEVEL_FRACTION = 0.6; // measured  0.96 of lod-0 building-samples
+/**
+ * PHASE POLITICS B4: THE SAME VACUITY TRAP, FOR THE LOD BRANCH ITSELF.
+ *
+ * `buildingsSimplified` is on every chunk's payload now -- "the LOD branch
+ * exists" and "the LOD branch never actually fires on a real flight" report
+ * identically everywhere else without this floor. `1` is a conservative
+ * placeholder, not yet re-derived against a measured run (this project's own
+ * convention is not to raise a floor quietly -- lowering an unmeasured one
+ * to something honest is the same discipline in the other direction).
+ */
+const MIN_SIMPLIFIED_BUILDINGS_SEEN = 1;
 const MIN_CITIES_SEEN = 1;
 const MIN_WALL_NODES = 1;
 const MIN_INTERIORS_ENTERED = 1;
+
+/**
+ * PHASE POLITICS S2: THE SAME VACUITY TRAP, ONE LAYER UP.
+ *
+ * `polityId`/`cultureId` are on every chunk's payload now (Phase Politics
+ * S2), but "the nation code works" and "the world has exactly one nation" are
+ * indistinguishable without a floor that demands the flight actually crossed
+ * a border. CUMULATIVE distinct-id counts, same discipline as
+ * `citiesSeen`/`layoutSeen*`: a single nation touching every node the flight
+ * passes must still read as one, not as however many nodes it touched.
+ */
+const MIN_POLITIES_SEEN = 1;
+const MIN_CULTURES_SEEN = 1;
 
 /**
  * PHASE 7a: THE SAME GUARD FOR PROPS, ON DENSER CONTENT.
@@ -911,6 +952,9 @@ try {
     `  buildings SEEN    ${finalSnapshot.buildingsSeen} over the run (floor ${MIN_BUILDINGS_SEEN})`,
   );
   console.log(
+    `  simplified SEEN   ${finalSnapshot.buildingsSeenSimplified} over the run (floor ${MIN_SIMPLIFIED_BUILDINGS_SEEN})`,
+  );
+  console.log(
     `  houses at the start ${buildingChunksAtStart}/${buildingsBefore.length} round-tripped chunks`,
   );
   console.log('medieval cities (C1)');
@@ -920,6 +964,13 @@ try {
   console.log(`  walls SEEN        ${finalSnapshot.wallsSeen} (floor ${MIN_WALL_NODES})`);
   console.log(
     `  interiors ENTERED ${finalSnapshot.interiorsEntered} (floor ${MIN_INTERIORS_ENTERED})`,
+  );
+  console.log('politics (Phase Politics S2)');
+  console.log(
+    `  polities SEEN     ${finalSnapshot.politiesSeen} distinct (floor ${MIN_POLITIES_SEEN})`,
+  );
+  console.log(
+    `  cultures SEEN     ${finalSnapshot.culturesSeen} distinct (floor ${MIN_CULTURES_SEEN})`,
   );
 
   console.log('props (Phase 7a)');
@@ -1276,6 +1327,15 @@ try {
         'that the sampling missed it.',
     );
   }
+  if (finalSnapshot.buildingsSeenSimplified < MIN_SIMPLIFIED_BUILDINGS_SEEN) {
+    failures.push(
+      `only ${finalSnapshot.buildingsSeenSimplified} buildings ever drew the ` +
+        `BUILDING_LOD_SIMPLIFY silhouette in the whole flight (floor ` +
+        `${MIN_SIMPLIFIED_BUILDINGS_SEEN}); the LOD branch exists but never actually ` +
+        'fired -- either the flight never held a coarse node with buildings resident, ' +
+        'or the LOD dispatch itself regressed.',
+    );
+  }
   if (max(buildingDraws) < MIN_BUILDING_DRAW_CALLS) {
     failures.push(
       `buildings were drawn at most ${max(buildingDraws)} times in a frame (floor ` +
@@ -1322,6 +1382,18 @@ try {
     failures.push(
       `the walk flight entered ${finalSnapshot.interiorsEntered} interiors (floor ` +
         `${MIN_INTERIORS_ENTERED}); the landmark overlay was not exercised.`,
+    );
+  }
+  if (finalSnapshot.politiesSeen < MIN_POLITIES_SEEN) {
+    failures.push(
+      `the flight saw ${finalSnapshot.politiesSeen} distinct polities (floor ` +
+        `${MIN_POLITIES_SEEN}); polityId is not reaching real chunks.`,
+    );
+  }
+  if (finalSnapshot.culturesSeen < MIN_CULTURES_SEEN) {
+    failures.push(
+      `the flight saw ${finalSnapshot.culturesSeen} distinct cultures (floor ` +
+        `${MIN_CULTURES_SEEN}); cultureId is not reaching real chunks.`,
     );
   }
 

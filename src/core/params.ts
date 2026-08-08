@@ -13,6 +13,9 @@
  *   ?hud=0                hide the perf HUD -- required for stable screenshots,
  *                         because fps and heap can never match between runs
  *   ?panel=0              hide the debug panel
+ *   ?map=1                show the debug political world map (Phase Politics
+ *                         P4). Off by default and deliberately excluded from
+ *                         `shots/canonical.json` -- see `src/debug/world-map.ts`.
  *   ?wireframe=1          start in wireframe
  *   ?fly=<m/s>            deterministic autopilot along X; 0 is off
  *   ?flyleg=<seconds>     seconds per autopilot leg before it reverses
@@ -47,6 +50,8 @@ export interface AppParams {
   time: number;
   hud: boolean;
   panel: boolean;
+  /** Debug political world map overlay (Phase Politics P4). Off by default. */
+  map: boolean;
   wireframe: boolean;
   /** Grounded first-person movement and collision. */
   walk: boolean;
@@ -69,6 +74,7 @@ export const DEFAULT_PARAMS: Omit<AppParams, 'seedHash'> = {
   time: 0,
   hud: true,
   panel: true,
+  map: false,
   wireframe: false,
   walk: false,
   fly: 0,
@@ -144,6 +150,7 @@ export function parseParams(search: string): AppParams {
     time: Math.max(0, parseNumber(q.get('time'), DEFAULT_PARAMS.time)),
     hud: parseBool(q.get('hud'), DEFAULT_PARAMS.hud),
     panel: parseBool(q.get('panel'), DEFAULT_PARAMS.panel),
+    map: parseBool(q.get('map'), DEFAULT_PARAMS.map),
     wireframe: parseBool(q.get('wireframe'), DEFAULT_PARAMS.wireframe),
     walk: parseBool(q.get('walk'), DEFAULT_PARAMS.walk),
     fly: parseNumber(q.get('fly'), DEFAULT_PARAMS.fly),
@@ -183,6 +190,7 @@ export function serializeParams(params: AppParams): string {
   if (round(params.time) !== DEFAULT_PARAMS.time) q.set('time', String(round(params.time)));
   if (params.hud !== DEFAULT_PARAMS.hud) q.set('hud', params.hud ? '1' : '0');
   if (params.panel !== DEFAULT_PARAMS.panel) q.set('panel', params.panel ? '1' : '0');
+  if (params.map !== DEFAULT_PARAMS.map) q.set('map', params.map ? '1' : '0');
   if (params.wireframe !== DEFAULT_PARAMS.wireframe) {
     q.set('wireframe', params.wireframe ? '1' : '0');
   }

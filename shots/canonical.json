@@ -217,132 +217,132 @@
     },
     {
       "name": "city-aerial",
-      "params": "?time=3&pos=-32612,1250,-28480&look=0,-88",
+      "params": "?time=3&pos=59127.01,1250,-101255.3&look=0,-88",
       "expect": "City density: continuous artery spines + packed townhouse fabric inside curtain (not thin spokes over empty greens)."
     },
     {
       "name": "city-aerial-wireframe",
-      "params": "?time=3&pos=-32612,1250,-28480&look=0,-88&wireframe=1",
+      "params": "?time=3&pos=59127.01,1250,-101255.3&look=0,-88&wireframe=1",
       "expect": "City density wireframe: street decks continuous across sectors; townhouse footprints form ribbons along arteries/rings."
     },
     {
       "name": "city-gate-approach",
-      "params": "?time=3&pos=-31955,110,-28355&look=63,-20",
+      "params": "?time=3&pos=59682.16,110,-100835.9&look=63,-20",
       "expect": "C6 wall approach: eastern gate, crenellated curtain with >=6 merlon gaps, projecting towers; road terminates at C5 twin-tower gatehouse in the curtain opening."
     },
     {
       "name": "city-gate-approach-wireframe",
-      "params": "?time=3&pos=-31955,110,-28355&look=63,-20&wireframe=1",
+      "params": "?time=3&pos=59682.16,110,-100835.9&look=63,-20&wireframe=1",
       "expect": "C6 wall massing wireframe: merlon teeth, towers thicker than curtain, twin-tower gatehouse in the cleared opening."
     },
     {
       "name": "city-gatehouse-proof",
-      "params": "?time=3&pos=-31990,95,-28380&look=55,-16",
+      "params": "?time=3&pos=59647.16,95,-100860.9&look=55,-16",
       "expect": "C6/C5 gate integration: twin-tower stone gatehouse filling the curtain opening; traversable centre; towers taller than curtain."
     },
     {
       "name": "city-gatehouse-proof-wireframe",
-      "params": "?time=3&pos=-31990,95,-28380&look=55,-16&wireframe=1",
+      "params": "?time=3&pos=59647.16,95,-100860.9&look=55,-16&wireframe=1",
       "expect": "Wireframe: twin towers + lintel in GATE_CLEAR opening; no wall-mesh gate box competing."
     },
     {
       "name": "city-gatehouse-topdown",
-      "params": "?time=3&pos=-32074,210,-28416&look=0,-90",
+      "params": "?time=3&pos=59563.16,210,-100896.9&look=0,-90",
       "expect": "C5 gatehouse top-down: twin towers flanking empty centre slot; curtain opening aligned."
     },
     {
       "name": "city-gatehouse-aerial",
-      "params": "?time=3&pos=-32035,130,-28385&look=55,-42",
+      "params": "?time=3&pos=59602.16,130,-100865.9&look=55,-42",
       "expect": "C5 gatehouse shaded aerial: twin towers + lintel above traversable opening; towers taller than curtain."
     },
     {
       "name": "city-cathedral",
-      "params": "?time=3&pos=-32720,80,-28455&look=-38,-20",
+      "params": "?time=3&pos=59011.19,80,-101232.75&look=-38,-20",
       "expect": "C5 cathedral approach: nave, transept/crossing, west front tower masses readable from SE."
     },
     {
       "name": "city-cathedral-wireframe",
-      "params": "?time=3&pos=-32766,78,-28452&look=0,-24&wireframe=1",
+      "params": "?time=3&pos=58965.19,78,-101229.75&look=0,-24&wireframe=1",
       "expect": "C5 cathedral wireframe: cruciform plan — nave arm, transept arms, west tower; south oblique centred on lot."
     },
     {
       "name": "city-cathedral-topdown",
-      "params": "?time=3&pos=-32766,162,-28518&look=0,-90",
+      "params": "?time=3&pos=58965.19,162,-101295.75&look=0,-90",
       "expect": "C5 cathedral top-down: non-rectangular cruciform; transept wider than nave."
     },
     {
       "name": "city-cathedral-aerial",
-      "params": "?time=3&pos=-32758,98,-28472&look=-15,-52",
+      "params": "?time=3&pos=58973.19,98,-101249.75&look=-15,-52",
       "expect": "C5 cathedral shaded aerial: west tower + crossing dominate frame (KEEP-aerial offset); break skyline."
     },
     {
       "name": "city-townhall",
-      "params": "?time=3&pos=-32706,80,-28265&look=0,-20",
+      "params": "?time=3&pos=59028.32,80,-101033.26&look=0,-20",
       "expect": "C5 town hall approach: plinth on all sides, main hall + clock tower (dual roof levels)."
     },
     {
       "name": "city-townhall-wireframe",
-      "params": "?time=3&pos=-32706,80,-28265&look=0,-20&wireframe=1",
+      "params": "?time=3&pos=59028.32,80,-101033.26&look=0,-20&wireframe=1",
       "expect": "C5 town hall wireframe: full plinth podium, hall block, projecting clock tower."
     },
     {
       "name": "city-townhall-topdown",
-      "params": "?time=3&pos=-32706,162,-28339&look=0,-90",
+      "params": "?time=3&pos=59028.32,162,-101107.26&look=0,-90",
       "expect": "C5 town hall top-down: rectangular plinth, central tower projection toward approach."
     },
     {
       "name": "city-townhall-aerial",
-      "params": "?time=3&pos=-32670,95,-28310&look=-25,-45",
+      "params": "?time=3&pos=59064.32,95,-101078.26&look=-25,-45",
       "expect": "C5 town hall shaded aerial: plinth + tower hierarchy visible in civic block."
     },
     {
       "name": "city-guildhall",
-      "params": "?time=3&pos=-32612,50,-28632&look=0,-10",
+      "params": "?time=3&pos=59127.01,50,-101418.7&look=0,-10",
       "expect": "C5 guildhall approach: hall + workshop wing + flanking loading piers with dark void at ground level."
     },
     {
       "name": "city-guildhall-wireframe",
-      "params": "?time=3&pos=-32612,50,-28632&look=0,-10&wireframe=1",
+      "params": "?time=3&pos=59127.01,50,-101418.7&look=0,-10&wireframe=1",
       "expect": "C5 guildhall wireframe: asymmetric workshop mass; loading opening gap readable at ground level."
     },
     {
       "name": "city-guildhall-topdown",
-      "params": "?time=3&pos=-32612,162,-28691&look=0,-90",
+      "params": "?time=3&pos=59127.01,162,-101477.7&look=0,-90",
       "expect": "C5 guildhall top-down: deep workshop + hall setback; pier gap on approach edge."
     },
     {
       "name": "city-guildhall-aerial",
-      "params": "?time=3&pos=-32575,95,-28655&look=-30,-45",
+      "params": "?time=3&pos=59164.01,95,-101441.7&look=-30,-45",
       "expect": "C5 guildhall shaded aerial: workshop taller than hall; distinct from barn silhouette."
     },
     {
       "name": "city-market",
-      "params": "?time=3&pos=-32350,72,-28788&look=-168,-28",
+      "params": "?time=3&pos=59389.01,72,-101563.3&look=-168,-28",
       "expect": "City density: continuous townhouse ribbons along streets (near-shared walls), not picket cottages on lawn."
     },
     {
       "name": "city-farmland",
-      "params": "?time=3&pos=-31780,180,-28480&look=90,-22",
+      "params": "?time=3&pos=59959.01,180,-101255.3&look=90,-22",
       "expect": "Medieval City C2. View from the Region-owned farmland belt back toward the curtain wall and city skyline."
     },
     {
       "name": "city-keep",
-      "params": "?time=3&pos=-32570,80,-28408&look=0,-20",
+      "params": "?time=3&pos=59171.49,80,-101183.3&look=0,-20",
       "expect": "C5 keep approach (~72 m south, face-on gate): bailey, gate/approach, central keep, corner towers taller than bailey; masses dominate frame."
     },
     {
       "name": "city-keep-wireframe",
-      "params": "?time=3&pos=-32570,80,-28408&look=0,-20&wireframe=1",
+      "params": "?time=3&pos=59171.49,80,-101183.3&look=0,-20&wireframe=1",
       "expect": "C5 keep wireframe: >=5 distinct masses (bailey + gate + keep + >=2 towers)."
     },
     {
       "name": "city-keep-topdown",
-      "params": "?time=3&pos=-32570,162,-28480&look=0,-90",
+      "params": "?time=3&pos=59171.49,162,-101255.3&look=0,-90",
       "expect": "C5 keep top-down: non-rectangular plan — bailey square, corner towers, south gate projection, central keep block."
     },
     {
       "name": "city-keep-aerial",
-      "params": "?time=3&pos=-32552,100,-28428&look=-19,-52",
+      "params": "?time=3&pos=59189.49,100,-101203.3&look=-19,-52",
       "expect": "C5 keep shaded aerial: keep compound readable in open core; towers rise above bailey."
     }
   ]

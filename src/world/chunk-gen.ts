@@ -39,6 +39,7 @@ import {
 } from './grading';
 import { clamp, gradientNoise2, lerp, smoothstep } from './noise';
 import { buildBuildingSurface, type BuildingPalette } from './building-mesh';
+import { CULTURES } from './culture';
 import { buildWallSurface } from './wall-mesh';
 import { buildPropSurface, type PropPalette } from './prop-mesh';
 import { buildDeckSurface, type DeckPalette } from './road-mesh';
@@ -358,6 +359,24 @@ const BUILDING_PALETTE: BuildingPalette = {
   roofB: linearRgb(ROOF_B),
   plinth: linearRgb(PLINTH),
 };
+
+/**
+ * Phase Politics B3. One linear `BuildingPalette` per `culture.ts` entry,
+ * converted once here rather than per-chunk -- `CULTURES[i].palette` is
+ * authored in sRGB, the same convention as `WALL_A` etc. above, and this is
+ * the one module that already owns `srgbToLinear`/`linearRgb` (`RULE 1`: the
+ * exact polynomial, not `Math.pow`). `building-mesh.ts` never sees sRGB; it
+ * only ever receives an already-linear `BuildingPalette`, exactly as before
+ * this slice -- the ONLY new thing crossing the `buildBuildingSurface`
+ * boundary is the raw `cultureId` scalar, and only for its roof-type bias.
+ */
+export const CULTURE_BUILDING_PALETTES: readonly BuildingPalette[] = CULTURES.map((culture) => ({
+  wallA: linearRgb(culture.palette.wallA),
+  wallB: linearRgb(culture.palette.wallB),
+  roofA: linearRgb(culture.palette.roofA),
+  roofB: linearRgb(culture.palette.roofB),
+  plinth: linearRgb(culture.palette.plinth),
+}));
 
 /**
  * Phase 7a prop colours, authored in sRGB and converted once.
@@ -1146,6 +1165,23 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     DECK_PALETTE,
   );
 
+  // Phase Politics S2. One query at the node's centre -- not per-vertex data,
+  // so a scalar on the payload rather than a typed array. `-1` reads as "sea
+  // or beyond every polity's frontier", matching the sentinel `polity.ts`
+  // itself uses for "no answer" rather than a magic number invented here.
+  //
+  // Computed BEFORE the buildings below (Phase Politics B3 moved this up):
+  // `cultureId` picks which of `CULTURE_BUILDING_PALETTES` the buildings in
+  // THIS node are painted with, and is threaded into `buildBuildingSurface`
+  // itself for its roof-type bias -- see `building-mesh.ts`'s `pickRoofType`.
+  const chunkCenterPoint = chunkOrigin(coord);
+  const chunkCenterX = chunkCenterPoint.x + size / 2;
+  const chunkCenterZ = chunkCenterPoint.z + size / 2;
+  const polity = region.politics.polityAt(chunkCenterX, chunkCenterZ);
+  const polityId = polity === undefined ? -1 : polity.polityId;
+  const cultureId = polity === undefined ? -1 : region.politics.cultureOf(polity);
+  const buildingPalette = CULTURE_BUILDING_PALETTES[cultureId] ?? BUILDING_PALETTE;
+
   // -- the buildings ---------------------------------------------------------
   //
   // Also built against `groundAt`, and for a NARROWER reason than the deck's: a
@@ -1157,7 +1193,8 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     region.roads,
     sectors.lots,
     groundAt,
-    BUILDING_PALETTE,
+    buildingPalette,
+    cultureId,
   );
 
   // -- the props -------------------------------------------------------------
@@ -1199,6 +1236,7 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     buildingNormals: buildings.normals,
     buildingColors: buildings.colors,
     buildingIndices: buildings.indices,
+    buildingStart: buildings.buildingStart,
     buildings: buildings.count,
     buildingsLevel: buildings.level,
     buildingsCottage: buildings.cottage,
@@ -1211,6 +1249,7 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     buildingsCathedral: buildings.cathedral,
     buildingsTownhall: buildings.townhall,
     buildingsGatehouse: buildings.gatehouse,
+    buildingsSimplified: buildings.simplified,
     propPositions: props.positions,
     propNormals: props.normals,
     propColors: props.colors,
@@ -1223,6 +1262,8 @@ export function generateChunk(coord: ChunkCoord, context: TierContext): ChunkDat
     wallIndices: walls.indices,
     walls: walls.count,
     cityTouch,
+    polityId,
+    cultureId,
     propsPine: props.pine,
     propsBroadleaf: props.broadleaf,
     propsBushRound: props.bushRound,

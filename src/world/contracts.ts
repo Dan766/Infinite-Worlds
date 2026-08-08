@@ -242,7 +242,7 @@ export function createTierContext(
  * in-flight payload from an older build can be rejected instead of
  * misinterpreted.
  */
-export const CHUNK_DATA_VERSION = 14;
+export const CHUNK_DATA_VERSION = 17;
 
 /**
  * The result of generating one chunk.
@@ -387,6 +387,15 @@ export interface ChunkData {
   /** Triangle indices into `buildingPositions`. */
   readonly buildingIndices: Uint32Array;
   /**
+   * CSR vertex-offset boundaries into `buildingPositions`, one entry per
+   * building plus a final total (length `buildings + 1`). Phase Politics B1:
+   * roof-type variety means two buildings of the same kind can cost
+   * different vertex counts, so a consumer that needs one building's own
+   * vertices (a test, a future per-building LOD) reads this rather than
+   * assuming a fixed stride. See `building-mesh.ts`'s `BuildingSurface`.
+   */
+  readonly buildingStart: Uint32Array;
+  /**
    * Buildings this node owns -- i.e. whose centre lies in its square.
    *
    * Not derivable from the buffers: every building has the same 38 vertices, so
@@ -422,6 +431,14 @@ export interface ChunkData {
   readonly buildingsCathedral: number;
   readonly buildingsTownhall: number;
   readonly buildingsGatehouse: number;
+  /**
+   * Of `buildings`, how many drew the `BUILDING_LOD_SIMPLIFY` silhouette
+   * instead of full massing. Phase Politics B4's own anti-vacuity counter --
+   * a scalar for the same reason `buildingsLevel` is one. Without it, "the
+   * LOD branch exists" and "the LOD branch never fires" report identically
+   * everywhere else.
+   */
+  readonly buildingsSimplified: number;
   /**
    * The Phase 7a PROPS of this node -- world vegetation and sparse yard clutter
    * -- batched into one submesh, in the same node-local frame as `positions`.
@@ -478,6 +495,14 @@ export interface ChunkData {
   /** 1 if this node touches a city settlement class, else 0. */
   readonly cityTouch: number;
   /**
+   * The polity owning this node's centre, or `-1` if sea or beyond every
+   * polity's frontier. Phase Politics S2. A scalar, not a typed array --
+   * this is one query at the chunk's centre, not per-vertex data.
+   */
+  readonly polityId: number;
+  /** The culture id of `polityId`'s capital, or `-1` when `polityId` is `-1`. */
+  readonly cultureId: number;
+  /**
    * One representative sRGB colour for the whole chunk, derived from the
    * coordinate hash.
    *
@@ -510,6 +535,7 @@ export function chunkDataBytes(data: ChunkData): number {
     data.buildingNormals.byteLength +
     data.buildingColors.byteLength +
     data.buildingIndices.byteLength +
+    data.buildingStart.byteLength +
     data.propPositions.byteLength +
     data.propNormals.byteLength +
     data.propColors.byteLength +
@@ -551,6 +577,7 @@ export function chunkDataTransferables(data: ChunkData): Transferable[] {
     data.buildingNormals.buffer as ArrayBuffer,
     data.buildingColors.buffer as ArrayBuffer,
     data.buildingIndices.buffer as ArrayBuffer,
+    data.buildingStart.buffer as ArrayBuffer,
     data.propPositions.buffer as ArrayBuffer,
     data.propNormals.buffer as ArrayBuffer,
     data.propColors.buffer as ArrayBuffer,

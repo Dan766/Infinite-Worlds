@@ -1,17 +1,41 @@
 import { describe, expect, it } from "vitest";
 import { parseParams } from "../core/params";
-import { worldRegionField, worldSectorField } from "./height-field";
+import { baseHeight, continentalness, habitability, SEA_LEVEL, worldRegionField, worldSectorField } from "./height-field";
 import { cityPlanAt, isCity } from "./city";
 import { KIND_TOWNHOUSE } from "./lots";
 import { SECTOR_SIZE } from "./contracts";
+import { citiesInBox, type CitySite, type PolityClimate, type PolityTerrain } from "./polity";
+import { type Settlement } from "./roads";
+
+/**
+ * Phase Politics S1 moved every city on every seed -- they now come from
+ * `polity.ts`'s own 8192 m lattice instead of a rarity roll on this file's
+ * old 512 m one, so a hardcoded `(-32612, -28480)` (the previous seed's one
+ * city) is no longer meaningful on ANY seed. Search for a real one instead,
+ * the same way `polity.test.ts` locates cities for its own assertions.
+ */
+function findRealCity(seed: number): { site: CitySite; settlement: Settlement } {
+  const terrain: PolityTerrain = { seaLevel: SEA_LEVEL, height: baseHeight };
+  const climate: PolityClimate = { continentalness, habitability };
+  let span = 20_000;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const sites = citiesInBox(-span, -span, span, span, terrain, climate, seed);
+    for (const site of sites) {
+      const net = worldRegionField(seed).roads.networkAt(site.x, site.z);
+      const settlement = net.settlements.find(isCity);
+      if (settlement !== undefined) return { site, settlement };
+    }
+    span *= 2;
+  }
+  throw new Error(`findRealCity: no city found within +/-${span}m of the origin on seed ${seed}`);
+}
 
 describe("city density", () => {
   it("packs street metres and lots above village-grade floors", () => {
     const seed = parseParams("").seedHash;
     const region = worldRegionField(seed);
     const field = worldSectorField(region, seed);
-    const net = region.roads.networkAt(-32612, -28480);
-    const city = net.settlements.find(isCity)!;
+    const city = findRealCity(seed).settlement;
     const plan = cityPlanAt(city, seed)!;
     let streetM = 0;
     for (let s = 0; s < plan.streetCount; s++) {

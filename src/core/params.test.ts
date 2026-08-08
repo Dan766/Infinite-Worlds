@@ -12,6 +12,7 @@ describe('parseParams', () => {
     expect(p.time).toBe(0);
     expect(p.hud).toBe(true);
     expect(p.panel).toBe(true);
+    expect(p.map).toBe(false);
     expect(p.wireframe).toBe(false);
   });
 
@@ -39,6 +40,12 @@ describe('parseParams', () => {
     expect(parseParams('?hud=0').hud).toBe(false);
     expect(parseParams('?hud=false').hud).toBe(false);
     expect(parseParams('?panel=off').panel).toBe(false);
+    expect(parseParams('?map=1').map).toBe(true);
+    expect(parseParams('?map').map).toBe(true);
+  });
+
+  it('malformed map values fall back to the default rather than throwing', () => {
+    expect(parseParams('?map=maybe').map).toBe(DEFAULT_PARAMS.map);
   });
 
   it('parses time and clamps it to be non-negative', () => {
@@ -85,10 +92,18 @@ describe('serializeParams', () => {
   });
 
   it('round-trips a fully specified state', () => {
-    const query = '?seed=alpha&pos=10,20,30&look=45,-12&freeze=1&time=7.5&hud=0&panel=0&wireframe=1';
+    const query =
+      '?seed=alpha&pos=10,20,30&look=45,-12&freeze=1&time=7.5&hud=0&panel=0&map=1&wireframe=1';
     const parsed = parseParams(query);
     const reparsed = parseParams(serializeParams(parsed));
     expect(reparsed).toEqual(parsed);
+  });
+
+  it('includes map only when it differs from the default', () => {
+    const on = parseParams('?map=1');
+    expect(serializeParams(on)).toMatch(/[?&]map=1/);
+    const off = parseParams('');
+    expect(serializeParams(off)).not.toMatch(/map=/);
   });
 
   it('round-trips repeatedly without drifting', () => {
