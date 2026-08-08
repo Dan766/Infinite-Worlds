@@ -40,7 +40,15 @@ import {
 import { sampleHeight } from './world/height-field';
 import { createWorldCollision } from './world/collision';
 import { InteriorOverlay } from './world/interior-overlay';
+import { NpcOverlay, npcDrawsSinceReset, resetNpcDraws } from './world/npc-overlay';
 import { WorldMap } from './debug/world-map';
+import { Atmosphere } from './sky/atmosphere';
+import {
+  moonDrawsSinceReset,
+  resetSkyDraws,
+  skyDrawsSinceReset,
+  starDrawsSinceReset,
+} from './sky/sky-dome';
 
 declare global {
   interface Window {
@@ -86,7 +94,10 @@ export class App {
   private readonly loop: Loop;
   private readonly player: PlayerController | null;
   private readonly interiors: InteriorOverlay;
+  private readonly npcs: NpcOverlay;
   private readonly worldMap: WorldMap;
+  /** Phase 10: the sun, the moon, and everything that follows from where they are. */
+  private readonly atmosphere: Atmosphere;
 
   private renderedFrames = 0;
   /**
@@ -136,6 +147,20 @@ export class App {
   private buildingDrawCalls = 0;
   private wallDrawCalls = 0;
   private propDrawCalls = 0;
+  private npcDrawCalls = 0;
+  /**
+   * Phase 10. The sky dome, the star field and the moon disc, actually
+   * rasterised in the last frame.
+   *
+   * `skyDrawCalls` is the guard whose absence would be hardest to notice: the
+   * renderer's clear colour is a dark blue that could pass for a night sky, so
+   * a dome that never draws looks like a working night rather than a bug.
+   * `starDrawCalls` carries a second claim -- the stars are invisible above the
+   * fade threshold, so a non-zero count also proves the flight reached a night.
+   */
+  private skyDrawCalls = 0;
+  private starDrawCalls = 0;
+  private moonDrawCalls = 0;
 
   constructor(canvas: HTMLCanvasElement, hudElement: HTMLElement, search: string) {
     this.params = parseParams(search);
@@ -172,16 +197,38 @@ export class App {
     });
     this.autopilot = new Autopilot(this.params.fly, this.params.flyLeg);
     this.interiors = new InteriorOverlay(this.params.seedHash);
+    this.npcs = new NpcOverlay(this.params.seedHash);
 
-    this.scene.add(this.cube.root, this.streamer.root, this.interiors.root);
-    this.addLighting();
+    // Phase 10. Replaces the Phase 0 placeholder rig outright: the sun and moon
+    // now move, driven by `Loop.simTime` so a frozen loop holds them still and
+    // `?time=` seeks them. See `src/sky/atmosphere.ts`.
+    this.atmosphere = new Atmosphere({ todAtZero: this.params.tod });
+
+    this.scene.add(
+      this.cube.root,
+      this.streamer.root,
+      this.interiors.root,
+      this.npcs.root,
+      this.atmosphere.root,
+    );
 
     this.renderer.setWireframe(this.params.wireframe);
 
     // `?time=` seeks to an absolute simulation tick, so the pose in a
     // screenshot is a function of the URL rather than of elapsed wall time.
     this.loop = new Loop(
-      (_dt, tick) => this.cube.update(tick * (1 / 60)),
+      (_dt, tick) => {
+        this.cube.update(tick * (1 / 60));
+        // NPCs step from the FIXED update only, never from `renderFrame`. A
+        // paused Loop (canonical screenshots force `freeze=1`) runs zero
+        // fixed updates, so every capture sees only a crowd's tick-pure
+        // birth state -- see `npcs.ts`'s header and the Phase 9 entry in
+        // `PROGRESS.md`.
+        if (this.params.npc) {
+          const p = this.rig.position;
+          this.npcs.step(tick, p.x, p.z);
+        }
+      },
       (_alpha, wallDt) => this.renderFrame(wallDt),
       {
         startTick: Math.round(this.params.time * 60),
@@ -197,6 +244,7 @@ export class App {
     // Replaces the placeholder `chunks` and `worker queue` lines registered
     // above, by label. See `Hud.register`.
     this.streamer.registerDebug(this.hud, this.panel);
+    this.atmosphere.registerDebug(this.hud, this.panel);
 
     if (this.player === null) this.rig.attach(canvas);
     else this.player.attach(canvas);
@@ -219,7 +267,9 @@ export class App {
     this.cube.dispose();
     this.streamer.dispose();
     this.interiors.dispose();
+    this.npcs.dispose();
     this.worldMap.dispose();
+    this.atmosphere.dispose();
     this.renderer.dispose();
   }
 
@@ -231,6 +281,10 @@ export class App {
       look: this.rig.look,
       freeze: this.loop.paused,
       time: this.loop.simTime,
+      // The PHASE of the cycle, not the current hour: `?tod=` is defined at sim
+      // time zero, so combined with the `time` above this reproduces the exact
+      // sky even when the loop is running. See `Atmosphere.setTimeOfDay`.
+      tod: this.atmosphere.todParam,
       hud: this.hud.visible,
       panel: this.panel.visible,
       map: this.worldMap.visible,
@@ -260,9 +314,27 @@ export class App {
     const render = this.renderer.stats();
     const chunks = this.streamer.stats();
     const camera = this.rig.position;
+    const sky = this.atmosphere.current;
 
     return {
       nowMs: performance.now(),
+      /**
+       * Phase 10. THE GUARD AGAINST A CLOCK THAT STOPPED.
+       *
+       * A frozen sun and a running sun produce byte-identical evidence in every
+       * other lighting measurement this phase adds: shadow counts, star counts
+       * and material counts all pass perfectly on a world stuck at 09:30. The
+       * soak asserts the time of day actually SPANS a range across the flight,
+       * which is the only observation that can tell the two apart.
+       */
+      todHours: sky.todHours,
+      sunElevationDeg: sky.sun.elevationDeg,
+      moonElevationDeg: sky.moon.elevationDeg,
+      sunIntensity: sky.sun.intensity,
+      starVisibility: sky.starVisibility,
+      skyDrawCalls: this.skyDrawCalls,
+      starDrawCalls: this.starDrawCalls,
+      moonDrawCalls: this.moonDrawCalls,
       heapMb: readHeapMb() ?? -1,
       fps: frame.fps,
       avgFrameMs: frame.avgMs,
@@ -365,6 +437,15 @@ export class App {
       propsSeenBushRound: chunks.propsSeenBushRound,
       propsSeenBushTall: chunks.propsSeenBushTall,
       propsSeenYard: chunks.propsSeenYard,
+      // Phase 9a/9b. NPCs are a main-thread overlay, not chunk content, so
+      // these come from `NpcOverlay` rather than the streamer's stats --
+      // see its header for why `npcsMoved`/`npcsArrived` are CUMULATIVE
+      // rather than instantaneous (the same reasoning `bridgeNodes` uses).
+      npcsRostered: this.npcs.npcsRostered,
+      npcsVisible: this.npcs.npcsVisible,
+      npcDrawCalls: this.npcDrawCalls,
+      npcsMoved: this.npcs.npcsMoved,
+      npcsArrived: this.npcs.npcsArrived,
       workers: chunks.workers,
       // Phase 2b. The quadtree's whole job is bounding these two.
       selectedNodes: chunks.selected,
@@ -559,11 +640,19 @@ export class App {
       this.rig.camera.position.z,
       this.params.walk,
     );
+    // Residency and instance upload only -- simulation already advanced in
+    // the fixed update above. See `NpcOverlay`'s header.
+    this.npcs.update(this.rig.camera.position.x, this.rig.camera.position.z, this.params.npc);
     // A couple of milliseconds of budget: enough to finish a 256x256 build
     // over a few dozen frames, never enough to show up in the frame budget.
     // A no-op call (hidden, or the current view already fully built) is a
     // handful of comparisons -- see `WorldMap.update`.
     this.worldMap.update(this.rig.camera.position.x, this.rig.camera.position.z, 2);
+    // The sky reads SIM time, not wall time, so `?freeze=1` holds the sun and
+    // every canonical screenshot keeps a fixed hour. It follows the camera
+    // because a directional light's shadow camera has to be near what it
+    // shadows -- see `atmosphere.ts`.
+    this.atmosphere.update(this.loop.simTime, this.rig.camera.position);
     this.frameTimer.sample(wallDt);
     resetWaterDraws();
     resetRiverDraws();
@@ -573,7 +662,15 @@ export class App {
     resetBuildingDraws();
     resetWallDraws();
     resetPropDraws();
+    resetNpcDraws();
+    resetSkyDraws();
     this.renderer.render(this.scene, this.rig.camera);
+    // Phase 10. Read immediately after the render, like every counter above:
+    // `skyDrawCalls` proves the dome reached the rasteriser rather than merely
+    // existing, and `starDrawCalls` proves the flight actually reached a night.
+    this.skyDrawCalls = skyDrawsSinceReset();
+    this.starDrawCalls = starDrawsSinceReset();
+    this.moonDrawCalls = moonDrawsSinceReset();
     this.waterDrawCalls = waterDrawsSinceReset();
     this.riverDrawCalls = riverDrawsSinceReset();
     this.roadDrawCalls = roadDrawsSinceReset();
@@ -582,6 +679,7 @@ export class App {
     this.buildingDrawCalls = buildingDrawsSinceReset();
     this.wallDrawCalls = wallDrawsSinceReset();
     this.propDrawCalls = propDrawsSinceReset();
+    this.npcDrawCalls = npcDrawsSinceReset();
     this.hud.update(wallDt);
 
     this.renderedFrames++;
@@ -595,17 +693,6 @@ export class App {
     ) {
       window.__worldReady = true;
     }
-  }
-
-  /**
-   * Placeholder lighting. Phase 10 replaces this entirely with a physical sky
-   * and cascaded shadow maps; nothing should be built on top of it.
-   */
-  private addLighting(): void {
-    const hemisphere = new THREE.HemisphereLight(0x9fc4e8, 0x2a2620, 1.1);
-    const sun = new THREE.DirectionalLight(0xffe9c4, 2.2);
-    sun.position.set(4, 6, 3);
-    this.scene.add(hemisphere, sun);
   }
 
   private registerHudLines(): void {
@@ -624,6 +711,11 @@ export class App {
     hud.register('draw calls', () => this.renderer.stats().drawCalls, HudOrder.render);
     hud.register('triangles', () => formatCount(this.renderer.stats().triangles), HudOrder.render);
     hud.register('programs', () => this.renderer.stats().programs, HudOrder.render);
+    hud.register(
+      'sky draws',
+      () => `${this.skyDrawCalls} sky / ${this.starDrawCalls} stars / ${this.moonDrawCalls} moon`,
+      HudOrder.render,
+    );
     hud.register('water draws', () => this.waterDrawCalls, HudOrder.render);
     hud.register('river draws', () => this.riverDrawCalls, HudOrder.render);
     hud.register('road draws', () => this.roadDrawCalls, HudOrder.render);
@@ -633,6 +725,12 @@ export class App {
     hud.register('wall draws', () => this.wallDrawCalls, HudOrder.render);
     hud.register('interiors entered', () => this.interiors.interiorsEntered, HudOrder.world);
     hud.register('prop draws', () => this.propDrawCalls, HudOrder.render);
+    hud.register('npc draws', () => this.npcDrawCalls, HudOrder.render);
+    hud.register(
+      'npcs',
+      () => `${this.npcs.npcsVisible}/${this.npcs.npcsRostered} moved ${this.npcs.npcsMoved} arrived ${this.npcs.npcsArrived}`,
+      HudOrder.world,
+    );
 
     hud.register(
       'js heap',
@@ -691,6 +789,15 @@ export class App {
       'hud',
       () => this.hud.visible,
       (value) => this.hud.setVisible(value),
+    );
+    // Exposure lives here rather than in the Sky folder: it is a property of
+    // the output pipeline, not of the sky, and keeping it here means
+    // `Atmosphere` never needs a reference to the renderer.
+    render.addNumber(
+      'exposure',
+      () => this.renderer.toneMappingExposure,
+      (value) => this.renderer.setToneMappingExposure(value),
+      { min: 0.2, max: 3, step: 0.05 },
     );
 
     const map = this.panel.folder('World map');

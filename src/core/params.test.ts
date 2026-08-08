@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PARAMS, parseParams, serializeParams } from './params';
 import { hashString } from './hash';
+import { TOD_AT_TIME_ZERO } from '../sky/celestial';
 
 describe('parseParams', () => {
   it('returns defaults for an empty query string', () => {
@@ -53,6 +54,27 @@ describe('parseParams', () => {
     expect(parseParams('?time=-4').time).toBe(0);
   });
 
+  it('parses tod and wraps it into [0, 24)', () => {
+    expect(parseParams('?tod=0').tod).toBe(0);
+    expect(parseParams('?tod=18.75').tod).toBe(18.75);
+    // Wrapped, not clamped -- 25:00 is 01:00 and -3:00 is 21:00.
+    expect(parseParams('?tod=25').tod).toBe(1);
+    expect(parseParams('?tod=-3').tod).toBe(21);
+    expect(parseParams('?tod=48').tod).toBe(0);
+  });
+
+  it('defaults tod to the sky module’s TOD_AT_TIME_ZERO', () => {
+    expect(parseParams('').tod).toBe(TOD_AT_TIME_ZERO);
+    expect(DEFAULT_PARAMS.tod).toBe(TOD_AT_TIME_ZERO);
+  });
+
+  it('malformed tod values fall back to the default', () => {
+    expect(parseParams('?tod=noon').tod).toBe(DEFAULT_PARAMS.tod);
+    expect(parseParams('?tod=').tod).toBe(DEFAULT_PARAMS.tod);
+    expect(parseParams('?tod=NaN').tod).toBe(DEFAULT_PARAMS.tod);
+    expect(parseParams('?tod=Infinity').tod).toBe(DEFAULT_PARAMS.tod);
+  });
+
   describe('malformed input falls back to defaults rather than throwing', () => {
     const cases = [
       '?pos=1,2',
@@ -93,7 +115,7 @@ describe('serializeParams', () => {
 
   it('round-trips a fully specified state', () => {
     const query =
-      '?seed=alpha&pos=10,20,30&look=45,-12&freeze=1&time=7.5&hud=0&panel=0&map=1&wireframe=1';
+      '?seed=alpha&pos=10,20,30&look=45,-12&freeze=1&time=7.5&tod=21.25&hud=0&panel=0&map=1&wireframe=1';
     const parsed = parseParams(query);
     const reparsed = parseParams(serializeParams(parsed));
     expect(reparsed).toEqual(parsed);
@@ -104,6 +126,14 @@ describe('serializeParams', () => {
     expect(serializeParams(on)).toMatch(/[?&]map=1/);
     const off = parseParams('');
     expect(serializeParams(off)).not.toMatch(/map=/);
+  });
+
+  it('includes tod only when it differs from the default', () => {
+    expect(serializeParams(parseParams('?tod=23'))).toMatch(/[?&]tod=23/);
+    expect(serializeParams(parseParams(''))).not.toMatch(/tod=/);
+    // Explicitly asking for the default hour still serialises to nothing, so a
+    // shared link is not littered with values that were never chosen.
+    expect(serializeParams(parseParams(`?tod=${TOD_AT_TIME_ZERO}`))).not.toMatch(/tod=/);
   });
 
   it('round-trips repeatedly without drifting', () => {
