@@ -65,12 +65,22 @@ import {
 } from './rivers';
 import {
   regionRoadField,
+  type CityCandidateSource,
+  type HinterlandDistance,
   type RegionRoadField,
   type RoadRivers,
   type RoadTerrain,
 } from './roads';
 import { sectorLotField, type LotGround, type SectorLotField } from './lots';
 import { sectorStreetField, type SectorStreetField } from './streets';
+import {
+  citiesInBox,
+  nearestCityDistance,
+  polityAt,
+  type Polity,
+  type PolityClimate,
+} from './polity';
+import { cultureIdAt } from './culture';
 
 // ---------------------------------------------------------------------------
 // Sea level
@@ -429,12 +439,36 @@ export function worldRiverField(worldSeed: number): RegionRiverField {
  * `roads.ts` must not depend on this module -- see the layering note there.
  * Wet temperate ground scores highest; a desert and a tundra both score low,
  * which is what keeps settlements out of the extremes without a biome table.
+ *
+ * Exported (Phase Politics P1) so `polity.ts`'s siting and `src/debug/world-
+ * map.ts` can inject the SAME formula `roads.ts` already grades settlements
+ * with, through the same by-reference-injection discipline, rather than each
+ * hand-duplicating it and risking drift.
  */
-function habitability(x: number, z: number, worldSeed: number): number {
+export function habitability(x: number, z: number, worldSeed: number): number {
   const warmth = 1 - Math.abs(temperature(x, z, worldSeed) - 0.62) * 2.4;
   const wet = smoothstep(0.25, 0.62, humidity(x, z, worldSeed));
   return clamp(warmth, 0, 1) * (0.35 + 0.65 * wet);
 }
+
+/**
+ * The climate `polity.ts`'s siting is allowed to see. One module-level
+ * constant, for the same reference-identity reason `WORLD_TERRAIN` is:
+ * `polity.ts`'s `cityAt`/`neighbourhoodAt` memos compare it by reference.
+ */
+const WORLD_CLIMATE: PolityClimate = { continentalness, habitability };
+
+/**
+ * `roads.ts`'s view of `polity.ts`'s cities -- injected, not imported, the
+ * same discipline `habitability` above already uses. `roads.ts` never learns
+ * that `polity.ts` exists; it only sees a function of this shape.
+ */
+const politicalCityCandidates: CityCandidateSource = (x0, z0, x1, z1, worldSeed) =>
+  citiesInBox(x0, z0, x1, z1, WORLD_TERRAIN, WORLD_CLIMATE, worldSeed);
+
+/** Same injection discipline, for the hinterland-aware acceptance threshold. */
+const politicalHinterlandDistance: HinterlandDistance = (x, z, worldSeed) =>
+  nearestCityDistance(x, z, WORLD_TERRAIN, WORLD_CLIMATE, worldSeed);
 
 /**
  * The road generator's view of the rivers, bound to one seed.
@@ -461,6 +495,22 @@ export interface RegionField {
   readonly worldSeed: number;
   readonly rivers: RegionRiverField;
   readonly roads: RegionRoadField;
+  readonly politics: RegionPolitics;
+}
+
+/**
+ * The political query surface a chunk generator gets through `RegionField`.
+ *
+ * A thin, chunk-facing wrapper over `polity.ts`, bound to this world's
+ * terrain/climate/seed the same way `roads`/`rivers` already are -- so
+ * `chunk-gen.ts` never imports `polity.ts` or `culture.ts` directly, matching
+ * every other Region-tier consumer in this project.
+ */
+export interface RegionPolitics {
+  /** The polity owning a point, or `undefined` if sea or beyond every frontier. */
+  polityAt(x: number, z: number): Polity | undefined;
+  /** The culture id a polity's capital belongs to. */
+  cultureOf(polity: Polity): number;
 }
 
 /**
@@ -477,7 +527,25 @@ export function worldRegionField(worldSeed: number): RegionField {
   return {
     worldSeed: seed,
     rivers,
-    roads: regionRoadField(WORLD_TERRAIN, roadRivers(rivers), habitability, seed),
+    roads: regionRoadField(
+      WORLD_TERRAIN,
+      roadRivers(rivers),
+      habitability,
+      seed,
+      politicalCityCandidates,
+      politicalHinterlandDistance,
+    ),
+    politics: {
+      polityAt: (x, z) => polityAt(x, z, WORLD_TERRAIN, WORLD_CLIMATE, seed),
+      cultureOf: (polity) =>
+        cultureIdAt(
+          polity.capitalCellX,
+          polity.capitalCellZ,
+          seed,
+          temperature(polity.capitalX, polity.capitalZ, seed),
+          humidity(polity.capitalX, polity.capitalZ, seed),
+        ),
+    },
   };
 }
 

@@ -26,21 +26,55 @@ import { describe, expect, it } from 'vitest';
 import { hashString } from '../core/hash';
 import { chunkSizeAt, type ChunkCoord } from './contracts';
 import {
+  BUILDING_LOD_SIMPLIFY,
   BUILDING_MAX_PLINTH,
-  BUILDING_TRIANGLE_COUNT,
-  BUILDING_VERTEX_COUNT,
   buildBuildingSurface,
+  pickRoofType,
   type BuildingPalette,
   type BuildingSurface,
 } from './building-mesh';
-import { worldRegionField, worldSectorField, type RegionField } from './height-field';
-import { KIND_KEEP, KIND_CATHEDRAL, KIND_TOWNHALL, KIND_GUILDHALL, KIND_GATEHOUSE, type SectorLots } from './lots';
+import { baseHeight, continentalness, habitability, SEA_LEVEL, worldRegionField, worldSectorField, type RegionField } from './height-field';
+import {
+  KIND_BARN,
+  KIND_CATHEDRAL,
+  KIND_COTTAGE,
+  KIND_GATEHOUSE,
+  KIND_GUILDHALL,
+  KIND_HALL,
+  KIND_KEEP,
+  KIND_TOWNHALL,
+  KIND_TOWNHOUSE,
+  type SectorLots,
+} from './lots';
 import { parseParams } from '../core/params';
-import { SETTLEMENT_CLASS_CITY } from './roads';
+import { SETTLEMENT_CLASS_CITY, type Settlement } from './roads';
+import { citiesInBox, type PolityClimate, type PolityTerrain } from './polity';
 import { WALL_HEIGHT } from './wall-mesh';
+import {
+  ROOF_FLAT_PARAPET,
+  ROOF_GABLE,
+  ROOF_HIP,
+  ROOF_PYRAMID,
+  ROOF_SHED,
+} from './culture';
 
 const SEED = hashString('buildings-test');
 const CITY_SEED = parseParams('').seedHash;
+
+/**
+ * Historical single-building cost from before Phase Politics B1 (roof-type
+ * variety). Ordinary ("gable box") buildings no longer have a fixed
+ * vertex/triangle count -- `BUILDING_VERTEX_COUNT`/`BUILDING_TRIANGLE_COUNT`
+ * were deleted from `building-mesh.ts` for it -- but landmark buildings are
+ * untouched by B1 (built by the separate, unchanged `addLandmarkBuilding`
+ * path) and always cost far more than this, so it remains a valid
+ * anti-vacuity floor for landmark-only assertions below.
+ */
+const LANDMARK_MIN_VERTS = 38;
+
+/** An ordinary building's own vertex span, across every roof type B1 emits. */
+const ORDINARY_VERTS_MIN = 30;
+const ORDINARY_VERTS_MAX = 50;
 
 const PALETTE: BuildingPalette = {
   wallA: [0.5, 0.5, 0.5],
@@ -88,27 +122,46 @@ function surfaceAt(coord: ChunkCoord, seed = SEED, groundY = -1000): BuildingSur
   return buildBuildingSurface(coord, region(seed).roads, field.lots, flatGround(groundY), PALETTE);
 }
 
+/**
+ * Find a real city on `seed`, wherever `polity.ts`'s lattice actually put
+ * one -- Phase Politics S1 moved every city on every seed, so a hardcoded
+ * coordinate (this file used to share `(-32612, -28480)` with
+ * `city-density.test.ts`) is no longer meaningful on any seed. Same search
+ * shape `city-density.test.ts` uses.
+ */
+function findRealCitySettlement(seed: number): Settlement {
+  const terrain: PolityTerrain = { seaLevel: SEA_LEVEL, height: baseHeight };
+  const climate: PolityClimate = { continentalness, habitability };
+  let span = 20_000;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const sites = citiesInBox(-span, -span, span, span, terrain, climate, seed);
+    for (const site of sites) {
+      const net = worldRegionField(seed).roads.networkAt(site.x, site.z);
+      const settlement = net.settlements.find((s) => s.class === SETTLEMENT_CLASS_CITY);
+      if (settlement !== undefined) return settlement;
+    }
+    span *= 2;
+  }
+  throw new Error(`findRealCitySettlement: no city found within +/-${span}m of the origin on seed ${seed}`);
+}
+
 /** Find the first landmark lot of `kind` inside the default city. */
 function findCityLandmark(kind: number): { rec: SectorLots; i: number } | undefined {
   const regionField = worldRegionField(CITY_SEED);
   const field = worldSectorField(regionField, CITY_SEED);
-  const net = regionField.roads.networkAt(-32612, -28480);
-  for (let si = 0; si < net.settlements.length; si++) {
-    const s = net.settlements[si]!;
-    if (s.class !== SETTLEMENT_CLASS_CITY) continue;
-    const cx = s.x;
-    const cz = s.z;
-    const R = s.wallRadius ?? 260;
-    const s0 = Math.floor((cx - R) / 512);
-    const s1 = Math.floor((cx + R) / 512);
-    const z0 = Math.floor((cz - R) / 512);
-    const z1 = Math.floor((cz + R) / 512);
-    for (let sz = z0; sz <= z1; sz++) {
-      for (let sx = s0; sx <= s1; sx++) {
-        const rec = field.lots.lotsAt(sx, sz);
-        for (let i = 0; i < rec.count; i++) {
-          if ((rec.kind[i] as number) === kind) return { rec, i };
-        }
+  const s = findRealCitySettlement(CITY_SEED);
+  const cx = s.x;
+  const cz = s.z;
+  const R = s.wallRadius ?? 260;
+  const s0 = Math.floor((cx - R) / 512);
+  const s1 = Math.floor((cx + R) / 512);
+  const z0 = Math.floor((cz - R) / 512);
+  const z1 = Math.floor((cz + R) / 512);
+  for (let sz = z0; sz <= z1; sz++) {
+    for (let sx = s0; sx <= s1; sx++) {
+      const rec = field.lots.lotsAt(sx, sz);
+      for (let i = 0; i < rec.count; i++) {
+        if ((rec.kind[i] as number) === kind) return { rec, i };
       }
     }
   }
@@ -177,31 +230,51 @@ function landmarkVerts(kind: number) {
 // ---------------------------------------------------------------------------
 
 describe('one building', () => {
-  it('costs exactly the vertices and triangles the constants claim', () => {
-    // The payload maths in `PROGRESS.md` and the cap in `BUILDING_MAX_PER_NODE`
-    // are both derived from these two numbers, so they are not documentation.
+  it('gives buildingStart an exact partition of the surface, each span inside the roof budget', () => {
+    // Phase Politics B1 gave ordinary buildings roof-type variety, so they no
+    // longer share one fixed vertex/triangle count -- what's still true, and
+    // what this asserts instead, is that `buildingStart` partitions the
+    // surface with no gaps or overlaps, and every ordinary building's own
+    // span is a sane roof-type cost.
     const nodes = findVillageNodes();
     expect(nodes.length).toBeGreaterThan(0);
+    let ordinaryChecked = 0;
     for (const node of nodes) {
       const surface = surfaceAt(node.coord);
       if (surface.count === 0) continue;
+      expect(surface.buildingStart.length).toBe(surface.count + 1);
+      expect(surface.buildingStart[0]).toBe(0);
+      expect(surface.buildingStart[surface.count]).toBe(surface.positions.length / 3);
       const landmarks =
         surface.keep + surface.cathedral + surface.townhall + surface.guildhall + surface.gatehouse;
-      if (landmarks === 0) {
-        expect(surface.positions.length / 3).toBe(surface.count * BUILDING_VERTEX_COUNT);
-        expect(surface.indices.length / 3).toBe(surface.count * BUILDING_TRIANGLE_COUNT);
+      for (let b = 0; b < surface.count; b++) {
+        const from = surface.buildingStart[b] as number;
+        const to = surface.buildingStart[b + 1] as number;
+        expect(to).toBeGreaterThan(from);
+        if (landmarks === 0) {
+          expect(to - from).toBeGreaterThanOrEqual(ORDINARY_VERTS_MIN);
+          expect(to - from).toBeLessThanOrEqual(ORDINARY_VERTS_MAX);
+          ordinaryChecked++;
+        }
       }
       expect(surface.normals.length).toBe(surface.positions.length);
       expect(surface.colors.length).toBe(surface.positions.length);
     }
+    expect(ordinaryChecked).toBeGreaterThan(0);
   });
 
   it('gives the known city keep more shell geometry than a cottage', () => {
     const citySeed = hashString('infinite-world');
     const field = world(citySeed);
+    const city = findRealCitySettlement(citySeed);
+    const R = city.wallRadius ?? 260;
+    const s0 = Math.floor((city.x - R) / 512);
+    const s1 = Math.floor((city.x + R) / 512);
+    const z0 = Math.floor((city.z - R) / 512);
+    const z1 = Math.floor((city.z + R) / 512);
     let keepLot;
-    for (let z = -58; z <= -54 && keepLot === undefined; z++) {
-      for (let x = -66; x <= -62 && keepLot === undefined; x++) {
+    for (let z = z0; z <= z1 && keepLot === undefined; z++) {
+      for (let x = s0; x <= s1 && keepLot === undefined; x++) {
         const rec = field.lots.lotsAt(x, z);
         for (let i = 0; i < rec.count; i++) {
           if ((rec.kind[i] as number) === KIND_KEEP) {
@@ -227,16 +300,30 @@ describe('one building', () => {
       PALETTE,
     );
     expect(surface.keep).toBeGreaterThan(0);
-    expect(surface.positions.length / 3).toBeGreaterThan(surface.count * BUILDING_VERTEX_COUNT);
-    expect(surface.indices.length / 3).toBeGreaterThan(surface.count * BUILDING_TRIANGLE_COUNT);
+    // The keep dwarfs any ordinary roof-type box (whose own span never
+    // exceeds `ORDINARY_VERTS_MAX`) -- found via `buildingStart` rather than
+    // a fixed per-building stride, since B1 gave ordinary buildings variable
+    // vertex counts.
+    let maxSpan = 0;
+    for (let b = 0; b < surface.count; b++) {
+      const span = (surface.buildingStart[b + 1] as number) - (surface.buildingStart[b] as number);
+      if (span > maxSpan) maxSpan = span;
+    }
+    expect(maxSpan).toBeGreaterThan(ORDINARY_VERTS_MAX);
   });
 
   it('C5 keep towers rise at least 20% above the bailey roof', () => {
     const citySeed = hashString('infinite-world');
     const field = world(citySeed);
+    const city = findRealCitySettlement(citySeed);
+    const cityR = city.wallRadius ?? 260;
+    const s0 = Math.floor((city.x - cityR) / 512);
+    const s1 = Math.floor((city.x + cityR) / 512);
+    const z0 = Math.floor((city.z - cityR) / 512);
+    const z1 = Math.floor((city.z + cityR) / 512);
     let keepLot: { rec: SectorLots; i: number } | undefined;
-    for (let z = -58; z <= -54 && keepLot === undefined; z++) {
-      for (let x = -66; x <= -62 && keepLot === undefined; x++) {
+    for (let z = z0; z <= z1 && keepLot === undefined; z++) {
+      for (let x = s0; x <= s1 && keepLot === undefined; x++) {
         const rec = field.lots.lotsAt(x, z);
         for (let i = 0; i < rec.count; i++) {
           if ((rec.kind[i] as number) === KIND_KEEP) {
@@ -285,7 +372,7 @@ describe('one building', () => {
       if (y < minY) minY = y;
     }
     // Anti-vacuity: keep landmark actually emitted verts near its lot centre.
-    expect(keepVerts).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(keepVerts).toBeGreaterThan(LANDMARK_MIN_VERTS);
     // Positive: tower crowns exceed bailey roof by ≥20%.
     expect(maxY).toBeGreaterThanOrEqual(baileyRoof * 1.2);
     expect(maxY).toBeGreaterThanOrEqual(floor + 28);
@@ -295,20 +382,34 @@ describe('one building', () => {
   it('C5 cathedral transept is at least 125% nave width and emits shell verts', () => {
     const { surface, kx, kz, rec, index, floor, verts } = landmarkVerts(KIND_CATHEDRAL);
     expect(surface.cathedral).toBe(1);
-    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(verts.length).toBeGreaterThan(LANDMARK_MIN_VERTS);
     expect(Math.max(...verts.map((v) => v.y))).toBeGreaterThanOrEqual(floor + 34);
+    const hw = rec.halfWidth[index] as number;
     const hd = rec.halfDepth[index] as number;
     const transeptHalfAcross = hd * 0.46;
     const naveHalfAcross = 5;
     expect(transeptHalfAcross).toBeGreaterThanOrEqual(naveHalfAcross * 1.25);
     const ax = rec.alongX[index] as number;
     const az = rec.alongZ[index] as number;
+    // The transept box itself (building-mesh.ts's `addLandmarkBuilding`,
+    // KIND_CATHEDRAL: `box(0, 0, halfWidth * 0.32, halfDepth * 0.46, ...)`)
+    // is `halfWidth * 0.32` wide along its own along-axis, centred on
+    // along=0 -- so its own corner vertices, which are the ONLY vertices
+    // carrying the wide across-measurement (a box has no verts along its
+    // edges, only at its corners), sit exactly AT that half-extent. A window
+    // narrower than it -- this test previously hardcoded `< 5`, and
+    // `halfWidth` is always 16 (a literal in `city.ts`, not city-instance
+    // dependent) giving exactly 5.12 -- silently excludes those corners and
+    // measures whatever unrelated, narrower geometry happens to remain. The
+    // window is derived from the box's own half-extent, with a small margin,
+    // so this stays correct regardless of any future tuning of that literal.
+    const transeptHalfAlong = hw * 0.32;
     let trAcross = 0;
     let towerAlong = 0;
     for (const v of verts) {
       const along = (v.x - kx) * ax + (v.z - kz) * az;
       const across = (v.x - kx) * az - (v.z - kz) * ax;
-      if (Math.abs(along) < 5 && v.y >= floor && v.y <= floor + 19) {
+      if (Math.abs(along) <= transeptHalfAlong + 0.5 && v.y >= floor && v.y <= floor + 19) {
         trAcross = Math.max(trAcross, Math.abs(across));
       }
       if (v.y >= floor + 32 && along < -8) towerAlong = Math.min(towerAlong, along);
@@ -322,7 +423,7 @@ describe('one building', () => {
     expect(surface.townhall).toBe(1);
     const hw = rec.halfWidth[index] as number;
     expect(hw * 2).toBeGreaterThanOrEqual(18);
-    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(verts.length).toBeGreaterThan(LANDMARK_MIN_VERTS);
     const roofHeights = new Set<number>();
     for (const v of verts) {
       if (v.y >= floor + 7.5 && v.y <= floor + 9) roofHeights.add(1);
@@ -339,18 +440,46 @@ describe('one building', () => {
   });
 
   it('C5 guildhall workshop exceeds hall height and loading gap exists on approach', () => {
-    const { surface, kx, kz, floor, verts } = landmarkVerts(KIND_GUILDHALL);
+    const { surface, kx, kz, rec, index, floor, verts } = landmarkVerts(KIND_GUILDHALL);
     expect(surface.guildhall).toBeGreaterThan(0);
-    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(verts.length).toBeGreaterThan(LANDMARK_MIN_VERTS);
     const maxY = Math.max(...verts.map((v) => v.y));
     expect(maxY).toBeGreaterThan(floor + 10.5);
-    const approachZ = kz + 7;
-    const gapVerts = verts.filter(
-      (v) => Math.abs(v.x - kx) < 2.5 && v.z > approachZ && v.y > floor && v.y < floor + 5,
+    const ax = rec.alongX[index] as number;
+    const az = rec.alongZ[index] as number;
+    const hw = rec.halfWidth[index] as number;
+    const hd = rec.halfDepth[index] as number;
+    // Project into the lot's own (along, across) frame -- same discipline the
+    // cathedral test above uses -- rather than the world x/z this test
+    // previously assumed, since a guildhall's alongX/alongZ depends on the
+    // street it fronts and is not guaranteed to be (1, 0) for any city.
+    const projected = verts.map((v) => ({
+      along: (v.x - kx) * ax + (v.z - kz) * az,
+      across: (v.x - kx) * az - (v.z - kz) * ax,
+      y: v.y,
+    }));
+    // The loading piers (`building-mesh.ts`'s KIND_GUILDHALL, box 3/4) sit at
+    // offsetAcross = -halfDepth * 0.88 -- the approach side -- so a box's own
+    // CORNER vertices, not its centre, are what a window has to reach: they
+    // are centred at along = +/- halfWidth * 0.62 with half-extent
+    // halfWidth * 0.38, so their |along| is halfWidth * 0.24 (inner edge) to
+    // halfWidth * 1.0 (outer edge), not halfWidth * 0.62 itself. The old
+    // fixed `< 2` window around a hardcoded 7.5 excluded both edges whenever
+    // the actual half-extents didn't happen to put them within 2 m of that
+    // literal -- the same class of bug the cathedral transept window had.
+    const pierAlongMin = hw * 0.24 - 0.5;
+    const pierAlongMax = hw * 1.0 + 0.5;
+    const approachAcross = -hd * 0.4;
+    const gapVerts = projected.filter(
+      (v) => Math.abs(v.along) < hw * 0.2 && v.across < approachAcross && v.y > floor && v.y < floor + 5,
     );
     expect(gapVerts.length).toBe(0);
-    const pierVerts = verts.filter(
-      (v) => Math.abs(Math.abs(v.x - kx) - 7.5) < 2 && v.z > approachZ && v.y > floor + 4,
+    const pierVerts = projected.filter(
+      (v) =>
+        Math.abs(v.along) >= pierAlongMin &&
+        Math.abs(v.along) <= pierAlongMax &&
+        v.across < approachAcross &&
+        v.y > floor + 4,
     );
     expect(pierVerts.length).toBeGreaterThan(0);
   });
@@ -358,7 +487,7 @@ describe('one building', () => {
   it('C5 gatehouse towers exceed 125% curtain height with centre opening', () => {
     const { surface, kx, kz, floor, verts } = landmarkVerts(KIND_GATEHOUSE);
     expect(surface.gatehouse).toBeGreaterThan(0);
-    expect(verts.length).toBeGreaterThan(BUILDING_VERTEX_COUNT);
+    expect(verts.length).toBeGreaterThan(LANDMARK_MIN_VERTS);
     const minTower = floor + WALL_HEIGHT * 1.25;
     expect(Math.max(...verts.map((v) => v.y))).toBeGreaterThanOrEqual(minTower);
     const centreGap = verts.filter(
@@ -374,62 +503,71 @@ describe('one building', () => {
     // convex-ish solid, so a triangle whose geometric normal points back toward
     // the building's centre is inside out -- invisible from outside with a
     // single-sided material, which is exactly how it would ship unnoticed.
+    // B1 gave ordinary buildings variable per-roof-type vertex counts, so a
+    // building's vertex range is no longer `[b * BUILDING_VERTEX_COUNT, ...)`
+    // -- it's `[buildingStart[b], buildingStart[b + 1])`. Triangle indices are
+    // absolute into `positions` and are emitted in building order (`face()`
+    // never splits a triangle's corners across two buildings), so walking the
+    // index buffer once while advancing `b` whenever the lead index crosses
+    // into the next building's span finds each triangle's owner without a
+    // separate triangle-boundary array.
     const nodes = findVillageNodes();
     let checked = 0;
     for (const node of nodes) {
       const surface = surfaceAt(node.coord);
       const p = surface.positions;
       const n = surface.normals;
+      const centers: { x: number; y: number; z: number }[] = [];
       for (let b = 0; b < surface.count; b++) {
-        const base = b * BUILDING_VERTEX_COUNT;
-        // The centre of this building's own vertices. Every face of a box is on
-        // the far side of it from the interior.
+        const vFrom = surface.buildingStart[b] as number;
+        const vTo = surface.buildingStart[b + 1] as number;
         let cx = 0;
         let cy = 0;
         let cz = 0;
-        for (let v = 0; v < BUILDING_VERTEX_COUNT; v++) {
-          cx += p[(base + v) * 3] as number;
-          cy += p[(base + v) * 3 + 1] as number;
-          cz += p[(base + v) * 3 + 2] as number;
+        for (let v = vFrom; v < vTo; v++) {
+          cx += p[v * 3] as number;
+          cy += p[v * 3 + 1] as number;
+          cz += p[v * 3 + 2] as number;
         }
-        cx /= BUILDING_VERTEX_COUNT;
-        cy /= BUILDING_VERTEX_COUNT;
-        cz /= BUILDING_VERTEX_COUNT;
+        const vertCount = vTo - vFrom;
+        centers.push({ x: cx / vertCount, y: cy / vertCount, z: cz / vertCount });
+      }
 
-        const from = b * BUILDING_TRIANGLE_COUNT * 3;
-        const to = from + BUILDING_TRIANGLE_COUNT * 3;
-        for (let t = from; t < to; t += 3) {
-          const i0 = surface.indices[t] as number;
-          const i1 = surface.indices[t + 1] as number;
-          const i2 = surface.indices[t + 2] as number;
-          const ax = p[i0 * 3] as number;
-          const ay = p[i0 * 3 + 1] as number;
-          const az = p[i0 * 3 + 2] as number;
-          const ux = (p[i1 * 3] as number) - ax;
-          const uy = (p[i1 * 3 + 1] as number) - ay;
-          const uz = (p[i1 * 3 + 2] as number) - az;
-          const vx = (p[i2 * 3] as number) - ax;
-          const vy = (p[i2 * 3 + 1] as number) - ay;
-          const vz = (p[i2 * 3 + 2] as number) - az;
-          const gx = uy * vz - uz * vy;
-          const gy = uz * vx - ux * vz;
-          const gz = ux * vy - uy * vx;
-          // Away from the centre...
-          expect(gx * (ax - cx) + gy * (ay - cy) + gz * (az - cz)).toBeGreaterThan(0);
-          // ...and the shaded normal agrees with the triangle it belongs to,
-          // which is what makes the lighting match the geometry.
-          const length = Math.sqrt(gx * gx + gy * gy + gz * gz);
-          expect(length).toBeGreaterThan(0);
-          const dot =
-            (gx / length) * (n[i0 * 3] as number) +
-            (gy / length) * (n[i0 * 3 + 1] as number) +
-            (gz / length) * (n[i0 * 3 + 2] as number);
-          expect(dot).toBeGreaterThan(0.99);
-          checked++;
-        }
+      let b = 0;
+      for (let t = 0; t < surface.indices.length; t += 3) {
+        const i0 = surface.indices[t] as number;
+        while (b < surface.count - 1 && i0 >= (surface.buildingStart[b + 1] as number)) b++;
+        const { x: cx, y: cy, z: cz } = centers[b] as { x: number; y: number; z: number };
+
+        const i1 = surface.indices[t + 1] as number;
+        const i2 = surface.indices[t + 2] as number;
+        const ax = p[i0 * 3] as number;
+        const ay = p[i0 * 3 + 1] as number;
+        const az = p[i0 * 3 + 2] as number;
+        const ux = (p[i1 * 3] as number) - ax;
+        const uy = (p[i1 * 3 + 1] as number) - ay;
+        const uz = (p[i1 * 3 + 2] as number) - az;
+        const vx = (p[i2 * 3] as number) - ax;
+        const vy = (p[i2 * 3 + 1] as number) - ay;
+        const vz = (p[i2 * 3 + 2] as number) - az;
+        const gx = uy * vz - uz * vy;
+        const gy = uz * vx - ux * vz;
+        const gz = ux * vy - uy * vx;
+        // Away from the centre...
+        expect(gx * (ax - cx) + gy * (ay - cy) + gz * (az - cz)).toBeGreaterThan(0);
+        // ...and the shaded normal agrees with the triangle it belongs to,
+        // which is what makes the lighting match the geometry.
+        const length = Math.sqrt(gx * gx + gy * gy + gz * gz);
+        expect(length).toBeGreaterThan(0);
+        const dot =
+          (gx / length) * (n[i0 * 3] as number) +
+          (gy / length) * (n[i0 * 3 + 1] as number) +
+          (gz / length) * (n[i0 * 3 + 2] as number);
+        expect(dot).toBeGreaterThan(0.99);
+        checked++;
       }
     }
-    expect(checked).toBeGreaterThan(BUILDING_TRIANGLE_COUNT);
+    expect(checked).toBeGreaterThan(100);
   });
 
   it('writes a linear colour in range at every vertex', () => {
@@ -444,6 +582,127 @@ describe('one building', () => {
       }
     }
     expect(seen).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Roof variety (Phase Politics B1)
+// ---------------------------------------------------------------------------
+
+describe('roof variety', () => {
+  it('picks the same roof for the same building every time (pure in kind and world position)', () => {
+    for (const [kind, x, z] of [
+      [KIND_COTTAGE, 1234, -5678],
+      [KIND_BARN, -910, 1112],
+      [KIND_TOWNHOUSE, 31415, -9265],
+      [KIND_HALL, -27182, 8182],
+    ] as const) {
+      const a = pickRoofType(kind, x, z);
+      const b = pickRoofType(kind, x, z);
+      expect(b).toBe(a);
+    }
+  });
+
+  it('covers every implemented roof type over enough cottages, none of the unimplemented three', () => {
+    // ROOF_MANSARD/ROOF_GAMBREL/ROOF_DOME_FACET are culture.ts enum values with
+    // no geometry in `addRoofCap` yet (see its doc comment) -- `pickRoofType`
+    // must never return them, or `addRoofCap`'s `else` branch would silently
+    // draw a gable in their place instead of the intended shape.
+    const seen = new Set<number>();
+    for (let i = 0; i < 2000; i++) {
+      seen.add(pickRoofType(KIND_COTTAGE, i * 97 - 500, i * 53 + 1000));
+    }
+    expect(seen.has(ROOF_GABLE)).toBe(true);
+    expect(seen.has(ROOF_HIP)).toBe(true);
+    expect(seen.has(ROOF_PYRAMID)).toBe(true);
+    expect(seen.has(ROOF_SHED)).toBe(true);
+    // ROOF_FLAT_PARAPET is cottage-reachable too (the generic roll below 42
+    // is gable, 42-68 hip, 68-88 pyramid, 88+ shed -- flat-parapet only comes
+    // from the townhouse-specific branch), so it is asserted separately below
+    // rather than here.
+    for (const type of seen) {
+      expect(type).not.toBe(2 /* ROOF_MANSARD */);
+      expect(type).not.toBe(6 /* ROOF_GAMBREL */);
+      expect(type).not.toBe(7 /* ROOF_DOME_FACET */);
+    }
+  });
+
+  it('biases barns toward gable/shed, townhouses toward flat-parapet/gable/hip, halls toward gable/hip', () => {
+    const barnRoofs = new Set<number>();
+    const townhouseRoofs = new Set<number>();
+    const hallRoofs = new Set<number>();
+    for (let i = 0; i < 2000; i++) {
+      const x = i * 71 - 300;
+      const z = i * 43 + 700;
+      barnRoofs.add(pickRoofType(KIND_BARN, x, z));
+      townhouseRoofs.add(pickRoofType(KIND_TOWNHOUSE, x, z));
+      hallRoofs.add(pickRoofType(KIND_HALL, x, z));
+    }
+    expect(barnRoofs).toEqual(new Set([ROOF_GABLE, ROOF_SHED]));
+    expect(townhouseRoofs).toEqual(new Set([ROOF_FLAT_PARAPET, ROOF_GABLE, ROOF_HIP]));
+    expect(hallRoofs).toEqual(new Set([ROOF_GABLE, ROOF_HIP]));
+  });
+
+  it('nudges cottages toward a culture\'s own houseRoofs, without touching barn/townhouse/hall', () => {
+    // Phase Politics B3. Culture 0 ('Northern Hold') prefers
+    // [ROOF_GABLE, ROOF_SHED] -- both implemented -- so its cottages should
+    // draw HIP/PYRAMID much less often than the unbiased (cultureId -1)
+    // baseline. Culture 1 ('Riverlands') prefers [ROOF_GABLE, ROOF_GAMBREL],
+    // and GAMBREL is unimplemented, so its nudge collapses to GABLE alone --
+    // a stronger, single-roof bias -- rather than silently drawing GAMBREL or
+    // falling back to an unrelated roof.
+    const SAMPLES = 3000;
+    let baselineOther = 0;
+    let culture0Other = 0;
+    let culture1Gable = 0;
+    let culture1Total = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const x = i * 131 - 4000;
+      const z = i * 89 + 2500;
+      const base = pickRoofType(KIND_COTTAGE, x, z, -1);
+      if (base === ROOF_HIP || base === ROOF_PYRAMID) baselineOther++;
+      const c0 = pickRoofType(KIND_COTTAGE, x, z, 0);
+      if (c0 === ROOF_HIP || c0 === ROOF_PYRAMID) culture0Other++;
+      const c1 = pickRoofType(KIND_COTTAGE, x, z, 1);
+      if (c1 === ROOF_GABLE) culture1Gable++;
+      culture1Total++;
+    }
+    // Baseline HIP+PYRAMID share is ~46% (26 + 20); Northern Hold's nudge
+    // should cut that meaningfully without eliminating all variety (the
+    // nudge is soft, not a hard filter).
+    expect(culture0Other).toBeLessThan(baselineOther * 0.75);
+    expect(culture0Other).toBeGreaterThan(0);
+    // Baseline GABLE share is ~42%; Riverlands' single-implemented-roof
+    // nudge (55% forced GABLE + 45% baseline's own 42% GABLE share) should
+    // land well above that.
+    expect(culture1Gable / culture1Total).toBeGreaterThan(0.65);
+
+    // Kinds with their own shape logic are untouched by culture.
+    for (const kind of [KIND_BARN, KIND_TOWNHOUSE, KIND_HALL]) {
+      for (let i = 0; i < 200; i++) {
+        const x = i * 211 + 900;
+        const z = i * 173 - 1600;
+        expect(pickRoofType(kind, x, z, 0)).toBe(pickRoofType(kind, x, z, -1));
+      }
+    }
+  });
+
+  it('gives a real village more than one roof shape, visible as more than one distinct vertex span', () => {
+    // The pure-function tests above prove the roll varies; this ties it to
+    // actual generated content, the same anti-vacuity discipline the
+    // archetype/street-density tests use in city.test.ts.
+    const nodes = findVillageNodes();
+    const spans = new Set<number>();
+    for (const node of nodes) {
+      const surface = surfaceAt(node.coord);
+      const landmarks =
+        surface.keep + surface.cathedral + surface.townhall + surface.guildhall + surface.gatehouse;
+      if (landmarks > 0) continue;
+      for (let b = 0; b < surface.count; b++) {
+        spans.add((surface.buildingStart[b + 1] as number) - (surface.buildingStart[b] as number));
+      }
+    }
+    expect(spans.size).toBeGreaterThan(1);
   });
 });
 
@@ -527,42 +786,60 @@ describe('ownership', () => {
 // ---------------------------------------------------------------------------
 
 describe('the floor and the plinth', () => {
-  it('puts the floor where the sector record says, at every level', () => {
+  it('puts the floor (and eaves) where the sector record says, at every level', () => {
     // The reason a building does not jump when the quadtree changes level under
     // it. Fitting the floor per node would be the obvious thing to do and is
     // exactly what this refuses.
+    //
+    // Floor and eaves (`floorY + lots.eaves`) are both Sector-tier fixed
+    // points, so their altitudes cannot depend on the node's own level --
+    // that is what this checks. Everything ABOVE eaves (ridge, roof slopes,
+    // facade panels) is NOT included any more: Phase Politics B4 gave
+    // `lod >= BUILDING_LOD_SIMPLIFY` its own flat cap directly at eaves
+    // instead of full massing (see `BUILDING_LOD_SIMPLIFY`), so what sits
+    // above eaves is deliberately level-dependent now -- eaves itself is the
+    // true invariant this test is named for, and the one still worth
+    // checking exactly.
     const nodes = findVillageNodes();
     const anchor = nodes[0] as { coord: ChunkCoord; lots: SectorLots };
     const rec = anchor.lots;
-    let lowestFloor = Infinity;
-    for (let i = 0; i < rec.count; i++) lowestFloor = Math.min(lowestFloor, rec.floorY[i] as number);
 
-    // Every altitude ABOVE the floor line -- the eaves and the ridge -- is
-    // `floorY + something the sector record fixed`, so it cannot depend on the
-    // level. Only the base is per node, and with the ground put a kilometre
-    // down every base is below the lowest floor and out of this set.
-    const above = (surface: BuildingSurface): number[] => {
+    // Only the buildings `anchor.coord` ITSELF owns (centre inside its own
+    // 64 m square) -- the sector record `rec` can span the whole village,
+    // most of which belongs to sibling lod-0 nodes and is absent from this
+    // one's own render. Landmarks (`LANDMARK_RECIPES`, Phase Politics B2)
+    // never read `lots.eaves` either -- each box's own top/bottom is a
+    // literal offset from `floor` -- so a landmark lot's `rec.eaves[i]` has
+    // no corresponding vertex to find at all; only ordinary buildings do.
+    const minX = anchor.coord.x * 64;
+    const minZ = anchor.coord.z * 64;
+    const maxX = minX + 64;
+    const maxZ = minZ + 64;
+    const landmarkKinds = new Set([KIND_KEEP, KIND_CATHEDRAL, KIND_TOWNHALL, KIND_GUILDHALL, KIND_GATEHOUSE]);
+    const eavesAltitudes = new Set<number>();
+    for (let i = 0; i < rec.count; i++) {
+      const cx = rec.centerX[i] as number;
+      const cz = rec.centerZ[i] as number;
+      if (cx < minX || cx >= maxX || cz < minZ || cz >= maxZ) continue;
+      if (landmarkKinds.has(rec.kind[i] as number)) continue;
+      eavesAltitudes.add(Math.fround((rec.floorY[i] as number) + (rec.eaves[i] as number)));
+    }
+    expect(eavesAltitudes.size).toBeGreaterThan(0);
+
+    const altitudesOf = (surface: BuildingSurface): Set<number> => {
       const out = new Set<number>();
-      for (let i = 1; i < surface.positions.length; i += 3) {
-        const y = surface.positions[i] as number;
-        if (y >= lowestFloor) out.add(y);
-      }
-      return [...out].sort((a, b) => a - b);
+      for (let i = 1; i < surface.positions.length; i += 3) out.add(surface.positions[i] as number);
+      return out;
     };
 
-    const fine = above(surfaceAt(anchor.coord));
-    expect(fine.length).toBeGreaterThan(0);
-    for (const lod of [1, 2, 3]) {
+    for (const lod of [0, 1, 2, 3]) {
       const coord: ChunkCoord = {
         x: Math.floor((anchor.coord.x * 64) / chunkSizeAt(lod)),
         z: Math.floor((anchor.coord.z * 64) / chunkSizeAt(lod)),
         lod,
       };
-      // A coarse node owns everything the fine one does and more, so its set of
-      // above-floor altitudes must CONTAIN the fine node's exactly. A floor
-      // fitted per node would move every one of them.
-      const coarse = new Set(above(surfaceAt(coord)));
-      for (const y of fine) expect(coarse.has(y)).toBe(true);
+      const altitudes = altitudesOf(surfaceAt(coord));
+      for (const y of eavesAltitudes) expect(altitudes.has(y)).toBe(true);
     }
   });
 
@@ -642,6 +919,111 @@ describe('the floor and the plinth', () => {
     );
     expect(surface.count).toBeGreaterThan(0);
     expect(surface.level).toBe(surface.count);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LOD bands (Phase Politics B4)
+// ---------------------------------------------------------------------------
+
+describe('LOD simplification', () => {
+  it('draws full massing at lod 0 and the flat silhouette at BUILDING_LOD_SIMPLIFY, walls and eaves unchanged either way', () => {
+    const nodes = findVillageNodes();
+    const anchor = nodes[0] as { coord: ChunkCoord; lots: SectorLots };
+    const fine = surfaceAt(anchor.coord);
+    expect(fine.count).toBeGreaterThan(0);
+    expect(fine.simplified).toBe(0);
+
+    const coarseCoord: ChunkCoord = {
+      x: Math.floor((anchor.coord.x * 64) / chunkSizeAt(BUILDING_LOD_SIMPLIFY)),
+      z: Math.floor((anchor.coord.z * 64) / chunkSizeAt(BUILDING_LOD_SIMPLIFY)),
+      lod: BUILDING_LOD_SIMPLIFY,
+    };
+    const coarse = surfaceAt(coarseCoord);
+    expect(coarse.count).toBeGreaterThan(0);
+    expect(coarse.simplified).toBeGreaterThan(0);
+
+    // Landmarks are never simplified (see `BUILDING_LOD_SIMPLIFY`'s doc
+    // comment) -- `simplified` never exceeds the ordinary-building share of
+    // `count`.
+    const landmarks =
+      coarse.keep + coarse.cathedral + coarse.townhall + coarse.guildhall + coarse.gatehouse;
+    expect(coarse.simplified).toBeLessThanOrEqual(coarse.count - landmarks);
+
+    // Every simplified building costs EXACTLY 4 walls (4v each) + 1 flat cap
+    // (4v) = 20v -- unlike full massing, the simplified path has no
+    // roof-type variety, so this is an exact count, not a range.
+    let simplifiedChecked = 0;
+    for (let b = 0; b < coarse.count; b++) {
+      const span = (coarse.buildingStart[b + 1] as number) - (coarse.buildingStart[b] as number);
+      if (span === 20) simplifiedChecked++;
+    }
+    expect(simplifiedChecked).toBe(coarse.simplified);
+  });
+
+  it('faces outward on every triangle of the simplified silhouette too', () => {
+    // The winding test above (`describe('one building')`) only ever
+    // exercises lod 0 nodes via `findVillageNodes()` -- this is the same
+    // check, run once against a real coarse-LOD village, so the simplified
+    // cap's own winding is verified rather than assumed from the shared
+    // `face()` machinery alone.
+    const nodes = findVillageNodes();
+    const anchor = nodes[0] as { coord: ChunkCoord; lots: SectorLots };
+    const coarseCoord: ChunkCoord = {
+      x: Math.floor((anchor.coord.x * 64) / chunkSizeAt(BUILDING_LOD_SIMPLIFY)),
+      z: Math.floor((anchor.coord.z * 64) / chunkSizeAt(BUILDING_LOD_SIMPLIFY)),
+      lod: BUILDING_LOD_SIMPLIFY,
+    };
+    const surface = surfaceAt(coarseCoord);
+    expect(surface.simplified).toBeGreaterThan(0);
+    const p = surface.positions;
+    const n = surface.normals;
+    let checked = 0;
+    for (let b = 0; b < surface.count; b++) {
+      const vFrom = surface.buildingStart[b] as number;
+      const vTo = surface.buildingStart[b + 1] as number;
+      if (vTo - vFrom !== 20) continue; // only the simplified buildings
+      let cx = 0;
+      let cy = 0;
+      let cz = 0;
+      for (let v = vFrom; v < vTo; v++) {
+        cx += p[v * 3] as number;
+        cy += p[v * 3 + 1] as number;
+        cz += p[v * 3 + 2] as number;
+      }
+      const count = vTo - vFrom;
+      cx /= count;
+      cy /= count;
+      cz /= count;
+      for (let t = 0; t < surface.indices.length; t += 3) {
+        const i0 = surface.indices[t] as number;
+        if (i0 < vFrom || i0 >= vTo) continue;
+        const i1 = surface.indices[t + 1] as number;
+        const i2 = surface.indices[t + 2] as number;
+        const ax = p[i0 * 3] as number;
+        const ay = p[i0 * 3 + 1] as number;
+        const az = p[i0 * 3 + 2] as number;
+        const ux = (p[i1 * 3] as number) - ax;
+        const uy = (p[i1 * 3 + 1] as number) - ay;
+        const uz = (p[i1 * 3 + 2] as number) - az;
+        const vx = (p[i2 * 3] as number) - ax;
+        const vy = (p[i2 * 3 + 1] as number) - ay;
+        const vz = (p[i2 * 3 + 2] as number) - az;
+        const gx = uy * vz - uz * vy;
+        const gy = uz * vx - ux * vz;
+        const gz = ux * vy - uy * vx;
+        expect(gx * (ax - cx) + gy * (ay - cy) + gz * (az - cz)).toBeGreaterThan(0);
+        const length = Math.sqrt(gx * gx + gy * gy + gz * gz);
+        expect(length).toBeGreaterThan(0);
+        const dot =
+          (gx / length) * (n[i0 * 3] as number) +
+          (gy / length) * (n[i0 * 3 + 1] as number) +
+          (gz / length) * (n[i0 * 3 + 2] as number);
+        expect(dot).toBeGreaterThan(0.99);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
   });
 });
 

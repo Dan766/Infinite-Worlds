@@ -102,7 +102,7 @@
  */
 
 import { CellHeap } from './cell-heap';
-import { hash2i, hash3i } from '../core/hash';
+import { hash2i } from '../core/hash';
 import { cityPlanAt, nearestCityGate } from './city';
 import {
   createTierContext,
@@ -263,32 +263,101 @@ export const SETTLEMENT_MIN_SCORE = 0.42;
 export const SETTLEMENT_RADIUS_MIN = 58;
 export const SETTLEMENT_RADIUS_MAX = 186;
 
-/** Village vs rare medieval city. */
+/**
+ * The settlement hierarchy. `VILLAGE = 0` / `CITY = 1` are unchanged from
+ * Phase City -- every existing `isCity` check (`site.class === 1`) stays
+ * correct without an edit. `HAMLET`/`TOWN` are APPENDED rather than slotted
+ * in, because renumbering the first two would silently misclassify every
+ * reference to them that already exists across `lots.ts`, `streets.ts`,
+ * `wall-mesh.ts`, `road-mesh.ts`, `props.ts`, `interior-overlay.ts` and
+ * `collision.ts`.
+ *
+ * Only `isCity` (`class === SETTLEMENT_CLASS_CITY`) is load-bearing anywhere
+ * downstream. A hamlet or a town is, as far as every mesh/collision/street
+ * generator in this project is concerned, simply "not a city" -- exactly the
+ * same code path a village already takes. Nothing outside this file needs to
+ * know the hierarchy exists.
+ */
 export const SETTLEMENT_CLASS_VILLAGE = 0;
 export const SETTLEMENT_CLASS_CITY = 1;
+export const SETTLEMENT_CLASS_HAMLET = 2;
+export const SETTLEMENT_CLASS_TOWN = 3;
 
-/** Elite score band eligible for a city roll. */
-export const CITY_SCORE_MIN = 0.72;
-/** One in N elite local-maxima become cities. */
-export const CITY_ROLL_MOD = 7;
-const CITY_SALT = 0x4369_5479;
-
-export function cityRarityRoll(
-  cellX: number,
-  cellZ: number,
-  worldSeed: number,
-  score: number,
-): boolean {
-  return (
-    score >= CITY_SCORE_MIN &&
-    (hash3i(cellX, cellZ, (worldSeed ^ CITY_SALT) >>> 0) >>> 0) % CITY_ROLL_MOD === 0
-  );
+/** A rough ordering for anything that wants one (debug displays, sort order). Not used by any generator. */
+export function settlementRank(klass: number): number {
+  switch (klass) {
+    case SETTLEMENT_CLASS_HAMLET:
+      return 0;
+    case SETTLEMENT_CLASS_VILLAGE:
+      return 1;
+    case SETTLEMENT_CLASS_TOWN:
+      return 2;
+    case SETTLEMENT_CLASS_CITY:
+      return 3;
+    default:
+      return 0;
+  }
 }
 
+/**
+ * Cities now come from `polity.ts`'s coarse, spacing-guaranteed lattice
+ * (Phase Politics P1), injected below as `cityCandidates` -- the same
+ * discipline `habitability` already uses. `cityRarityRoll` (a flat
+ * `score >= 0.72 && hash % 7 === 0` on this module's own 512 m lattice) is
+ * deleted rather than kept alongside it: the two selection rules disagreeing
+ * about which cells are cities would be a second source of truth for the
+ * question `streets.ts`'s "one settlement centre per sector" invariant
+ * depends on being answered exactly once.
+ */
 export const CITY_WALL_RADIUS_MIN = 420;
 export const CITY_WALL_RADIUS_MAX = 580;
 export const CITY_FARM_BELT_MIN = 220;
 export const CITY_FARM_BELT_MAX = 360;
+
+/**
+ * Metres beyond a city's own farmland belt within which no village, hamlet or
+ * town may site a centre. Without this, an ordinary village candidate could
+ * win a local-maximum test on ground the city's own farm belt already claims.
+ */
+export const CITY_SUPPRESS_MARGIN = 260;
+
+/**
+ * The hinterland: how close to a city a settlement must be for its
+ * acceptance bar to drop toward `HAMLET_MIN_SCORE`, and how far away it must
+ * be for the bar to relax back to the ordinary `SETTLEMENT_MIN_SCORE`.
+ *
+ * ONLY THE THRESHOLD MOVES; the score and its 3x3 strict-local-maximum test,
+ * below, are untouched. That is deliberate and load-bearing: two regions that
+ * both see a candidate still compute the identical `settlementScore` for it
+ * and therefore still agree about which of two equal-looking neighbours wins
+ * a tie, so the region-boundary agreement `roads.test.ts` already asserts
+ * needs no change. `SETTLEMENT_MIN_SCORE`'s own doc comment already names
+ * this the safe axis: "the local-maximum rule already guarantees spacing, so
+ * this controls how much of the world is habitable."
+ */
+export const CITY_HINTERLAND_MIN = 2_000;
+export const CITY_HINTERLAND_MAX = 6_000;
+
+/** Below `SETTLEMENT_MIN_SCORE`, a settlement only the hinterland's relaxed bar admits. */
+export const HAMLET_MIN_SCORE = 0.3;
+/** At or above this, an accepted settlement is a town rather than a village. */
+export const TOWN_MIN_SCORE = 0.6;
+
+/**
+ * The acceptance bar a candidate's score must clear, given its distance to
+ * the nearest city. Linear ramp between the two hinterland radii; flat
+ * outside them. At `distanceToCity === Infinity` (the default when no
+ * political field is injected -- see `regionRoadField`) this returns exactly
+ * `SETTLEMENT_MIN_SCORE`, so every caller that does not wire in `polity.ts`
+ * (most of this project's test suite) sees byte-identical acceptance
+ * behaviour to before this function existed.
+ */
+export function acceptThreshold(distanceToCity: number): number {
+  if (distanceToCity <= CITY_HINTERLAND_MIN) return HAMLET_MIN_SCORE;
+  if (distanceToCity >= CITY_HINTERLAND_MAX) return SETTLEMENT_MIN_SCORE;
+  const t = (distanceToCity - CITY_HINTERLAND_MIN) / (CITY_HINTERLAND_MAX - CITY_HINTERLAND_MIN);
+  return lerp(HAMLET_MIN_SCORE, SETTLEMENT_MIN_SCORE, t);
+}
 
 /** Metres above sea level a settlement site must stand. */
 export const SETTLEMENT_MIN_ALTITUDE = 4;
@@ -412,7 +481,7 @@ export interface Settlement {
   readonly score: number;
   /** Footprint radius in metres (wall radius for cities). */
   readonly radius: number;
-  /** `SETTLEMENT_CLASS_VILLAGE` or `SETTLEMENT_CLASS_CITY`. */
+  /** One of `SETTLEMENT_CLASS_VILLAGE` / `CITY` / `HAMLET` / `TOWN`. Only `=== CITY` is load-bearing anywhere downstream. */
   readonly class: number;
   /** Curtain-wall radius; 0 on villages. */
   readonly wallRadius: number;
@@ -545,6 +614,51 @@ export function settlementScore(
  * local-maximum test reads a 3x3 neighbourhood and a candidate on the window
  * edge still needs all eight of its neighbours.
  */
+/**
+ * A city, as `roads.ts` needs to see one. Structurally identical to (a
+ * subset of) `polity.ts`'s `CitySite` -- deliberately not imported from
+ * there, so this module keeps zero runtime dependency on the politics layer,
+ * matching the discipline `RoadTerrain`/`RoadRivers`/`habitability` already
+ * follow. `height-field.ts` is the one module that imports both and adapts
+ * `polity.ts`'s real output into this shape.
+ */
+export interface CityCandidate {
+  readonly siteCellX: number;
+  readonly siteCellZ: number;
+  readonly x: number;
+  readonly z: number;
+  readonly y: number;
+  /** [0, 1]. Plays the role `settlementScore`'s `quality` derivative does for a village. */
+  readonly siteScore: number;
+}
+
+/** Every city whose coarse cell can overlap the world-space box `[x0, x1] x [z0, z1]`. */
+export type CityCandidateSource = (
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+  worldSeed: number,
+) => readonly CityCandidate[];
+
+/** Straight-line distance to the nearest city, or `Infinity` if none is known. */
+export type HinterlandDistance = (x: number, z: number, worldSeed: number) => number;
+
+function defaultCityCandidates(): readonly CityCandidate[] {
+  return [];
+}
+
+function defaultHinterlandDistance(): number {
+  return Infinity;
+}
+
+function cityInfluenceRadii(city: CityCandidate): { wallRadius: number; farmRadius: number } {
+  const quality = clamp(city.siteScore, 0, 1);
+  const wallRadius = lerp(CITY_WALL_RADIUS_MIN, CITY_WALL_RADIUS_MAX, quality);
+  const farmRadius = wallRadius + lerp(CITY_FARM_BELT_MIN, CITY_FARM_BELT_MAX, quality);
+  return { wallRadius, farmRadius };
+}
+
 function siteSettlements(
   regionX: number,
   regionZ: number,
@@ -552,6 +666,8 @@ function siteSettlements(
   terrain: RoadTerrain,
   rivers: RoadRivers,
   habitability: (x: number, z: number, worldSeed: number) => number,
+  cityCandidates: CityCandidateSource = defaultCityCandidates,
+  hinterlandDistance: HinterlandDistance = defaultHinterlandDistance,
 ): Settlement[] {
   const padCells = SETTLEMENT_PAD / SETTLEMENT_CELL;
   const cell0X = regionX * REGION_SETTLEMENT_CELLS - padCells;
@@ -559,6 +675,42 @@ function siteSettlements(
   // One extra ring on every side, for the 3x3 local-maximum test.
   const cols = SETTLEMENT_WINDOW_CELLS + 2;
 
+  // -- cities: sourced from polity.ts's own lattice, never re-derived here --
+  //
+  // A city's position, spacing (the 8 km floor) and very existence were
+  // already decided once, by `polity.ts`'s coarse lattice. This function does
+  // not re-score or re-select it -- only turns it into a `Settlement` and, via
+  // `citySiteKeys`/the suppression pass below, keeps the 512 m village lattice
+  // from placing anything on top of it.
+  const worldX0 = (cell0X - 1) * SETTLEMENT_CELL;
+  const worldZ0 = (cell0Z - 1) * SETTLEMENT_CELL;
+  const worldX1 = (cell0X - 1 + cols) * SETTLEMENT_CELL;
+  const worldZ1 = (cell0Z - 1 + cols) * SETTLEMENT_CELL;
+  const cities = cityCandidates(worldX0, worldZ0, worldX1, worldZ1, worldSeed);
+
+  const citySiteKeys = new Set<string>();
+  const cityInfluence: { x: number; z: number; suppressRadiusSq: number }[] = [];
+  const out: Settlement[] = [];
+  for (const city of cities) {
+    citySiteKeys.add(`${city.siteCellX},${city.siteCellZ}`);
+    const { wallRadius, farmRadius } = cityInfluenceRadii(city);
+    const suppressRadius = farmRadius + CITY_SUPPRESS_MARGIN;
+    cityInfluence.push({ x: city.x, z: city.z, suppressRadiusSq: suppressRadius * suppressRadius });
+    out.push({
+      cellX: city.siteCellX,
+      cellZ: city.siteCellZ,
+      x: city.x,
+      z: city.z,
+      y: city.y,
+      score: clamp(city.siteScore, 0, 1),
+      radius: wallRadius,
+      class: SETTLEMENT_CLASS_CITY,
+      wallRadius,
+      farmRadius,
+    });
+  }
+
+  // -- villages, hamlets and towns: the same 512 m local-maximum lattice as before --
   const scores = new Float64Array(cols * cols);
   const pointX = new Float64Array(cols * cols);
   const pointZ = new Float64Array(cols * cols);
@@ -570,23 +722,45 @@ function siteSettlements(
       const at = row * cols + col;
       pointX[at] = p.x;
       pointZ[at] = p.z;
-      scores[at] = settlementScore(
-        p.x,
-        p.z,
-        worldSeed,
-        terrain,
-        rivers,
-        habitability(p.x, p.z, worldSeed),
-      );
+      // A cell a city already occupies never competes as a village candidate
+      // -- scoring it anyway could let it win a local-maximum test against
+      // its own neighbours and be emitted twice.
+      scores[at] = citySiteKeys.has(`${cellX},${cellZ}`)
+        ? 0
+        : settlementScore(p.x, p.z, worldSeed, terrain, rivers, habitability(p.x, p.z, worldSeed));
     }
   }
 
-  const out: Settlement[] = [];
   for (let row = 1; row < cols - 1; row++) {
     for (let col = 1; col < cols - 1; col++) {
       const at = row * cols + col;
       const score = scores[at] as number;
-      if (score < SETTLEMENT_MIN_SCORE) continue;
+      if (score <= 0) continue;
+
+      const x = pointX[at] as number;
+      const z = pointZ[at] as number;
+
+      // Suppress any candidate inside a city's own farmland influence, so a
+      // village can never win a local maximum on ground the city already
+      // claims -- checked before the (cheaper, but still real) threshold and
+      // local-max tests so a suppressed cell never needs either.
+      let suppressed = false;
+      for (const city of cityInfluence) {
+        const dx = x - city.x;
+        const dz = z - city.z;
+        if (dx * dx + dz * dz < city.suppressRadiusSq) {
+          suppressed = true;
+          break;
+        }
+      }
+      if (suppressed) continue;
+
+      // ONLY THE THRESHOLD IS HINTERLAND-AWARE. `settlementScore` itself, and
+      // the strict local-maximum test just below, are exactly what they were
+      // before Phase Politics -- see `acceptThreshold`'s own doc comment for
+      // why that is what keeps two regions agreeing about a shared candidate.
+      const threshold = acceptThreshold(hinterlandDistance(x, z, worldSeed));
+      if (score < threshold) continue;
 
       // Strict local maximum over the 3x3 neighbourhood. Decided by nine cells,
       // so two regions that both see this cell reach the same verdict. Ties are
@@ -606,21 +780,15 @@ function siteSettlements(
       }
       if (!best) continue;
 
-      const x = pointX[at] as number;
-      const z = pointZ[at] as number;
       const quality = clamp((score - SETTLEMENT_MIN_SCORE) / (1 - SETTLEMENT_MIN_SCORE), 0, 1);
       const cellX = cell0X - 1 + col;
       const cellZ = cell0Z - 1 + row;
-      let klass = SETTLEMENT_CLASS_VILLAGE;
-      let wallRadius = 0;
-      let farmRadius = 0;
-      let radius = lerp(SETTLEMENT_RADIUS_MIN, SETTLEMENT_RADIUS_MAX, quality);
-      if (cityRarityRoll(cellX, cellZ, worldSeed, score)) {
-        klass = SETTLEMENT_CLASS_CITY;
-        wallRadius = lerp(CITY_WALL_RADIUS_MIN, CITY_WALL_RADIUS_MAX, quality);
-        farmRadius = wallRadius + lerp(CITY_FARM_BELT_MIN, CITY_FARM_BELT_MAX, quality);
-        radius = wallRadius;
-      }
+      const klass =
+        score >= TOWN_MIN_SCORE
+          ? SETTLEMENT_CLASS_TOWN
+          : score < SETTLEMENT_MIN_SCORE
+            ? SETTLEMENT_CLASS_HAMLET
+            : SETTLEMENT_CLASS_VILLAGE;
       out.push({
         cellX,
         cellZ,
@@ -628,10 +796,10 @@ function siteSettlements(
         z,
         y: terrain.height(x, z, worldSeed),
         score,
-        radius,
+        radius: lerp(SETTLEMENT_RADIUS_MIN, SETTLEMENT_RADIUS_MAX, quality),
         class: klass,
-        wallRadius,
-        farmRadius,
+        wallRadius: 0,
+        farmRadius: 0,
       });
     }
   }
@@ -1097,6 +1265,8 @@ export function generateRegionRoads(
   terrain: RoadTerrain,
   rivers: RoadRivers,
   habitability: (x: number, z: number, worldSeed: number) => number = () => 0.5,
+  cityCandidates: CityCandidateSource = defaultCityCandidates,
+  hinterlandDistance: HinterlandDistance = defaultHinterlandDistance,
 ): RoadNetwork {
   if (context.tier !== 'region') {
     throw new Error(`generateRegionRoads needs a 'region' TierContext, got '${context.tier}'`);
@@ -1107,7 +1277,16 @@ export function generateRegionRoads(
   const minZ = coord.z * REGION_SIZE - ROAD_REACH;
 
   // -- 1. site the settlements on the global lattice --------------------------
-  const settlements = siteSettlements(coord.x, coord.z, worldSeed, terrain, rivers, habitability);
+  const settlements = siteSettlements(
+    coord.x,
+    coord.z,
+    worldSeed,
+    terrain,
+    rivers,
+    habitability,
+    cityCandidates,
+    hinterlandDistance,
+  );
 
   // -- 2. the Gabriel graph, pruned to what can reach this region -------------
   //
@@ -1115,7 +1294,42 @@ export function generateRegionRoads(
   // order that matters: pruning first would hide a settlement whose presence
   // blocks an edge, and the two regions either side of a boundary would then
   // disagree about that edge.
-  const allEdges = gabrielEdges(settlements);
+  //
+  // HAMLETS DO NOT COMPETE FOR GABRIEL EDGES. A denser hinterland means more
+  // settlements, and `gabrielEdges` is O(n^3); a hamlet gets exactly one spur
+  // to its nearest non-hamlet neighbour instead of a share of the full graph,
+  // which caps the edge-count growth at +1 per hamlet rather than +degree.
+  const nonHamletIndex: number[] = [];
+  const nonHamletSettlements: Settlement[] = [];
+  for (let i = 0; i < settlements.length; i++) {
+    const s = settlements[i] as Settlement;
+    if (s.class === SETTLEMENT_CLASS_HAMLET) continue;
+    nonHamletIndex.push(i);
+    nonHamletSettlements.push(s);
+  }
+  const coreEdges: [number, number][] = gabrielEdges(nonHamletSettlements).map(([a, b]) => [
+    nonHamletIndex[a] as number,
+    nonHamletIndex[b] as number,
+  ]);
+  const spurEdges: [number, number][] = [];
+  for (let i = 0; i < settlements.length; i++) {
+    const s = settlements[i] as Settlement;
+    if (s.class !== SETTLEMENT_CLASS_HAMLET) continue;
+    let nearest = -1;
+    let nearestDistSq = ROAD_MAX_EDGE * ROAD_MAX_EDGE;
+    for (const j of nonHamletIndex) {
+      const other = settlements[j] as Settlement;
+      const dx = s.x - other.x;
+      const dz = s.z - other.z;
+      const distSq = dx * dx + dz * dz;
+      if (distSq < nearestDistSq) {
+        nearestDistSq = distSq;
+        nearest = j;
+      }
+    }
+    if (nearest >= 0) spurEdges.push([i, nearest]);
+  }
+  const allEdges: [number, number][] = [...coreEdges, ...spurEdges];
   const reachMinX = coord.x * REGION_SIZE - ROAD_REACH;
   const reachMaxX = (coord.x + 1) * REGION_SIZE + ROAD_REACH;
   const reachMinZ = coord.z * REGION_SIZE - ROAD_REACH;
@@ -1330,6 +1544,8 @@ export function regionRoads(
   worldSeed: number,
   regionX: number,
   regionZ: number,
+  cityCandidates: CityCandidateSource = defaultCityCandidates,
+  hinterlandDistance: HinterlandDistance = defaultHinterlandDistance,
 ): RoadNetwork {
   const seed = worldSeed >>> 0;
   for (let i = 0; i < cache.length; i++) {
@@ -1354,6 +1570,8 @@ export function regionRoads(
     terrain,
     rivers,
     habitability,
+    cityCandidates,
+    hinterlandDistance,
   );
   cacheBuilds++;
   cache.unshift(built);
@@ -1526,6 +1744,8 @@ export function regionRoadField(
   rivers: RoadRivers,
   habitability: (x: number, z: number, worldSeed: number) => number,
   worldSeed: number,
+  cityCandidates: CityCandidateSource = defaultCityCandidates,
+  hinterlandDistance: HinterlandDistance = defaultHinterlandDistance,
 ): RegionRoadField {
   const seed = worldSeed >>> 0;
   const networkAt = (x: number, z: number): RoadNetwork =>
@@ -1536,6 +1756,8 @@ export function regionRoadField(
       seed,
       Math.floor(x / REGION_SIZE),
       Math.floor(z / REGION_SIZE),
+      cityCandidates,
+      hinterlandDistance,
     );
 
   // One blend for the convenience wrappers below. They are off the hot path --

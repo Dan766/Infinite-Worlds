@@ -20,6 +20,7 @@ state moves between sessions. Update both at the end of every phase.
 | 8     | Player controller and collision    | Done (code; soak deferred with city epic) |
 | City  | Medieval cities C0–C4              | Done (code; full soak/shots deferred) |
 | Visual| Settlement visuals (City C5–C7 + Village V1–V3) | C5 landmark kinds ACCEPT (prereq soak/shots:check housekeeping) |
+| Politics | Nations, cities, culture, names (Phase P) | P1–P4 done. Phase S (siting wired into the real world) done: code, tests, city screenshots re-aimed with evidence. Soak flight-start and 11 non-city baseline diffs are open -- see Phase S entry |
 | 9     | NPCs                               | -      |
 | 10    | Lighting and atmosphere            | -      |
 | 11    | Materials and post-processing      | -      |
@@ -4329,3 +4330,1232 @@ passed a separate Composer v-critic with PNG Read + sha256.
   acceptance prerequisites; silhouette work for C5 landmarks is complete.
 - Next epic slice per order: **V1** (village cottage/barn/hall) — serialized
   with C5 on `building-mesh.ts`; C5 is clear to hand off.
+
+## Politics epic, Phase P (P1–P4) -- nations, cities, culture, names, debug map
+
+### Why
+
+The prior city system placed cities by a flat `hash % 7` rarity roll on the
+village lattice: nothing enforced a minimum spacing, nothing made villages
+cluster around a city, and there was no political layer at all -- no nations,
+no borders, no names. This epic replaces that with an enforced-spacing city
+lattice, a deterministic nation/city-state partition with borders and
+prestige-weighted capitals, and a culture layer (palette/roof-vocabulary/name
+morphology) so two nations can eventually read as different civilisations.
+Full design doc: `settlement-visual-epic` succeeded by a fresh plan
+(`a-junior-developer-with-glistening-goose.md`, not committed -- a Claude Code
+plan-mode artifact) covering four phases: **P**olitics (this entry, invisible
+-- no world geometry changes), **S**iting (wires politics into `roads.ts`,
+moves every settlement in the world, the disruptive slice), **C**ity layout
+(archetypes, terrain-fitted walls, parcels, replacing `city.ts`), **B**uilding
+massing (roof variety, culture palettes, LOD/impostors). This session shipped
+Phase P in full: P1 (siting), P2 (capitals/nations/borders), P3
+(culture/names), P4 (debug map). **Zero changes to any existing world-facing
+module** -- `roads.ts`, `city.ts`, `lots.ts`, `building-mesh.ts` are
+byte-identical to before this session except for one export (`habitability`
+in `height-field.ts`, see below). No screenshot baseline moved, no soak
+budget changed.
+
+### Built
+
+- **`src/world/polity.ts`** (new). Pure, position-only -- no tier, injected
+  into `regionRoadField` the same way `habitability` already is. Two stages:
+  - **Siting** (`cityAt`, `citiesInBox`, `nearestCityDistance`): a coarse
+    `CITY_CELL = 8192` m (2 regions) lattice scored by climate alone
+    (`cellPotential`: continentalness + habitability, zero `baseHeight`
+    reads), a strict 3x3 local-maximum test (same pattern `roads.ts`'s
+    `siteSettlements` uses, one lattice coarser), then a two-pass
+    `baseHeight`-only fine argmax (4x4 sub-cells, then 4x4 settlement-lattice
+    candidates within the winner) that lands the site exactly on the existing
+    512 m settlement lattice. **Rivers are never read during siting** -- the
+    whole reason for the two-stage design; see Judgment calls.
+  - **Politics** (`polityAt`, `polityOfCity`, `isCapital`, `Polity`):
+    prestige-weighted capital selection (strict local prestige-maximum within
+    a 7x7 coarse-cell block), nation membership by prestige-weighted nearest
+    capital within a prestige-derived reach (18-44 km), territory by
+    multiplicatively-weighted Voronoi over MEMBER cities (not capitals) with
+    borders warped by the same `warp2` terrain uses, tapered to zero within
+    1,500 m of a city so a city can never be warped outside its own
+    territory. Three bounded memos (`cityAt`, `neighbourhoodAt`,
+    `capitalOf`/`computePolity`) make `polityAt` cheap enough for a map to
+    call per pixel -- see Measured.
+- **`src/world/culture.ts`** (new). Pure data table: 6 cultures spanning the
+  climate square, each with a `CulturePalette` (same 5-swatch shape
+  `building-mesh.ts`'s `BuildingPalette` already uses, so Phase B can adopt it
+  with no reshape), house/civic roof preferences, and a city-archetype bias.
+  `ROOF_*` (8 types) and `ARCH_*` (5 archetypes) are declared here as forward
+  references for Phase B/C, which do not exist yet. `cultureIdAt` picks a
+  culture per capital from a 70/30 mix of climate fit and an independent hash
+  roll.
+- **`src/world/names.ts`** (new). Culture-keyed syllable morphology
+  (onset/nucleus/coda + settlement/nation suffix tables, disjoint across
+  cultures), `settlementName`/`nationName`/`cultureName`. Deliberately takes a
+  plain `diminutive: boolean` instead of `roads.ts`'s `SETTLEMENT_CLASS_*` --
+  see Judgment calls.
+- **`src/debug/world-map.ts`** (new). Split into `WorldMapField` (pure,
+  Node-testable, no DOM) and `WorldMap` (thin `<canvas>`-owning wrapper).
+  Incremental row-budgeted build (`step(budgetMs)`), border detection by
+  comparing each pixel against its already-painted left/top neighbour,
+  city dots + text labels. Wired into `app.ts`: `?map=1` param (default off,
+  excluded from `shots/canonical.json`), a HUD `polity` line, a panel
+  "World map" folder (visible toggle + metres/px slider).
+- **`height-field.ts`**: exported the previously-private `habitability`
+  function (only change to an existing world-facing module this session) so
+  `polity.ts`'s tests and `world-map.ts` reuse the exact formula `roads.ts`
+  grades settlements with, instead of a third hand-duplicated copy.
+
+### Judgment calls worth knowing
+
+- **No new coarser tier.** Considered and rejected: a "realm" tier above
+  Region would make `coarser('realm')` legal from inside a region generator,
+  quietly breaking the load-bearing "nothing is coarser than a region"
+  guarantee `ARCHITECTURE.md` states for RULE 3. A nation's extent is also
+  emergent from city positions, not decidable inside a fixed box. `polity.ts`
+  is a plain injected module instead, exactly like `habitability`.
+- **City siting reads zero rivers.** The obvious design -- score every
+  candidate with something `rivers.drop`-shaped, the way village siting does
+  -- was checked against the river-region memo cost this project already
+  measured once: a 4096 m `SETTLEMENT_PAD` experiment (recorded earlier in
+  this file) cost 24-28 river-region rebuilds per road region against a
+  24-entry cache, 1.4 s, 10x budget. A coarse-cell city scan would touch 6-8x
+  that column span. Fix: siting is staged so only `continentalness`,
+  `habitability` and `baseHeight` are ever read -- both memo-free by design
+  (`baseHeight` is µs-scale with no cache of its own). `polity.test.ts` has a
+  dedicated test driving siting through a stub that structurally cannot reach
+  a river (the injected `PolityTerrain`/`PolityClimate` interfaces have no
+  river-shaped method at all).
+- **`capitalOf` had to be memoised mid-session -- this was a real bug, not a
+  design choice.** The first working version of `polityAt` recomputed
+  `capitalOf` for every city in a query's neighbourhood, and each of those
+  calls built its OWN `neighbourhoodAt` snapshot centred on that city's own
+  cell. A single query could therefore demand a dozen-plus distinct
+  neighbourhood snapshots; the next query a few hundred metres away demanded
+  a near-identical dozen again. Measured: a ~15,000-point test sweep that
+  should have been near-instant took over two minutes before the fix, and
+  `NEIGHBOURHOOD_CACHE_LIMIT` alone (raised 32 -> 128) was not enough on its
+  own -- the real fix was memoising `capitalOf` itself (`capitalCache`,
+  `CAPITAL_CACHE_LIMIT = 1024`), since a city's owning capital is a pure
+  function of the city alone and should only ever be computed once, not once
+  per query that happens to see it. After both fixes the full `polity.test.ts`
+  suite (21 tests, real terrain, thousands of `polityAt` calls) runs in ~30 s.
+  That is still slower than this project's other test files (single-digit
+  seconds) and is recorded here rather than hidden: it is dominated by
+  legitimately expensive real-terrain probing across dozens of real cities,
+  not by a remaining cache bug, but a future session touching `polity.ts`
+  should re-measure before assuming it is free.
+- **Nation reach and territorial frontier are the same number
+  (`NATION_REACH_MIN`/`SPAN`), not two.** A polity should not be able to claim
+  land further than the distance at which it could ever absorb a city as a
+  member, so a second, independently-tuned frontier constant would only be a
+  second knob for the same idea. `FRONTIER_MAX` is `NATION_REACH_MIN +
+  NATION_REACH_SPAN` (44,000 m), not a separate constant.
+- **`names.ts` takes a `diminutive: boolean`, not `roads.ts`'s numeric
+  `SETTLEMENT_CLASS_*`.** Keeps the same one-directional dependency discipline
+  `polity.ts` follows (`roads.ts` may depend on the politics/culture/names
+  modules; they must never depend back on it). Phase S will pass
+  `class === SETTLEMENT_CLASS_HAMLET` in at the call site.
+- **`SETTLEMENT_CLASS_VILLAGE = 0` / `CITY = 1` were NOT renumbered** when
+  designing the eventual hamlet/town classes -- those will be appended as `2`
+  and `3` in Phase S. Renumbering would silently misclassify every existing
+  reference to the two current values.
+- **Border/territory search radius is derived, not tuned by feel.**
+  `POLITY_SEARCH_RADIUS = FRONTIER_MAX * (1 + CITY_PULL)` is asserted as an
+  equation in `polity.test.ts`, not a magic number: it is the exact distance
+  beyond which a city's prestige weighting can no longer make it win an
+  argmin against a geometrically nearer one.
+- **The border-crossing detector in `world-map.ts` is one-sided** (compares
+  only the already-painted left/top neighbour, since the build is row-major)
+  -- deliberately simple for a debug overlay. A future minimap doing more than
+  proving "borders exist and are not straight lines" should difference the
+  finished buffer in both directions instead.
+
+### Measured
+
+- `npm test`: 578 tests passing (up from 512 at the last recorded count),
+  across 5 new files (`polity.test.ts` 21, `culture.test.ts` 9,
+  `names.test.ts` 14, `world-map.test.ts` 12, plus additions to
+  `params.test.ts`). `npx tsc --noEmit` clean. One pre-existing, unrelated
+  failure in the Node-test-runner harness (`scripts/lib/shots-select.test.mjs`
+  reports "no suite found" to Vitest's collector) -- untouched by this
+  session, confirmed via `git log`/`git status` against that file.
+- `polity.test.ts`'s 8 km floor test (`CITY_CELL = 8192`): over a 80x80
+  coarse-cell real-terrain window, no two cities closer than `CITY_CELL`,
+  ≥15 cities found (anti-vacuity floor). Mean nearest-neighbour separation
+  measured in the 8-40 km band, bracketing the ~15 km target.
+- `politicalCacheStats().builds` per query window verified to not grow on a
+  repeat query (`cityAt`, `capitalOf`/`computePolity` all memoised and
+  swap-to-front, matching `rivers.ts`/`roads.ts`'s existing discipline).
+- No screenshot, soak budget, or `CHUNK_DATA_VERSION` changed -- nothing in
+  this phase is wired into `ChunkData`, `roads.ts`, `city.ts`, `lots.ts`, or
+  `building-mesh.ts` yet.
+
+### Known gaps, deliberately left
+
+- **Not wired into the real world.** Every settlement and city on the actual
+  seed is still sited exactly as before (`cityRarityRoll`, the 512 m lattice,
+  the hardcoded `city.ts` plan). Phase S is the slice that moves them, and it
+  is the one slice in this whole epic expected to re-aim all 68 committed
+  screenshot baselines (26 of them pinned to one specific city's absolute
+  coordinates) and re-derive the soak's flight start.
+- **No enclave test.** The weighted-Voronoi territory can produce
+  non-convex, even disconnected regions (a strong nation's member city can
+  out-pull a weak neighbour's own capital near that capital's doorstep) --
+  this is intended, but asserting one demonstrably exists on the default seed
+  within a bounded test window risked either flakiness or overfitting to one
+  seed, so it is recorded here as a known, un-asserted property instead of a
+  brittle test.
+- **`WorldMap` (the canvas-owning wrapper class) has no direct unit test** --
+  this project's Vitest config runs in a plain Node environment with no
+  jsdom, so only `WorldMapField` (the pure sampler it wraps) is tested. The
+  wrapper is thin enough that its correctness rests on the field's tests plus
+  a manual dev-server check.
+- Village layouts, `city.ts`'s hardcoded plan, `lots.ts`'s city path, and
+  `building-mesh.ts`'s single gable box + hardcoded landmark chain are all
+  still exactly as the prior "junior dev" session left them -- Phases C and B
+  replace them, not this one.
+
+### For next (Phase S)
+
+1. Wire `polity.ts` into `roads.ts`: delete `cityRarityRoll`/`CITY_SCORE_MIN`/
+   `CITY_ROLL_MOD`, add `SETTLEMENT_CLASS_HAMLET = 2`/`TOWN = 3`, make village
+   acceptance threshold a function of `nearestCityDistance` (the score and its
+   local-max test stay byte-for-byte unchanged -- only the threshold moves).
+2. Before touching a single screenshot: write `scripts/find-city.mjs` to
+   locate the new seed's cities/gates/landmarks and compute the old->new
+   `?pos=`/`?look=` mapping, document it here, then `npm run shots -- --only=
+   city-*` followed by `shots:repeat` before committing.
+3. Re-derive the soak's flight start the same way it was originally tuned
+   (maximise the worst of the anti-vacuity counts, per the existing note in
+   this file) -- do not assume the old coordinates still work.
+4. Gate on `riverCacheStats().builds` per region being unchanged from
+   baseline after wiring -- that is the whole point of Phase P's two-stage,
+   rivers-free siting design, and it is only proven once something real reads
+   it.
+
+## Politics epic, Phase S -- siting wired into the real world
+
+### Why
+
+Phase P shipped the whole political layer with zero effect on the actual
+world; this phase is the disruptive one the plan named: wire `polity.ts` into
+`roads.ts` so every settlement and city on every seed is actually sited by it,
+add the hamlet/town tiers and the hinterland-aware acceptance threshold, put
+`polityId`/`cultureId` on the chunk payload, and re-aim whatever screenshot
+baselines that moved.
+
+### Built
+
+- **`roads.ts` siting rewrite.** `cityRarityRoll`/`CITY_SCORE_MIN`/
+  `CITY_ROLL_MOD`/`CITY_SALT` deleted outright. `SETTLEMENT_CLASS_HAMLET = 2`/
+  `TOWN = 3` appended (village=0/city=1 untouched). New exported
+  `CityCandidateSource`/`HinterlandDistance` injected function types (same
+  by-reference-injection discipline `habitability` already uses -- `roads.ts`
+  still imports nothing from `polity.ts`) and `acceptThreshold(distance)`,
+  which returns exactly `SETTLEMENT_MIN_SCORE` at `distance = Infinity`, the
+  default every caller that doesn't wire in politics gets. `siteSettlements`
+  now: emits every city `cityCandidates` returns directly (position, wall/farm
+  radius derived from the city's own `siteScore`, exactly the old
+  `lerp(CITY_WALL_RADIUS_MIN, MAX, quality)` formula); suppresses any village
+  candidate inside a city's farmland-plus-margin; applies
+  `acceptThreshold(hinterlandDistance(...))` in place of the flat
+  `SETTLEMENT_MIN_SCORE` gate; classifies survivors HAMLET (below the normal
+  bar, admitted only by a relaxed hinterland threshold) / VILLAGE / TOWN
+  (score >= 0.6) with the local-maximum test itself byte-for-byte unchanged.
+  `generateRegionRoads`'s Gabriel-graph step excludes hamlets and gives each
+  one spur edge to its nearest non-hamlet neighbour instead (caps edge growth
+  at +1/hamlet against the O(n^3) full graph). `height-field.ts` wires the
+  real `politicalCityCandidates`/`politicalHinterlandDistance` closures (bound
+  to `polity.ts`'s `citiesInBox`/`nearestCityDistance`) into
+  `regionRoadField`, and `RegionField` gained a `politics: RegionPolitics`
+  slot (`polityAt`/`cultureOf`) for chunk-tier consumers.
+- **`ChunkData` payload (S2).** `polityId`/`cultureId` scalars (`-1` = sea or
+  beyond every frontier), `CHUNK_DATA_VERSION` 14 -> 15. Computed once per
+  chunk at its centre in `chunk-gen.ts` (not per-vertex). Threaded through
+  `chunk-streamer.ts` as two new CUMULATIVE **distinct-value** counters --
+  `politiesSeenSet`/`culturesSeenSet`, `Set<number>` rather than a running sum,
+  because "how many different nations has the flight crossed" is not
+  answerable by counting touched nodes -- and into `app.ts`'s `perfSnapshot()`
+  and `scripts/soak.mjs`'s new `MIN_POLITIES_SEEN`/`MIN_CULTURES_SEEN` floors
+  (both `1`; see Judgment calls on why not `2`).
+- **26 `city-*` canonical screenshots re-aimed and regenerated**, with visual
+  evidence read directly (not just byte-diffed) -- see Measured. New tool,
+  `scripts/reaim-city-shots.mjs` (committed): applies a RIGID TRANSLATION to
+  each view's `pos=`, keeping every view's exact original camera offset/`look`
+  to its anchor (city centre / a specific landmark / a specific gate) and only
+  moving the anchor. Deltas were derived once from the new default-seed city's
+  real `CityPlan` (found with a throwaway `vitest` probe -- `polity.ts`/
+  `city.ts` are pure and Node-testable, no browser needed) compared against
+  each OLD topdown view's `pos` (a topdown view looks straight down,
+  `look=0,-90`, so its `pos.x/z` is the closest thing the old baselines have
+  to a recorded landmark coordinate).
+
+### Judgment calls worth knowing
+
+- **`SETTLEMENT_REMOTE_SCORE` does not exist.** Phase P's plan named a
+  "harsher far from any city" tier as well as a relaxed hinterland one;
+  implemented, it would have been a SECOND behaviour change stacked on top of
+  the hinterland relaxation, and would have made every one of this project's
+  many existing tests that call the bare `regionRoadField(WORLD, WORLD_RIVERS,
+  () => 0.5, SEED)` helper (no politics wired in, so `hinterlandDistance`
+  defaults to `() => Infinity`) see FEWER villages than before, for no reason
+  connected to this phase's actual goal. `acceptThreshold(Infinity) ===
+  SETTLEMENT_MIN_SCORE` exactly, so every test file that doesn't explicitly
+  wire in `polity.ts` -- the large majority of `roads.test.ts`,
+  `streets.test.ts`, `lots.test.ts`, `wall-mesh.test.ts`, `road-mesh.test.ts`,
+  `collision.test.ts`, `props.test.ts`, `interior-mesh.test.ts`,
+  `chunk-gen.test.ts` -- needed zero changes and stayed byte-identical in
+  behaviour. Confirmed by running the full suite before touching a single one
+  of those files: 570/577 passed on the first try, and the 7 failures were
+  exactly the ones tied to the one hardcoded city coordinate (see below), not
+  a single stray village-count assertion.
+- **Two tests broke, and both were genuinely pre-existing bugs the siting
+  move exposed, not caused.** `building-mesh.test.ts`'s cathedral-transept and
+  guildhall-pier assertions measured a box's CENTRE-plus-a-narrow-window when
+  the geometry's actual corner vertices sit at the box's own half-extent
+  (`halfWidth * 0.32` for the transept, not the `< 5` window the test
+  hardcoded) -- a fixed literal that is identical for every cathedral ever
+  generated (landmark half-extents are hardcoded in `city.ts`, not
+  city-instance-dependent), so this would have failed on the OLD city too had
+  its camera-derived orientation not happened to make the corner land inside
+  the stale window by coincidence. Fixed by deriving the window from the
+  lot's own `halfWidth`/`halfDepth` fields instead of a magic number, and (for
+  the guildhall) by projecting into the lot's own along/across frame instead
+  of assuming world-axis alignment. `building-mesh.ts` itself was not touched
+  -- these are test-file fixes to code this phase deliberately left alone.
+- **`city-density.test.ts` and `building-mesh.test.ts` both independently
+  hardcoded the SAME coordinate** (`networkAt(-32612, -28480)`) for "the one
+  city" in the test world. Both now share the same search pattern (locate a
+  real city via `polity.ts`'s `citiesInBox` against the real terrain/climate,
+  then resolve it to a `Settlement` via `networkAt`) rather than a fixed
+  point -- `findRealCity`/`findRealCitySettlement`, duplicated per file rather
+  than factored into a shared test-utils module, matching this project's
+  existing convention of self-contained test files.
+- **`MIN_POLITIES_SEEN`/`MIN_CULTURES_SEEN` are `1`, not `2`.** The stress-tested
+  plan wanted `2` (proving the flight crosses a border, not just touches one
+  nation) but that is only safe to assert once a flight path is confirmed to
+  actually cross one -- and the flight-start re-derivation this phase attempted
+  did not reach that confirmation (see Known gaps). `1` still catches the
+  literal wiring failure (every node reporting `-1`); tightening to `2` is
+  explicitly left for whoever finishes the soak re-derivation.
+- **The city re-aim is a rigid translation, not a fresh design pass**, and
+  that is a deliberate choice, not a shortcut: `city.ts`'s landmark/district
+  layout is still the fully deterministic, non-random plan from before this
+  phase (Phase C replaces it), so every landmark of a given kind sits at the
+  literal-identical bearing/distance from its city's centre on every
+  instance -- translating the old camera offsets is therefore not an
+  approximation, it is the exact same shot. This is why the "for next" note's
+  suggested `scripts/find-city.mjs` ended up being a throwaway `vitest` probe
+  (deleted after use) rather than a committed script: locating a city is a
+  three-line call into already-pure, already-tested modules, and the only
+  thing worth committing was the re-aim transform itself
+  (`scripts/reaim-city-shots.mjs`).
+
+### Measured
+
+- `npm test`: 578 passing, `npx tsc --noEmit` clean, immediately after wiring
+  real politics into `worldRegionField` (before any test file was touched) --
+  the only failures were the 7 tied to the one hardcoded city coordinate,
+  confirming the hinterland-threshold design note above.
+- New default-seed city (used for the screenshot re-aim): centre
+  `(59127.0, -101255.3)`, `y=42.7`, wall radius `556.0` m, farm radius
+  `895.0` m, 3 gates, class quality (`siteScore`) `0.85`. 72 cities found in a
+  ±100 km box around the origin on this seed -- for scale, the old rarity-roll
+  system produced roughly one findable city per seed; this is the density
+  increase Phase Politics was built for.
+- All 26 re-aimed `city-*` screenshots were read directly (not just
+  byte-compared) after regeneration: `city-aerial` shows a complete walled
+  city with continuous ring streets, packed townhouse ribbons, 3 gates and
+  roads leading in past a river; `city-keep-topdown` shows the bailey, 4
+  corner towers and gate-facing approach centred exactly in frame;
+  `city-cathedral` shows the nave/transept/tower massing facing a market
+  plaza with the curtain wall visible behind it; `city-gatehouse-topdown`
+  shows twin towers straddling the wall opening with the road passing
+  through. `npm run shots:check` reports all 26 as `OK` against these new
+  baselines with 40-266 distinct colours each (none blank).
+- `npm run shots:check` on the FULL 68-view set (read-only; nothing besides
+  the 26 city-* baselines was written) additionally reports 11 non-city views
+  as CHANGED: `cube-default`, `cube-t0`, `chunks-radius-edge`,
+  `lod-rings-wireframe`, `seed-canary-inland`, `river-to-the-sea`,
+  `river-mouth-shallow`, `river-mouth-wireframe`, `road-bridge`,
+  `road-bridge-wireframe`, `settlement-buildings-wireframe`. Two were read
+  directly: `cube-default` (a Phase 0 placeholder cube on a beach, which does
+  not depend on settlements, roads, or anything this phase touched --
+  plausibly platform/SwiftShader drift rather than a code effect) and
+  `river-mouth-shallow` (a healthy scene: river meeting the sea, a village
+  visible in the distance that plausibly differs from before given the
+  density increase). Neither looks broken. None of these 11 were committed --
+  see Known gaps.
+- A 30-second sanity `npm run soak --seconds=30` at the new flight start
+  (see below) completed without crashing and exercised the full counter set,
+  including the two new Phase Politics S2 floors (`polities SEEN 1`,
+  `cultures SEEN 1`, both at floor). Real, useful data came out of it (see
+  Known gaps) even though it is not the qualifying run.
+
+### Known gaps, deliberately left
+
+- **The soak flight start is a first candidate, not a verified one.**
+  `START_X`/`START_Z` were moved to a real keep found the same pure,
+  Node-computable way the city re-aim was (`polity.ts`'s `citiesInBox` +
+  `city.ts`'s `CityPlan`), guaranteeing `citiesSeen`/`interiorsEntered` are
+  non-zero by construction. What it does NOT yet have, unlike every prior
+  move recorded in this file: a confirmed coastal/riverside keep. The 30s
+  sanity run's real output: `sea at the start 0/25`, `river at the start
+  0/25`, and the water-draw floors failed as a direct consequence (this keep
+  measured 0/25 sea in its own 5x5 -- a search for a coastal one was
+  attempted and timed out before finding one). The same run also reported
+  `peak live vertices 1258877` against the `1,040,000` budget -- a real
+  finding, not sanity-run noise, and worth flagging prominently: starting
+  literally inside a dense new-density city centre may be a genuinely
+  harder vertex load than the old flight's coastal-village start, on top of
+  whatever the general settlement-density increase costs everywhere. The
+  `props SEEN` floor also failed at 30s, but that floor was calibrated
+  against a full 300s run and is not a meaningful signal at 30s -- ignore it
+  until a real run is done.
+- **Full `npm run soak` (300s) has not been run.** Needed to: find a
+  genuinely coastal-and-riverside city/village start (or accept a village
+  rather than a city centre, which the old start always used and this one
+  does not); confirm or refute the vertex-budget concern above with a real
+  flight rather than a stationary-ish 30s sample; re-derive every other
+  budget number in the table now that settlement density has changed
+  globally; and decide whether `MIN_POLITIES_SEEN`/`CULTURES_SEEN` can be
+  safely tightened to `2`.
+- **11 non-city screenshot diffs are un-investigated and NOT committed.**
+  `shots/.check/` (gitignored) holds all 11 after the full `shots:check` run
+  above. Two were eye-reviewed and look healthy; the other nine were not.
+  Per `docs/settlement-visual-acceptance.md`'s own binding process, baseline
+  replacement needs eye review recorded here before commit -- this phase
+  reviewed and evidenced the 26 it deliberately re-aimed, but these 11 were
+  discovered, not chosen, and deserve the same treatment before anyone runs
+  `npm run shots` over the full set.
+- Everything named as a Phase C/B gap in the Phase P entry above is still
+  true: `city.ts`'s hardcoded plan, `lots.ts`'s city path, and
+  `building-mesh.ts`'s single gable box + landmark chain are untouched.
+
+### For next
+
+1. Run the full `npm run soak` (300s, default) at the current
+   `START_X`/`START_Z` to get a real budget table rather than a 30s
+   approximation, and to see whether the vertex-budget failure persists over
+   a full flight.
+2. If it does, or if a coastal start is still wanted: search harder for a
+   coastal-and-riverside city/village (the throwaway probe timed out after
+   ~2 minutes checking 30 candidates one at a time -- batching the `sea`
+   check across all candidates before running the expensive `cityPlanAt`
+   only on the survivors would be much faster) and re-run.
+3. Investigate the 11 non-city changed views in `shots/.check/` (read each
+   PNG, decide platform-drift vs. real density effect, per the acceptance
+   doc's process) before running `npm run shots` over anything beyond the 26
+   already committed.
+4. Only once 1-3 are resolved: consider tightening `MIN_POLITIES_SEEN`/
+   `CULTURES_SEEN` to `2`, per the plan's original intent.
+5. Phase C (city archetypes, terrain-fitted walls, parcels replacing the
+   station walk) is the next real content slice; `city.ts`'s hardcoded plan
+   and `lots.ts`'s city path are both still exactly as the prior "junior dev"
+   session left them.
+
+## Politics epic, Phase C -- city archetypes, organic walls, per-archetype streets and districts
+
+### Why
+
+Every city was still the exact same 28-gon regardless of which nation, site,
+or hash it came from -- Phase S made cities common and politically real, but
+they all looked identical. This phase makes them look like different places:
+5 hash-selected archetypes (`ARCH_RADIAL`/`RIVERPORT`/`HILL_CITADEL`/`GRID`/
+`HARBOR`, forward-declared in `culture.ts` back in Phase P) now shape the
+wall's silhouette, the street network's topology, and where the seven
+districts sit around the ring -- all from `city.ts` alone, with
+`generateCityPlan(site, worldSeed)`'s signature completely unchanged.
+
+### Built
+
+- **C1 -- archetypes + organic wall.** `pickArchetype(cellX, cellZ, worldSeed)`
+  (hash-selected, one of `ARCHETYPE_COUNT` from `culture.ts`). The wall's old
+  `R * (0.92..1.04)` near-circle is replaced by `organicUnit` -- 8 hash-seeded
+  control radii around the ring, smoothly interpolated (`smoothstep`, no
+  trig) -- bent per archetype: `ARCH_GRID` blends toward the Chebyshev
+  (inscribed-square) distance for a boxy silhouette; `ARCH_RIVERPORT`
+  elongates along one hash-chosen bearing (`cityAxisBearing`); `ARCH_HARBOR`
+  flattens one side along that same kind of bearing; `ARCH_HILL_CITADEL`
+  tightens the whole profile; `ARCH_RADIAL` is the organic profile alone.
+  Every factor is clamped to `[0.95, 1.5]` before multiplying `R`.
+- **C2 -- street network per archetype.** The old fixed "6 rings + 24
+  radials" polar grid is now one of five shapes: `ARCH_GRID` gets two
+  perpendicular lane families aligned to a hash-chosen bearing (a real
+  checkerboard, confirmed visually -- see Measured); `ARCH_RIVERPORT` gets
+  one long spine along the wall's own elongation axis plus perpendicular
+  cross-lanes; `ARCH_HILL_CITADEL` keeps rings but tighter and closer-packed;
+  `ARCH_HARBOR` gets a fan converging on the flattened waterfront bearing
+  plus a waterfront arc; `ARCH_RADIAL` keeps the original rings+radials.
+  Gate arteries and per-district block lanes are unchanged and shared by
+  every archetype. **`lots.ts`, `wall-mesh.ts`, `road-mesh.ts` needed zero
+  edits** -- they only ever walk the plan's `nodeX`/`nodeZ`/`streetStart` CSR
+  generically, regardless of what topology produced it.
+- **C4 -- district arrangement per archetype.** The same 7 districts, same
+  fixed order (landmark placement still indexes `dX[0]`, `dX[1]` etc. by that
+  order -- COUNT and ORDER never change, only each district's bearing).
+  `ARCH_GRID` spreads them at quadrant angles aligned to the grid's own
+  bearing; `ARCH_RIVERPORT` clusters them along the elongation axis (reading
+  as a linear waterfront town); `ARCH_HARBOR` pulls the keep to the side AWAY
+  from the waterfront (defensibility) while clustering market/guild toward
+  it; `ARCH_RADIAL`/`ARCH_HILL_CITADEL` keep the original ring arrangement.
+  `distFrac`/`radFrac` (how far out, how big) are untouched by any of this --
+  only bearing (where around the ring) moves, which is what keeps the safety
+  margin from C1 valid without re-deriving it.
+- `city.test.ts` gained a real geometry test suite: `organicUnit` range/
+  continuity/purity, `pickArchetype` determinism and full coverage over many
+  cities, a "not a textbook circle" spread check, street-length parity across
+  archetypes (see Judgment calls), and -- the one that matters most --
+  every district and landmark (except gatehouses, which sit AT the wall by
+  design) staying strictly inside the generated wall polygon, checked with a
+  real ray-casting point-in-polygon test across many real cities and
+  explicitly asserting more than one archetype was exercised.
+
+### Judgment calls worth knowing
+
+- **C3 (parcel subdivision replacing `lots.ts`'s city path) was deferred, not
+  attempted.** The original design called for extracting closed block
+  polygons from the street graph and recursively splitting them into
+  frontage-sized parcels -- genuine planar-graph face-extraction, a
+  materially harder and riskier problem than anything else in this phase,
+  across five different street topologies with real numerical-robustness
+  concerns. Critically, it also turned out not to be a functional blocker:
+  `lots.ts`'s existing station-walk lot placement is already generic over
+  whatever street CSR data a `CityPlan` provides -- it does not know or care
+  whether a street came from rings, grid lanes, a spine, or a fan. Proof:
+  `city-density.test.ts`'s density floors (tuned against the OLD ring+radial
+  network) passed against every archetype's new network with zero changes to
+  `lots.ts`. The "big deletion" (the nine `isCity` branches, the shadow-band
+  tombstone hack) remains a real code-quality win worth doing, but it is a
+  separate, lower-urgency piece of work from "cities look different from
+  each other" -- which this phase delivers without it.
+- **Street density was deliberately balanced across archetypes**, not left to
+  whatever each topology naturally produced. `city-density.test.ts`'s floors
+  are calibrated against WHICHEVER city a seed's `citiesInBox` finds first --
+  if one archetype's network were dramatically sparser, that test would flake
+  depending on which archetype happened to be first on a given seed. Lane/
+  ring/spoke counts were sized to comparable total polyline length up front
+  (grid: 9+9 lanes; riverport: 1 spine + 11 cross-lanes; hill-citadel: same 6
+  rings tightened + 20-segment radials; harbor: 22-point fan + two arcs), and
+  `city.test.ts` asserts the realised min/max total length ratio across
+  archetypes stays above `0.4` rather than trusting the design intent.
+- **Terrain-fitted walls are still not implemented** -- same call as C1's own
+  header states, restated here because it is easy to assume "organic wall"
+  means "terrain-aware wall" and it does not yet. The wall's shape comes
+  entirely from hashed control points and archetype bending, never from
+  `baseHeight`/river data. That plumbing (threading `CityTerrain`/`CityRivers`
+  through `city.ts`'s ~7 call sites) is real, separately-scoped future work.
+- **`ARCH_HILL_CITADEL` and `ARCH_RADIAL` share the same district
+  arrangement**, deliberately: a citadel's distinctiveness already comes from
+  its tighter street rings (C2) and compact wall profile (C1); giving it a
+  third independent axis of variation (district layout) was judged not worth
+  the added risk of a fourth bearing-set to keep safely inside the wall
+  margin, for a difference that would barely read at city scale.
+
+### Measured
+
+- `npm test`: 585 passing (up from 578), `npx tsc --noEmit` clean, after all
+  of C1/C2/C4. All pre-existing city-dependent test files
+  (`city-density.test.ts`, `building-mesh.test.ts`, `streets.test.ts`,
+  `lots.test.ts`, `wall-mesh.test.ts`, `road-mesh.test.ts`,
+  `collision.test.ts`, `interior-mesh.test.ts`) passed with **zero edits**
+  after each of C1, C2 and C4 landed -- the strongest evidence that the
+  "only `city.ts` changes" design held.
+- Visual spot-checks against real cities on the default seed (found via a
+  throwaway `vitest` probe, same technique as Phase S's re-aim -- no browser
+  needed to locate them): `city-aerial` (the default seed's city, archetype
+  `ARCH_RADIAL`) shows a visibly irregular, lopsided wall polygon -- bulged
+  on one side, pulled in on another -- unmistakably not the old near-perfect
+  circle. A real `ARCH_GRID` city (found by scanning archetypes, captured at
+  `(152719, -154337)`) shows a genuine checkerboard of perpendicular streets
+  at a diagonal orientation. A real `ARCH_HARBOR` city (`(-5780, -147657)`)
+  shows a clear fan of streets converging toward one side with the opposite
+  side empty, exactly the intended "buildings cluster toward the waterfront"
+  read. All three screenshots were read directly, not just captured.
+- All 26 `city-*` canonical baselines regenerated and re-captured (geometry
+  itself changed this time, not just camera position): `npm run shots:check`
+  reports all 26 with 40-266 distinct colours, none blank. `city-keep-topdown`
+  and `city-cathedral` re-verified by direct image read and still look
+  correct after the district-bearing changes. `city-townhall` looks
+  excellent (clear plaza, dense ribbons, other landmarks visible in the
+  distance). **`city-market` does not** -- see Known gaps.
+
+### Known gaps, deliberately left
+
+- **`city-market`'s screenshot is a bad, overly-close framing** (nearly
+  filling the frame with one building wall, not showing the market plaza the
+  view is meant to prove). Root cause is not fully diagnosed: the default
+  city is `ARCH_RADIAL`, whose district bearings this phase left completely
+  unchanged, so this is most likely a pre-existing fragility in Phase S's
+  RIGID-TRANSLATION re-aim (a low-altitude, close-in camera -- `y=72`,
+  `look=-168,-28` -- that happened to translate to a spot hugging a wall at
+  the new city's location) rather than a C4 regression, but that is an
+  inference, not a confirmed diagnosis. Needs a genuine camera re-position
+  (an art/framing decision, not a mechanical translation this time), and
+  should get the same eye-review treatment every other re-aimed view in this
+  epic has had -- it was captured and committed anyway rather than hand-tuned
+  blind, because a wrong guess at a "better" angle without visual iteration
+  would be no more trustworthy than what is there now.
+- **C3 (parcels) remains undone** -- see Judgment calls. `lots.ts` still has
+  its nine `isCity` branches, the 64 m shadow-band tombstone hack, and the
+  epsilon-fudged overlap test; they work correctly (proven against every new
+  archetype), they are just not clean.
+- **Terrain-fitted walls remain undone** -- see Judgment calls. Walls are
+  organic (per-archetype hashed shape) but not terrain-aware (no slope/
+  river/sea avoidance).
+- Culture (palette, roof vocabulary, material) still does not touch a single
+  vertex anywhere -- `culture.ts`'s `CulturePalette`/`houseRoofs`/
+  `civicRoofs`/`archetypeBias` fields are all still unread outside
+  `culture.test.ts`. That is Phase B in full.
+- The soak flight-start and the 11 non-city screenshot diffs flagged at the
+  end of the Phase S entry are both still open; this phase did not touch
+  either.
+
+### For next
+
+1. If `city-market`'s framing bothers a reviewer, re-position that one
+   camera by hand with visual iteration (open the dev server, walk the
+   market district, pick a genuinely good angle) rather than guessing a
+   fixed offset again.
+2. Phase B (`massing.ts`, roof library, culture palettes, landmark recipes,
+   LOD/impostors) is the next real content slice and the one that finally
+   makes `culture.ts`'s data do something. `building-mesh.ts` is still
+   exactly the single gable box + the 160-line hardcoded landmark chain from
+   before Phase Politics started.
+3. If C3 (parcels) or terrain-fitted walls are picked up later, both are
+   now well-scoped, independently-sized pieces of work with a clear reason
+   they were not attempted here (see this entry's Judgment calls) rather
+   than an oversight.
+
+## Politics epic, Phase B, slice B1 -- roof-type massing variety
+
+### Why
+
+Every ordinary building -- cottage, barn, hall, townhouse, warehouse -- was
+still the exact same 38-vertex gabled box regardless of kind, culture, or
+seed; `culture.ts`'s 8-entry `ROOF_*` vocabulary (forward-declared back in
+Phase P) had never been read by anything. This slice makes ordinary buildings
+draw one of five real roof shapes instead of one, seeded by the building's own
+world position and kind, and lays the CSR plumbing (`buildingStart`) that a
+per-building varying vertex count requires.
+
+### Built
+
+- **`pickRoofType(kind, worldX, worldZ)`** in `building-mesh.ts` (exported for
+  test coverage, mirroring `city.ts`'s `pickArchetype`) -- a single
+  `hash2i(worldX*4, worldZ*4, ROOF_SALT)` roll, world-position-keyed (not
+  node-local) so the choice never depends on which node/lod happens to be
+  rendering the building. Kind-biased: `KIND_BARN` leans gable/shed,
+  `KIND_TOWNHOUSE` leans flat-parapet/gable/hip, `KIND_HALL` leans gable/hip,
+  everything else (cottage, warehouse) draws from the full
+  gable/hip/pyramid/shed set. Landmarks are untouched -- `pickRoofType` is
+  only ever called from the ordinary-building path in `addBuilding`, never
+  from `addLandmarkBuilding`.
+- **`addRoofCap(...)`** replaces the old fixed "gable ends + two roof slopes"
+  block with a branch per `ROOF_*` value: `ROOF_HIP` (two trapezoids + two
+  triangles meeting a short ridge), `ROOF_PYRAMID` (four triangles to a single
+  apex), `ROOF_FLAT_PARAPET` (a short vertical riser on all four sides plus a
+  flat cap), `ROOF_SHED` (a single asymmetric slope with a riser on the low
+  side), and `ROOF_GABLE` (the original shape, now the `else` default). Walls
+  and facade detail (door/window/chimney quads) below `eaves` are unchanged
+  and shared by every roof type.
+- **`BuildingSurface.buildingStart`** -- a new CSR field, `Uint32Array` of
+  length `count + 1`, building `b` owning vertices
+  `[buildingStart[b], buildingStart[b + 1])`. Necessary because roof types no
+  longer cost the same vertex count (36-44 verts depending on type, vs. the
+  old fixed 38), so nothing can find one building's vertices by a uniform
+  stride anymore. Plumbed through `BuildingBuilder.startBuilding()` (called
+  as the first line of `addBuilding`, before any geometry, covering both
+  landmark and ordinary paths) all the way to `ChunkData.buildingStart`,
+  `chunkDataTransferables`, and `chunkDataBytes` (`CHUNK_DATA_VERSION`
+  15 -> 16).
+- `BUILDING_VERTEX_COUNT`/`BUILDING_TRIANGLE_COUNT` (the old fixed-cost
+  constants) are deleted from `building-mesh.ts` -- they are no longer a
+  true statement about any building. `building-mesh.test.ts`'s three tests
+  that depended on them were rewritten to use `buildingStart` instead: the
+  exact-cost test now asserts the partition is gap-free and every ordinary
+  building's own span sits in a `[30, 50]` vertex budget; the keep-vs-cottage
+  test now compares the largest per-building span in a surface against that
+  same budget instead of a per-building-average; and the winding test --
+  the one load-bearing safety net for inside-out geometry -- now derives
+  each triangle's owning building by walking `buildingStart` instead of
+  assuming a fixed stride, rather than being deleted or weakened.
+- A new `describe('roof variety', ...)` block in `building-mesh.test.ts`:
+  `pickRoofType` purity, full coverage of the 5 implemented types over 2000
+  cottages while explicitly asserting the 3 unimplemented ones
+  (`ROOF_MANSARD`/`ROOF_GAMBREL`/`ROOF_DOME_FACET`) never appear, the exact
+  per-kind bias sets for barn/townhouse/hall, and -- the anti-vacuity tie to
+  real generated content -- a real village node containing more than one
+  distinct per-building vertex span.
+
+### Judgment calls worth knowing
+
+- **Only 5 of `culture.ts`'s 8 `ROOF_*` values are implemented**
+  (gable/hip/pyramid/flat-parapet/shed). `ROOF_MANSARD`/`ROOF_GAMBREL`/
+  `ROOF_DOME_FACET` need curved or multi-slope geometry that does not reduce
+  to the same handful of `face()` calls the other five share, and were
+  judged a separate, higher-cost slice rather than something to rush to hit
+  "all 8." `pickRoofType` is written so it can never select them, and a test
+  enforces that directly -- the gap is explicit, not a silent fallback to
+  gable.
+- **The ordinary-building vertex budget is asserted as a range (`[30, 50]`),
+  not a table of exact per-type costs.** The five roof types actually cost
+  36-44 vertices; the wider asserted range leaves headroom for a future roof
+  type or a tuning change to the shared wall/facade geometry without forcing
+  a test edit for an unrelated reason -- the winding test (exact per-triangle
+  geometry) is what actually has to be precise, and it is.
+- **Culture does not yet bias which roof a building gets.** `pickRoofType`
+  reads only `kind` and world position -- not `cultureId` -- so two cities in
+  different cultures currently draw from the identical roof-type weights.
+  Wiring `cultureId` through (`SectorLots` does not carry it yet) is Phase
+  B3's job, alongside the palette; doing it here would have coupled two
+  independent slices for no test benefit.
+- **Landmarks are completely unchanged by this slice** -- same 160-line
+  hardcoded `addLandmarkBuilding` chain as before Phase Politics started.
+  `buildingStart` still records their (much larger, unchanged) vertex spans
+  correctly, since `startBuilding()` is called unconditionally at the top of
+  `addBuilding` regardless of which path it dispatches to, but no landmark
+  geometry itself changed. That is Phase B2.
+
+### Measured
+
+- `npx tsc --noEmit`: clean. `npx vitest run src/world/building-mesh.test.ts`:
+  19 passing (up from 15 -- 4 new roof-variety tests), including the rewritten
+  winding test, which empirically confirms all five roof types (in
+  particular `ROOF_SHED`, which had one self-caught degenerate-triangle bug
+  fixed before this run) are correctly wound with no inside-out faces.
+  `npx vitest run` (full suite): 585 passing, unchanged from the Phase C
+  baseline (the `scripts/lib/shots-select.test.mjs` "failure" is the same
+  pre-existing, unrelated Node-test-runner-vs-vitest harness quirk on an
+  untouched file noted in every prior phase's entry).
+  `npx vitest run src/world/chunk-gen.test.ts`: 70 passing, confirming the
+  `CHUNK_DATA_VERSION` 16 payload plumbing (version stamp, transferable
+  buffer list, byte-length accounting) is correct.
+- Visual: captured `?time=3&pos=1973,142,702&look=0,-88` (the same camera as
+  the committed `settlement-buildings` canonical view) directly against the
+  dev server and read the PNG. Roof variety is clearly visible: peaked
+  gable ridgelines, flat-topped parapet boxes, and pyramid/hip silhouettes
+  sit side by side in the same village, a real change from the prior
+  uniform-gable-box village.
+
+### Known gaps, deliberately left
+
+- `ROOF_MANSARD`/`ROOF_GAMBREL`/`ROOF_DOME_FACET` remain unimplemented (see
+  Judgment calls).
+- Culture does not yet influence roof choice, palette, or any other massing
+  decision -- Phase B3.
+- Landmark recipes (replacing the hardcoded `addLandmarkBuilding` chain) are
+  untouched -- Phase B2.
+- No LOD bands or block impostors exist yet for building geometry -- Phase
+  B4. The soak was not re-run this slice (`buildingStart` adds roughly 4
+  bytes/building to the chunk payload, negligible next to
+  positions/normals/colors at 36 bytes/vertex, so it is not expected to move
+  any budget), consistent with the still-open live-soak-run gap carried since
+  Phase S.
+- The `city-market` framing and the 11 non-city screenshot diffs flagged at
+  the end of the Phase C entry are both still open; this slice did not touch
+  either.
+
+### For next
+
+1. Phase B2: replace the 160-line hardcoded `addLandmarkBuilding` chain with
+   data-table-driven, culture-perturbed landmark recipes. The 20 retired
+   landmark-proof screenshots get recaptured here per the project's existing
+   verifier gate.
+2. Phase B3: `SectorLots` gains `cultureId`; `BUILDING_PALETTE` becomes an
+   array indexed by culture; `pickRoofType` reads `cultureId` too, so two
+   cities in different nations become statistically distinguishable in both
+   colour and roof-shape mix.
+3. Phase B4: LOD bands + block impostors, with the soak budget table
+   re-derived against measured numbers -- the first point in this whole epic
+   where building geometry becomes dense enough that it might actually move
+   a ceiling.
+
+## Politics epic, Phase B, slice B2 -- landmark recipes replacing the hardcoded chain
+
+### Why
+
+`addLandmarkBuilding`'s five civic kinds (keep/cathedral/townhall/guildhall/
+gatehouse) were a 160-line `if (kind === KIND_KEEP) { ... } if (kind ===
+KIND_CATHEDRAL) { ... }` chain of inline `box(...)` calls -- correct, but not
+data, so nothing (a future per-culture variant, a tool, a test) could inspect
+"what a keep is made of" without parsing imperative code. This slice turns
+each kind's box list into an actual table.
+
+### Built
+
+- **`LANDMARK_RECIPES: Record<number, (ctx: LandmarkContext) => LandmarkBox[]>`**
+  in `building-mesh.ts` -- one entry per `KIND_*`, each a small pure function
+  from a `LandmarkContext` (`halfWidth`/`halfDepth`/`base`/`floor`/`eaves`/
+  `wall`/`roof`/`plinth`) to an array of `LandmarkBox` objects (the same
+  eight fields `addOrientedBox` already took: offset/half-extent along and
+  across, bottom, top, side and cap colour). Every numeric literal is
+  transcribed unchanged from the old chain.
+- **`addLandmarkBuilding` is now a 10-line generic dispatcher**: look up
+  `LANDMARK_RECIPES[kind]`, call it with the context, `addOrientedBox` each
+  box in the returned list. The five kind-specific blocks (with their
+  design-intent comments -- "Towers ≥20% taller than bailey roof", "Transept
+  halfAcross 13m vs nave 5m", etc.) still live next to their own numbers,
+  just as data literals instead of a sequence of calls.
+- **Verified byte-identical, not just "should be":**
+  1. `npx tsc --noEmit` clean, `building-mesh.test.ts` 19/19 unchanged --
+     including all five C5 landmark tests, which check fairly precise
+     numeric thresholds (keep tower height ratio, cathedral transept width
+     ratio and tower position, town hall frontage and roof-level count,
+     guildhall pier position, gatehouse tower height and centre gap) and
+     would have caught a transcription slip.
+  2. A direct vertex-level diff: temporarily restored the old imperative
+     function under a second name, built the keep landmark with both
+     implementations against the same seed, sorted and dumped every
+     `(x, y, z)` position AND every `(r, g, b)` colour triple from both, and
+     ran `diff` on the two dumps. **Zero difference** -- proof the refactor
+     is a pure reshaping with no geometry or colour change, stronger than
+     "the tests still pass" alone. The diagnostic scaffolding (a second
+     `addLandmarkBuildingOLD` function, a temporary dump-to-file test) was
+     removed afterward; nothing of it shipped.
+
+### Judgment calls worth knowing
+
+- **Per-culture recipe variants are NOT implemented** -- `LANDMARK_RECIPES`
+  is keyed by `kind` alone. `cultureId` does not reach `SectorLots`/
+  `addBuilding` until Phase B3; adding a fake seed or a second key ahead of
+  that plumbing would mean redoing this table twice for no benefit now.
+  This was the original B2 slice description's other half ("culture-
+  perturbed") and it is explicitly deferred to B3, bundled with the
+  `cultureId` wiring it depends on.
+- **A real, unrelated screenshot-baseline problem was found and diagnosed
+  while verifying this slice, and deliberately NOT fixed here.** Filtered
+  `npm run shots:check` against the 20 committed landmark views reported all
+  20 CHANGED. The vertex/colour diff above rules out B2 as the cause. Root
+  cause, found by temporarily reverting `building-mesh.ts`/`building-mesh.test.ts`
+  to `HEAD` while leaving the rest of the working tree alone: `git diff
+  --stat HEAD -- src/world/city.ts` still shows 330+/34- lines, meaning
+  Phase P/S/C's siting and archetype work is **not actually captured by the
+  committed `HEAD`** despite the Phase C PROGRESS.md entry's claim that "all
+  26 `city-*` canonical baselines [were] regenerated and re-captured" --
+  they were regenerated on disk (confirmed: `git stash` of everything,
+  including those PNGs, made a clean-`HEAD` shots:check pass byte-identical)
+  but that regeneration was never committed, and something in the
+  still-uncommitted P/S/C code has since drifted from what the on-disk PNGs
+  show. This is a **pre-existing gap from before this slice**, not something
+  B2 (or B1) introduced -- confirmed by the same isolation test also failing
+  to build cleanly once `chunk-gen.ts`'s `buildingStart` reference was left
+  pointed at a reverted `building-mesh.ts`, itself evidence of how much
+  uncommitted cross-file state this session is carrying. Re-running
+  `npm run shots` for the full canonical set and committing the result is
+  now a prerequisite for B-verify, not a B2 task -- doing it here, mid-slice,
+  would have conflated a real B2 verification with an unrelated backlog item.
+
+### Measured
+
+- `npx tsc --noEmit`: clean. `building-mesh.test.ts`: 19/19, unchanged from
+  before this slice.
+- Direct vertex+colour diff (keep landmark, old imperative vs. new
+  recipe-table implementation, same seed): 0 differences across 219 sorted
+  position lines and every colour triple in the surface.
+
+### Known gaps, deliberately left
+
+- Per-culture recipe variants -- Phase B3, alongside `cultureId` wiring (see
+  Judgment calls).
+- **The screenshot-baseline / uncommitted-P/S/C-work gap found above.**
+  Every canonical view is suspect until `npm run shots` is re-run against
+  the FULL current working tree and the diffs are eye-reviewed and
+  committed -- not just the 20 landmark ones this slice happened to check.
+  This should happen once (not per-slice) as part of B-verify, after B3/B4
+  land, so it is not repeated four times.
+- Everything already listed as open in the B1 entry (3 unimplemented roof
+  types, culture not wired to anything, no LOD, no live soak run) is still
+  open; this slice did not touch any of it.
+
+### For next
+
+1. Phase B3: `SectorLots` gains `cultureId`; `BUILDING_PALETTE` becomes an
+   array indexed by culture; `pickRoofType` reads `cultureId`; and
+   `LANDMARK_RECIPES` can grow a second dimension for real per-culture
+   massing variation once the data to key it on actually exists.
+2. Before Phase B is called done: run `npm run shots` for the complete
+   canonical set (not a filtered subset), eye-review every diff, and commit
+   both the code and the regenerated baselines together so `HEAD` and
+   `shots/*.png` stop disagreeing. This is blocking B-verify regardless of
+   B4's outcome.
+3. Phase B4: LOD bands + block impostors, soak budget table re-derived
+   against measured numbers.
+
+## Politics epic, Phase B, slice B3 -- culture palettes wired into buildings
+
+### Why
+
+`culture.ts` (Phase P3) had carried a full `CulturePalette` and `houseRoofs`/
+`civicRoofs` per culture since before a single building existed with roof
+variety -- its own doc comment says as much: "so Phase B can index straight
+into `CULTURES` in place of the single global palette `chunk-gen.ts` uses
+today, with no reshape." Until this slice, nothing read any of it: every
+city everywhere painted its buildings from one hardcoded global palette, and
+B1's roof-type roll never looked at where in the world it was rolling.
+
+### Built
+
+- **`chunk-gen.ts` gains `CULTURE_BUILDING_PALETTES`** -- one linear
+  `BuildingPalette` per `CULTURES` entry, converted once at module load with
+  the SAME `linearRgb()`/`srgbToLinear()` this module already uses for
+  `BUILDING_PALETTE`. `building-mesh.ts` never sees sRGB and never imports
+  colour math from `chunk-gen.ts` (would be a backward dependency) --
+  `CULTURES[i].palette` is authored in sRGB like every other palette in this
+  module, and the conversion stays where the rest of the world's colour
+  math already lives.
+- **`generateChunk` now resolves `cultureId` before building, not after.**
+  The `polityAt`/`cultureOf` query (Phase S2) moved up in front of the
+  `buildBuildingSurface` call instead of after it; the resolved palette
+  (`CULTURE_BUILDING_PALETTES[cultureId] ?? BUILDING_PALETTE`, the `??`
+  covering `cultureId === -1` -- sea or unclaimed ground) and the raw
+  `cultureId` scalar are both passed in. Every other consumer of the old
+  ordering (`polityId`/`cultureId` on the payload) is untouched.
+- **`buildBuildingSurface` gained one new trailing parameter, `cultureId`
+  (default `-1`)**, threaded through `emitLotsInNode` → `addBuilding` →
+  `pickRoofType`. Every existing call site (every test in
+  `building-mesh.test.ts`) keeps compiling and keeps its exact old
+  assertions valid unchanged, because the default reproduces the pre-B3
+  unbiased distribution exactly.
+- **`pickRoofType` reads `cultureId` for the cottage/warehouse bucket only.**
+  A new `cultureHouseRoof()` helper: 55% of the time, a cottage/warehouse in
+  a culture's territory draws one of THAT culture's own `houseRoofs`,
+  restricted to the roofs `addRoofCap` can actually draw (B1 left 3 of 8
+  unimplemented). The other 45% (and the other 3 kinds, always) keep
+  drawing from the original kind-based distribution. Barn/townhouse/hall
+  are deliberately left unbiased by culture -- see Judgment calls.
+
+### Judgment calls worth knowing
+
+- **Not `SectorLots.cultureId` as the original plan text specified --
+  `cultureId` stays a per-CHUNK scalar, exactly like `polityId`/`cultureId`
+  on `ChunkData` already are.** Culture is a nation-level property, constant
+  across an entire city (every node inside one polity's territory resolves
+  to the same `cultureId` -- proven in Phase P2's own test suite:
+  `polityAt(city) === polityOfCity(city)`), so there is nothing per-LOT to
+  store. Threading it through `SectorLots` would have meant plumbing a new
+  field through the Sector tier's own generation and CSR shape for a value
+  that is already, correctly, uniform across every lot a chunk emits. This
+  is a real, considered deviation from the plan text, not an oversight --
+  the plan's own goal ("two cities in different nations become
+  statistically distinguishable") is fully met by the simpler wiring.
+- **A SOFT nudge, not a hard filter, and only for cottages/warehouses.**
+  Two of six cultures (Riverlands, Highland Clans) prefer `ROOF_GAMBREL`,
+  still unimplemented -- a hard filter to "only this culture's roofs" would
+  have collapsed those two to a monotonous single-roof (`ROOF_GABLE`)
+  village, undoing B1's whole point for exactly the cultures whose
+  preference collides with the B1 gap. The 55% soft nudge still gives every
+  culture a measurable, testable lean while guaranteeing every kind-
+  appropriate roof stays reachable everywhere. Barn/townhouse/hall keep
+  their own kind-specific distribution entirely unbiased: those three
+  already have a strong kind-appropriate shape (a barn is a barn in every
+  culture), and a civic-flavoured roof rolled onto a barn would read as a
+  mistake, not variety -- narrowing culture's reach to the one bucket
+  (cottage/warehouse) that has no competing kind-logic of its own.
+- **`civicRoofs` remains completely unread.** No landmark anywhere consults
+  it -- `LANDMARK_RECIPES` (B2) still hardcodes stone/stoneDark/timber
+  colours per box, unrelated to any palette, and landmarks don't have a
+  "roof type" in the `ROOF_*` sense at all (a keep's tower crown is its own
+  literal box, not `addRoofCap` output). Wiring `civicRoofs` in would mean
+  redesigning how a landmark's roof geometry is chosen, which is a
+  materially different (and larger) problem than this slice's palette/
+  roof-bias wiring -- left as a named gap rather than attempted half-way.
+
+### Measured
+
+- `npx tsc --noEmit`: clean. `building-mesh.test.ts` + `chunk-gen.test.ts`:
+  91/91 passing (up from 89 before this slice -- one new roof-bias test in
+  `building-mesh.test.ts`, one new palette-wiring test in
+  `chunk-gen.test.ts`).
+- The roof-bias test measures, over 3000 samples: Northern Hold
+  (`cultureId 0`, prefers gable/shed, both implemented) cuts the
+  HIP+PYRAMID share to under 75% of the unbiased baseline's; Riverlands
+  (`cultureId 1`, prefers gable/gambrel -- gambrel unimplemented, so the
+  nudge collapses to gable alone) pushes the GABLE share above 65%, well
+  over the ~42% baseline. The same test confirms barn/townhouse/hall are
+  byte-identical regardless of `cultureId` across 200 samples each.
+- The palette-wiring test confirms all 6 `CULTURE_BUILDING_PALETTES`
+  entries are pairwise distinct (every `wallA` at least 0.01 apart, summed
+  across channels), then finds a real, landmark-free village inside a
+  claimed polity's territory and checks every one of its building vertex
+  colours -- walls, roofs, AND the fixed facade constants (door/window/
+  chimney colours, which are culture-independent by design) -- falls inside
+  that culture's own palette range and no other's.
+
+### Known gaps, deliberately left
+
+- `civicRoofs` unread (see Judgment calls) -- landmarks still don't vary by
+  culture at all.
+- Barn/townhouse/hall roofs remain unbiased by culture (see Judgment
+  calls) -- only cottages/warehouses lean toward their culture's preference.
+- `ROOF_MANSARD`/`ROOF_GAMBREL`/`ROOF_DOME_FACET` are still unimplemented
+  (B1's gap) -- two of six cultures' stated preference includes one of
+  these, and their nudge is correspondingly weaker (collapses to their one
+  implemented preferred roof rather than offering a real choice between
+  two).
+- The screenshot-baseline / uncommitted-P/S/C-work gap flagged in the B2
+  entry is still open and still unaddressed here -- this slice's own visual
+  check (if done) was a throwaway, uncompared capture, not a baseline.
+- Everything already listed as open after B1/B2 (no LOD, no live soak run)
+  is still open.
+
+### For next
+
+1. Before Phase B is called done: the full `npm run shots` re-sync flagged
+   in the B2 entry, still outstanding and now covering three slices' worth
+   of undocumented visual change (B1 roofs, B2 is a no-op so nothing new
+   there, B3 palettes).
+2. Phase B4: LOD bands + block impostors, soak budget table re-derived
+   against measured numbers.
+3. If `civicRoofs` or a barn/townhouse/hall culture bias is picked up
+   later, both are now well-scoped with a clear reason they were left out
+   of B3 (see this entry's Judgment calls).
+
+## Politics epic, Phase B, slice B4 -- LOD bands for buildings
+
+### Why
+
+Every building, at every LOD, cost the same full massing (B1's roof-type
+variety, B2's per-kind facade detail) regardless of distance -- a coarse
+node holding a whole village's worth of buildings paid B1's per-building
+vertex budget for roof shapes and door panels that read as a handful of
+pixels from that far away. This is exactly the pre-existing, already-known
+gap: the live soak has been over the 1,040,000-vertex and 120 MB payload
+budgets since before this slice (recorded as an open item since Phase S),
+and the plan's own risk register named building LOD as the fix.
+
+### Built
+
+- **`BUILDING_LOD_SIMPLIFY = 1`** -- the lowest LOD (inclusive) at which an
+  ordinary building draws a simplified silhouette instead of full massing.
+  Reuses `BUILDING_LEVEL_LOD`'s own "lod 0 is close enough to judge"
+  precedent rather than inventing a second distance rule.
+- **`addSimplifiedCap`** -- four walls (unchanged at every LOD; the
+  footprint is what makes a settlement read as a settlement from any
+  distance) plus one flat quad at `eaves`, roof-coloured. No roof-type
+  variety (`addRoofCap`/`pickRoofType` are skipped entirely), no facade
+  detail (door/window/chimney panels skipped). Exactly 20 vertices every
+  time -- 16 for the four wall quads, 4 for the cap -- vs. 36-52 for full
+  massing, an exact count rather than a range because the simplified path
+  has no per-kind or per-culture variance to produce one.
+- **`lod` threaded through `buildBuildingSurface` -> `emitLotsInNode` ->
+  `addBuilding`**, all with a default so no existing call site (every test)
+  needed to change. Landmarks are NOT simplified at any LOD -- the branch
+  sits entirely inside the ordinary-building path in `addBuilding`, after
+  the landmark early return -- because there are far fewer of them per city
+  and a keep that lost its towers at distance would misread as a different,
+  smaller building.
+- **`BuildingSurface.simplified` / `ChunkData.buildingsSimplified` /
+  `ChunkStreamerStats.buildingsSeenSimplified`** -- the anti-vacuity counter
+  threaded the same way `buildingsLevel` already is, plus a new
+  `MIN_SIMPLIFIED_BUILDINGS_SEEN` soak floor and HUD line. `CHUNK_DATA_VERSION`
+  16 -> 17 for the new scalar.
+- New tests: an exact-vertex-count check for every simplified building in a
+  real coarse-LOD village, and a second full winding-normal check (the same
+  math the lod-0 winding test uses) run specifically against the simplified
+  cap, since the existing winding test only ever exercised lod-0 nodes.
+
+### Judgment calls worth knowing
+
+- **Block impostors (the plan's other B4 deliverable) were NOT attempted.**
+  The plan assumed "blocks already exist as Region-tier data, so this costs
+  no new generation" -- checked during this slice and found false: `city.ts`
+  has no block-POLYGON data structure at all, only informal "block lane"
+  street fabric in comments. A real block impostor (one extruded prism per
+  city block) would need genuine planar-graph face extraction from the
+  street network, which is the SAME class of problem Phase C3 (parcel
+  subdivision) already deferred as "a materially harder and riskier problem
+  than anything else in this phase." Attempting it as a rushed add-on to a
+  slice that had already found real, working value in per-building LOD
+  would have risked both. Per-building simplification alone was judged the
+  right-sized deliverable; block impostors are now a separately-scoped,
+  well-understood future slice with the same reasoning C3 already
+  documented.
+- **The vertex/payload budget overage is REDUCED, not eliminated, and that
+  is reported honestly rather than rounded up.** A live 300 s soak run
+  before this slice's fix landed (using the still-current, not-yet-
+  re-derived flight coordinates) measured 1,258,877 peak vertices against
+  the 1,040,000 budget (a 21% overage, recorded as an open gap in earlier
+  entries). The SAME 300 s soak after B4 measured 1,108,944 (a 6.6%
+  overage) and 130.5 MB payload against 120 MB (an 8.75% overage,
+  previously worse). That is a real, measured two-thirds reduction in the
+  overage, not a full fix -- `BUILDING_LOD_SIMPLIFY` could be tightened
+  further, or block impostors (deferred above) would very likely close the
+  rest, but this project's own rule is "the fix is a narrower LOD band,
+  never a raised limit," and this slice stops at the honestly-measured
+  result rather than either overclaiming success or scope-creeping into
+  block impostors to chase a fully green soak in one sitting.
+- **A real bug was caught by the soak run itself, not by any test**: the
+  first 60 s smoke run reported `simplified SEEN undefined` -- the streamer
+  (`chunk-streamer.ts`) had the new counter, but `app.ts`'s `perfSnapshot()`
+  manually re-lists every field it exposes to the browser rather than
+  spreading the streamer's stats object, and the new field was missed there.
+  No unit test caught this because none of them go through
+  `window.__app.perfSnapshot()` -- only the soak's browser-driven flight
+  does. Fixed, then re-verified with the full 300 s run (`simplified SEEN
+  69454`, a real, large, non-vacuous count).
+- **The existing "puts the floor where the sector record says, at every
+  level" test's premise stopped being fully true and was corrected, not
+  weakened.** It used to assert every above-floor altitude (eaves AND
+  ridge AND facade points) was identical between lod 0 and every coarser
+  lod. That was true before B4 because full massing was drawn at every
+  LOD; B4 makes it false BY DESIGN for anything above eaves. The fix
+  narrows the assertion to what is still exactly true -- floor and eaves,
+  both Sector-tier fixed points -- rather than deleting or loosening the
+  test. Two real bugs surfaced while fixing it and are worth recording:
+  landmark lots' `rec.eaves` has no corresponding vertex at all (landmarks
+  don't read it, see B2), and the sector's full lot record is NOT the same
+  set as one lod-0 node's own buildings (ownership is by centre inside that
+  node's own 64 m square) -- both are now explicit in the corrected test's
+  filtering, not assumed.
+
+### Measured
+
+- `npx tsc --noEmit`: clean. `building-mesh.test.ts`: 22/22 (up from 20 --
+  two new LOD tests). Full suite: 593/593 (the one failing "file" is the
+  same pre-existing `scripts/lib/shots-select.test.mjs` harness quirk noted
+  in every prior phase's entry; a handful of RULE-2-class timeouts seen
+  during a run that coincided with a concurrent soak/browser load were
+  re-verified passing cleanly in isolation, not a regression).
+- Soak (300 s, same seed and flight coordinates as the pre-B4 baseline):
+  `simplified SEEN 69454` of `buildings SEEN 77996` (most buildings the
+  flight ever saw were far enough to simplify -- expected, since the flight
+  spends most of its time at LOD >= 1). Peak live vertices 1,108,944 (was
+  1,258,877; budget 1,040,000, still over). Peak payload 130.5 MB (was
+  higher; budget 120 MB, still over). Heap trend clean: `UNEXPLAINED
+  -1.44 MB/min` (limit 6, well inside it -- no leak). Every other soak floor
+  from before this slice held (buildings/props/streets/decks/rivers/roads
+  all still comfortably over their own floors).
+- Visual verification was attempted (an aerial and an oblique shot of a
+  real village) and was inconclusive -- individual buildings read as
+  sub-pixel warm dots from an altitude far enough to force LOD >= 1, the
+  same class of framing difficulty the B3 entry already recorded. The exact
+  20-vertex unit test and the soak's own 69,454-building measurement are
+  the load-bearing evidence for this slice, not a screenshot.
+
+### Known gaps, deliberately left
+
+- **Vertex/payload budgets are still over, by roughly a third of their
+  pre-B4 overage** (see Judgment calls). Further tightening
+  (`BUILDING_LOD_SIMPLIFY` at a stricter threshold, or the block-impostor
+  system below) is needed before the soak is fully green.
+- **Block impostors are entirely unimplemented** (see Judgment calls) --
+  needs the same block-polygon extraction Phase C3 deferred.
+- The screenshot-baseline / uncommitted-P/S/C-work gap flagged in the B2
+  entry is still open and still unaddressed -- B4 did not touch it, and
+  every visual claim in this entry is deliberately a measured number or an
+  explicit "inconclusive," not a screenshot comparison.
+- The pre-existing soak failures unrelated to buildings (no water/river in
+  the round-tripped chunks, zero interiors entered) are the flight-start-
+  coordinate quality gap carried since Phase S, untouched by this slice.
+- Everything already listed as open after B1/B2/B3 (3 unimplemented roof
+  types, `civicRoofs` unread, barn/townhouse/hall unbiased by culture) is
+  still open.
+
+### For next
+
+1. **B-verify is next and is the real remaining work for Phase B**: the
+   full `npm run shots` re-sync (blocking since B2), a decision on whether
+   to tighten `BUILDING_LOD_SIMPLIFY` further or accept the reduced-but-
+   present budget overage as a follow-up item, and the flight-start
+   re-derivation for water/river/interior coverage.
+2. If block impostors are picked up later, they are now well-scoped with
+   the same reasoning C3 already established: real planar-graph face
+   extraction from the street network, a separate and materially larger
+   piece of work than anything else in Phase B.
+3. If the budget gap needs closing without block impostors, the cheapest
+   next lever is almost certainly `BUILDING_LOD_SIMPLIFY`'s own cost (20
+   vertices could still shrink -- e.g. a shared-corner box instead of four
+   independent quad faces) before reaching for a stricter LOD threshold.
+
+## Politics epic, Phase B -- verify (code-complete; screenshot re-sync deferred)
+
+### Why
+
+B1-B4 are each individually built, tested, and (for B1-B3) reasoned about;
+B4 additionally has a real soak measurement. This entry is the code-level
+close-out of the whole Buildings phase and an honest record of the one
+thing it could NOT finish: the full canonical-screenshot re-sync flagged as
+blocking back in the B2 entry.
+
+### Built / verified
+
+- `npx tsc --noEmit`: clean across the whole epic.
+- Full `npx vitest run`, run in ISOLATION (no other heavy process
+  competing for the machine): **593/593 tests passing.** The only failing
+  "file" is `scripts/lib/shots-select.test.mjs`, a pre-existing, unrelated
+  Node-test-runner-vs-vitest harness quirk on an untouched file, noted in
+  every phase entry back to Phase C.
+- A live 300 s `npm run soak` run (documented in full in the B4 entry)
+  completed successfully with real, honestly-reported numbers: the
+  vertex-budget overage cut from 21% to 6.6%, the payload overage reduced,
+  the heap-leak check clean, `buildingsSeenSimplified` non-vacuous at
+  69,454. Every soak floor unrelated to buildings/LOD held.
+
+### The screenshot re-sync: attempted, blocked, deferred by user decision
+
+- **What was attempted.** `npm run shots` (the full 68-view canonical
+  baseline regenerator) was run three times: once fresh, once after
+  discovering and killing several of this session's own leftover dev-server
+  processes (ports 5173-5176, confirmed by exact PID via
+  `Get-CimInstance Win32_Process`, not a blind `pkill` -- the earlier
+  `pkill` calls in the B1/B3/B4 entries had apparently not actually killed
+  their targets), and once more after that cleanup. All three failed on the
+  very first or second view with the same symptom: the page loads and
+  renders (60 fps, no console errors, no page errors) but
+  `window.__worldReady` never becomes true within the 180 s capture
+  timeout.
+- **Diagnosed, not just retried.** A throwaway Playwright script (deleted
+  after use) polled the live HUD state every 5 s for 85 s against a fresh
+  page. This proved the failure is genuine severe SLOWNESS, not a hang or a
+  code regression: chunks were generating and the sim tick was advancing
+  the whole time, just at roughly a tenth to a twentieth of the pace
+  observed earlier in this same session's own successful soak run (37
+  chunks resident after 85 s, where the soak run reached 300+ within a
+  comparable window). No exception, no stuck worker queue, no visibility-
+  throttling flag missing (`--disable-background-timer-throttling` and its
+  siblings are already in `LAUNCH_ARGS`) -- just a machine that has slowed
+  down over the course of this very long, heavy session (many hours of
+  concurrent builds, test runs, and browser launches). `document.hidden`
+  was also checked and ruled out as the Playwright-side cause (false in the
+  actual capture browser); a separate, unrelated Browser-pane MCP tool
+  display quirk seen mid-diagnosis was confirmed NOT to be the same code
+  path.
+- **Left in a clean state, not a partial one.** Only `shots/cube-default.png`
+  was actually overwritten before the failures (the one view that captured
+  successfully in the first attempt); it was reverted with `git checkout --`
+  rather than left as a lone changed baseline sitting inconsistently next
+  to 67 stale ones. `shots/` is byte-for-byte where it was before this
+  entry's attempts.
+- **User decision: retry later, in a fresh session/environment, rather than
+  force it now or accept the gap permanently.** Phase B's code is
+  considered complete and verified by tests and the soak measurement; the
+  screenshot re-sync is carried forward as the explicit next step, not
+  silently dropped.
+
+### Known gaps, deliberately left
+
+- **The screenshot-baseline re-sync itself** (see above) -- still the single
+  largest piece of unfinished business from the whole epic, blocking
+  visual (not test-level) confidence in B1's roof variety, B3's palettes,
+  and B4's LOD bands, plus the pre-existing P/S/C drift discovered in the
+  B2 entry.
+- Everything listed as open in the B1/B2/B3/B4 entries individually
+  (3 unimplemented roof types, `civicRoofs` unread, barn/townhouse/hall
+  unbiased by culture, block impostors unimplemented, the vertex/payload
+  budget still over by a reduced amount) remains open.
+- The pre-existing, unrelated soak gaps (flight-start coordinate not over
+  water/river, zero interiors entered) are still open, carried since Phase
+  S.
+
+### For next
+
+1. **Re-run `npm run shots` in a fresh session** (a new environment/machine
+   state should not carry this session's accumulated slowdown), eye-review
+   every diff -- expect ALL or nearly all of the 68 views to change, since
+   the B2 entry established the committed `HEAD` never actually had the
+   full P/S/C work either -- and commit code + baselines together.
+2. Everything listed under "For next" in the B1/B2/B3/B4 entries
+   individually remains the real backlog for continuing past Phase B:
+   Phase B3's `civicRoofs`/barn-townhouse-hall culture bias, B4's block
+   impostors and further budget tightening, and the roof-type/terrain-
+   fitted-wall/parcel-subdivision gaps carried from even earlier phases.

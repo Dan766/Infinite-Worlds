@@ -40,6 +40,7 @@ import {
 import { sampleHeight } from './world/height-field';
 import { createWorldCollision } from './world/collision';
 import { InteriorOverlay } from './world/interior-overlay';
+import { WorldMap } from './debug/world-map';
 
 declare global {
   interface Window {
@@ -85,6 +86,7 @@ export class App {
   private readonly loop: Loop;
   private readonly player: PlayerController | null;
   private readonly interiors: InteriorOverlay;
+  private readonly worldMap: WorldMap;
 
   private renderedFrames = 0;
   /**
@@ -156,6 +158,11 @@ export class App {
     this.cube = new CubeScene(this.params.seedHash);
     this.hud = new Hud(hudElement, { visible: this.params.hud });
     this.panel = new DebugPanel({ visible: this.params.panel, title: 'Infinite World' });
+    // Phase Politics P4. Off by default, and deliberately not part of any
+    // canonical screenshot -- see `src/debug/world-map.ts` and `?map=` in
+    // `src/core/params.ts`.
+    this.worldMap = new WorldMap(this.params.seedHash, { visible: this.params.map });
+    document.body.appendChild(this.worldMap.element);
 
     // All world generation happens in workers owned by the streamer; the main
     // thread only builds meshes from the payloads they transfer back.
@@ -212,6 +219,7 @@ export class App {
     this.cube.dispose();
     this.streamer.dispose();
     this.interiors.dispose();
+    this.worldMap.dispose();
     this.renderer.dispose();
   }
 
@@ -225,6 +233,7 @@ export class App {
       time: this.loop.simTime,
       hud: this.hud.visible,
       panel: this.panel.visible,
+      map: this.worldMap.visible,
       wireframe: this.renderer.wireframeEnabled,
     };
   }
@@ -323,6 +332,8 @@ export class App {
       wallTriangles: chunks.wallTriangles,
       wallsSeen: chunks.wallsSeen,
       citiesSeen: chunks.citiesSeen,
+      politiesSeen: chunks.politiesSeen,
+      culturesSeen: chunks.culturesSeen,
       wallDrawCalls: this.wallDrawCalls,
       interiorsEntered: this.interiors.interiorsEntered,
       // Phase 7a. Same trio once more: residency, rasteriser, seating.
@@ -348,6 +359,7 @@ export class App {
       buildingsSeenCathedral: chunks.buildingsSeenCathedral,
       buildingsSeenTownhall: chunks.buildingsSeenTownhall,
       buildingsSeenGatehouse: chunks.buildingsSeenGatehouse,
+      buildingsSeenSimplified: chunks.buildingsSeenSimplified,
       propsSeenPine: chunks.propsSeenPine,
       propsSeenBroadleaf: chunks.propsSeenBroadleaf,
       propsSeenBushRound: chunks.propsSeenBushRound,
@@ -547,6 +559,11 @@ export class App {
       this.rig.camera.position.z,
       this.params.walk,
     );
+    // A couple of milliseconds of budget: enough to finish a 256x256 build
+    // over a few dozen frames, never enough to show up in the frame budget.
+    // A no-op call (hidden, or the current view already fully built) is a
+    // handful of comparisons -- see `WorldMap.update`.
+    this.worldMap.update(this.rig.camera.position.x, this.rig.camera.position.z, 2);
     this.frameTimer.sample(wallDt);
     resetWaterDraws();
     resetRiverDraws();
@@ -647,6 +664,11 @@ export class App {
       HudOrder.misc,
     );
     hud.register('backend', () => this.renderer.backend, HudOrder.misc);
+    hud.register(
+      'polity',
+      () => this.worldMap.labelAt(this.rig.camera.position.x, this.rig.camera.position.z),
+      HudOrder.world,
+    );
   }
 
   private buildPanel(): void {
@@ -669,6 +691,19 @@ export class App {
       'hud',
       () => this.hud.visible,
       (value) => this.hud.setVisible(value),
+    );
+
+    const map = this.panel.folder('World map');
+    map.addToggle(
+      'visible',
+      () => this.worldMap.visible,
+      (value) => this.worldMap.setVisible(value),
+    );
+    map.addNumber(
+      'metres/px',
+      () => this.worldMap.metresPerPixel,
+      (value) => this.worldMap.setScale(value),
+      { min: 32, max: 512, step: 32 },
     );
 
     const share = this.panel.folder('Share');

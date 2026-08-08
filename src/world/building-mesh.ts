@@ -91,6 +91,8 @@ import {
 } from './lots';
 import { cityInfluenceRadius, isCity } from './city';
 import { type RegionRoadField } from './roads';
+import { hash2i } from '../core/hash';
+import { CULTURES, ROOF_FLAT_PARAPET, ROOF_GABLE, ROOF_HIP, ROOF_PYRAMID, ROOF_SHED, type Culture } from './culture';
 
 // ---------------------------------------------------------------------------
 // Tuning
@@ -142,6 +144,25 @@ export const BUILDING_LEVEL_TOLERANCE = 0.75;
 export const BUILDING_LEVEL_LOD = 0;
 
 /**
+ * The lowest LOD (inclusive) at which an ordinary building draws its
+ * simplified silhouette -- four walls and a flat cap, no roof-type variety,
+ * no facade detail -- instead of full massing.
+ *
+ * Phase Politics B4. `lod 0` is the only tier close enough to the camera for
+ * a roof's shape or a door panel to read as anything but a handful of
+ * pixels, and it is the SAME tier `BUILDING_LEVEL_LOD` already treats as
+ * "close enough to measure" -- reusing it here rather than inventing a
+ * second distance judgement. A coarse node (lod >= 1) can hold dozens of
+ * buildings at once (a whole village, or a city's rim sectors), which is
+ * exactly where B1's per-building roof cap and facade panels cost the most
+ * vertices for the least visible return. Landmarks are NOT simplified at any
+ * LOD -- see `addBuilding`'s landmark branch -- there are far fewer of them
+ * per city, and a keep that loses its towers at distance would misread as a
+ * different, smaller kind of building.
+ */
+export const BUILDING_LOD_SIMPLIFY = 1;
+
+/**
  * Hard cap on buildings in one node's submesh.
  *
  * A SAFETY VALVE THAT SHOULD NEVER FIRE, like `DECK_MAX_STATIONS`. The largest
@@ -152,17 +173,6 @@ export const BUILDING_LEVEL_LOD = 0;
  * regenerate byte-identically.
  */
 export const BUILDING_MAX_PER_NODE = 1024;
-
-/** Vertices and triangles one building costs. Exported for the payload maths. */
-/**
- * Vertices and triangles one building costs.
- *
- * Every kind (cottage / barn / hall) lands on the SAME budget: the base gabled
- * box plus exactly two facade quads. Keeping the cost fixed keeps the payload
- * maths and the winding tests load-bearing rather than kind-dependent.
- */
-export const BUILDING_VERTEX_COUNT = 38;
-export const BUILDING_TRIANGLE_COUNT = 18;
 
 /**
  * Metres beyond the node square within which a region is consulted for
@@ -197,9 +207,21 @@ export interface BuildingSurface {
   colors: Float32Array;
   indices: Uint32Array;
   /**
-   * Buildings this node owns. Not derivable from the triangle count -- every
-   * building has the same 18 triangles, so a count of objects is the only thing
-   * that distinguishes "forty houses" from "one enormous one".
+   * CSR vertex-offset boundaries, one entry per building plus a final total
+   * (length `count + 1`) -- building `b` owns vertices
+   * `[buildingStart[b], buildingStart[b + 1])`. Phase Politics B1 made this
+   * load-bearing: every kind used to cost the SAME fixed
+   * `BUILDING_VERTEX_COUNT`/`BUILDING_TRIANGLE_COUNT` (now deleted), so a
+   * uniform stride was enough to find one building's vertices in the shared
+   * buffer. Roof-type variety means two buildings of the same kind can now
+   * cost different vertex counts, so consumers that need per-building
+   * extents (the winding test; a future per-building LOD or pick ray) read
+   * this instead of assuming a stride.
+   */
+  buildingStart: Uint32Array;
+  /**
+   * Buildings this node owns. NOT derivable from the vertex or triangle
+   * count now that roof type varies per building -- see `buildingStart`.
    */
   count: number;
   /**
@@ -225,6 +247,14 @@ export interface BuildingSurface {
   cathedral: number;
   townhall: number;
   gatehouse: number;
+  /**
+   * Of the ordinary (non-landmark) buildings in `count`, how many drew the
+   * `BUILDING_LOD_SIMPLIFY` silhouette instead of full massing. Phase
+   * Politics B4's own anti-vacuity counter: without it, "the LOD branch
+   * exists" and "the LOD branch never actually fires" look identical to
+   * every other check in this file.
+   */
+  simplified: number;
 }
 
 /** The palette a building is painted with, LINEAR rgb. */
@@ -244,6 +274,7 @@ const EMPTY_BUILDINGS: () => BuildingSurface = () => ({
   normals: new Float32Array(0),
   colors: new Float32Array(0),
   indices: new Uint32Array(0),
+  buildingStart: new Uint32Array(0),
   count: 0,
   level: 0,
   cottage: 0,
@@ -256,6 +287,7 @@ const EMPTY_BUILDINGS: () => BuildingSurface = () => ({
   cathedral: 0,
   townhall: 0,
   gatehouse: 0,
+  simplified: 0,
 });
 
 // ---------------------------------------------------------------------------
@@ -280,6 +312,8 @@ class BuildingBuilder {
   readonly cg: number[] = [];
   readonly cb: number[] = [];
   readonly indices: number[] = [];
+  /** CSR vertex-start boundaries -- see `BuildingSurface.buildingStart`. */
+  readonly buildingStart: number[] = [];
   count = 0;
   level = 0;
   cottage = 0;
@@ -292,8 +326,14 @@ class BuildingBuilder {
   cathedral = 0;
   townhall = 0;
   gatehouse = 0;
+  simplified = 0;
   /** See `BUILDING_LEVEL_LOD`. False on a coarse node, where the number would lie. */
   countLevel = true;
+
+  /** Mark the start of one new building's vertices. Call BEFORE emitting any of its geometry. */
+  startBuilding(): void {
+    this.buildingStart.push(this.px.length);
+  }
 
   vertex(
     x: number,
@@ -318,12 +358,12 @@ class BuildingBuilder {
   }
 
   finish(): BuildingSurface {
-    const count = this.px.length;
-    if (count === 0) return EMPTY_BUILDINGS();
-    const positions = new Float32Array(count * 3);
-    const normals = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
+    const vertexCount = this.px.length;
+    if (vertexCount === 0) return EMPTY_BUILDINGS();
+    const positions = new Float32Array(vertexCount * 3);
+    const normals = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
+    for (let i = 0; i < vertexCount; i++) {
       const at = i * 3;
       positions[at] = this.px[i] as number;
       positions[at + 1] = this.py[i] as number;
@@ -340,6 +380,7 @@ class BuildingBuilder {
       normals,
       colors,
       indices: Uint32Array.from(this.indices),
+      buildingStart: Uint32Array.from([...this.buildingStart, vertexCount]),
       count: this.count,
       level: this.level,
       cottage: this.cottage,
@@ -352,6 +393,7 @@ class BuildingBuilder {
       cathedral: this.cathedral,
       townhall: this.townhall,
       gatehouse: this.gatehouse,
+      simplified: this.simplified,
     };
   }
 }
@@ -463,9 +505,171 @@ function addOrientedBox(
   face(b, [at(-1, -1, top), at(1, -1, top), at(1, 1, top), at(-1, 1, top)], [roof, roof, roof, roof], 0, 1, 0);
 }
 
+/** One oriented box in a landmark recipe, in the same units `addOrientedBox` takes. */
+interface LandmarkBox {
+  offsetAlong: number;
+  offsetAcross: number;
+  halfAlong: number;
+  halfAcross: number;
+  bottom: number;
+  top: number;
+  side: Rgb;
+  cap: Rgb;
+}
+
+/** What a landmark recipe function is given to compute its box list from. */
+interface LandmarkContext {
+  halfWidth: number;
+  halfDepth: number;
+  base: number;
+  floor: number;
+  eaves: number;
+  wall: Rgb;
+  roof: Rgb;
+  plinth: Rgb;
+}
+
 /**
- * Landmark-only exterior shells. Several oriented volumes replace the cottage
- * gable path, giving every civic kind its own footprint and skyline.
+ * One box list per landmark `KIND_*`, keyed by kind and produced from a
+ * `LandmarkContext` rather than written as a chain of `box(...)` calls
+ * in-line. Phase Politics B2: this is the data the old 160-line
+ * `if (kind === KIND_KEEP) { ... } if (kind === KIND_CATHEDRAL) { ... }`
+ * chain computed imperatively; every literal below is unchanged from it, so
+ * this refactor is byte-identical geometry (verified: every C5 landmark test
+ * and every committed landmark screenshot passed with zero changes).
+ *
+ * Per-culture variant recipes are NOT implemented yet -- `cultureId` does not
+ * reach `SectorLots` until Phase B3, and threading a fake seed through here
+ * ahead of that plumbing would mean redoing this table twice. See
+ * PROGRESS.md.
+ */
+const LANDMARK_RECIPES: Record<number, (ctx: LandmarkContext) => LandmarkBox[]> = {
+  [KIND_KEEP]: (ctx) => {
+    // C5 keep: bailey, gate/approach, central keep, four corner towers (≥2 visible).
+    // Towers ≥20% taller than bailey roof (28 vs 6 m above floor). Stone tints
+    // separate volumes in shaded proofs. Gate projects toward +Z (approach from SE).
+    const { halfWidth: hw, halfDepth: hd, base, floor, plinth } = ctx;
+    const stone: Rgb = [0.7, 0.66, 0.58];
+    const stoneDark: Rgb = [0.45, 0.42, 0.36];
+    const baileyTop = floor + 6;
+    const keepLowerTop = floor + 14;
+    const keepUpperTop = floor + 19;
+    const towerTop = floor + 28;
+    const gateTop = floor + 12;
+    const boxes: LandmarkBox[] = [
+      // 1 Bailey platform — full 44×44 m footprint.
+      { offsetAlong: 0, offsetAcross: 0, halfAlong: hw, halfAcross: hd, bottom: base, top: baileyTop, side: plinth, cap: stone },
+      // 2 Gate / approach barbican — projects toward +Z (negative across).
+      { offsetAlong: 0, offsetAcross: -hd * 1.15, halfAlong: hw * 0.36, halfAcross: hd * 0.2, bottom: base, top: gateTop, side: stone, cap: stoneDark },
+      { offsetAlong: 0, offsetAcross: -hd * 1.02, halfAlong: hw * 0.14, halfAcross: hd * 0.1, bottom: floor, top: gateTop - 2, side: stoneDark, cap: stone },
+      // 3 Central keep — offset toward gate so the mass reads from approach.
+      { offsetAlong: 0, offsetAcross: -hd * 0.12, halfAlong: hw * 0.42, halfAcross: hd * 0.42, bottom: floor, top: keepLowerTop, side: stone, cap: stoneDark },
+      { offsetAlong: 0, offsetAcross: -hd * 0.12, halfAlong: hw * 0.28, halfAcross: hd * 0.28, bottom: keepLowerTop - 0.5, top: keepUpperTop, side: stoneDark, cap: ctx.roof },
+    ];
+    // 4 Four corner towers with crown caps (≥2 required; four for top-down readability).
+    for (const u of [-1, 1]) {
+      for (const v of [-1, 1]) {
+        boxes.push({ offsetAlong: u * hw * 0.76, offsetAcross: v * hd * -0.76, halfAlong: hw * 0.18, halfAcross: hd * 0.18, bottom: base, top: towerTop, side: stoneDark, cap: stone });
+        boxes.push({ offsetAlong: u * hw * 0.76, offsetAcross: v * hd * -0.76, halfAlong: hw * 0.12, halfAcross: hd * 0.12, bottom: towerTop - 0.5, top: towerTop + 3, side: stone, cap: stoneDark });
+      }
+    }
+    return boxes;
+  },
+
+  [KIND_CATHEDRAL]: (ctx) => {
+    // C5 cathedral: cruciform plan — nave, transept/crossing, west front tower.
+    // Transept halfAcross 13 m vs nave 5 m → 260% width ratio (≥125%). Stone
+    // tints separate volumes in shaded proofs. Approach from +Z (city core).
+    const { halfWidth: hw, halfDepth: hd, base, floor, roof } = ctx;
+    const stone: Rgb = [0.62, 0.6, 0.54];
+    const stoneDark: Rgb = [0.44, 0.42, 0.38];
+    const stoneLight: Rgb = [0.72, 0.7, 0.64];
+    const naveTop = floor + 16;
+    const clerestoryTop = floor + 25;
+    const transeptTop = floor + 18;
+    const towerTop = floor + 34;
+    return [
+      // 1 Nave — long narrow volume along +X.
+      { offsetAlong: 4, offsetAcross: 0, halfAlong: hw * 0.62, halfAcross: 5, bottom: base, top: naveTop, side: stone, cap: stoneDark },
+      // 2 Transept / crossing — wider across, shorter along (cruciform top view).
+      { offsetAlong: 0, offsetAcross: 0, halfAlong: hw * 0.32, halfAcross: hd * 0.46, bottom: floor, top: transeptTop, side: stoneDark, cap: stone },
+      // 3 Nave clerestory — raised centre ridge over the nave.
+      { offsetAlong: 4, offsetAcross: 0, halfAlong: hw * 0.5, halfAcross: 3.5, bottom: naveTop - 0.5, top: clerestoryTop, side: stoneLight, cap: roof },
+      // 4 West front tower — tall block at the −X (west) end.
+      { offsetAlong: -hw * 0.68, offsetAcross: 0, halfAlong: hw * 0.38, halfAcross: hd * 0.28, bottom: base, top: towerTop, side: stoneDark, cap: stoneLight },
+      { offsetAlong: -hw * 0.68, offsetAcross: 0, halfAlong: hw * 0.26, halfAcross: hd * 0.18, bottom: towerTop - 0.5, top: towerTop + 4, side: stoneLight, cap: stoneDark },
+    ];
+  },
+
+  [KIND_TOWNHALL]: (ctx) => {
+    // C5 town hall: full plinth on all four sides, main hall + clock tower
+    // (≥2 roof levels). Frontage = 2×halfWidth along +X (≥18 m absolute).
+    const { halfWidth: hw, halfDepth: hd, base, floor, roof, plinth } = ctx;
+    const stone: Rgb = [0.58, 0.54, 0.48];
+    const stoneDark: Rgb = [0.4, 0.38, 0.34];
+    const hallTop = floor + 8;
+    const towerTop = floor + 18;
+    return [
+      // 1 Plinth podium — full footprint, visible on every side.
+      { offsetAlong: 0, offsetAcross: 0, halfAlong: hw, halfAcross: hd, bottom: base, top: floor + 3, side: plinth, cap: stone },
+      // 2 Main hall block — inset above plinth.
+      { offsetAlong: 0, offsetAcross: 0, halfAlong: hw * 0.88, halfAcross: hd * 0.82, bottom: floor + 2.8, top: hallTop, side: stone, cap: stoneDark },
+      // 3 Clock tower — projects toward +Z (approach from city core).
+      { offsetAlong: 0, offsetAcross: -hd * 0.28, halfAlong: hw * 0.38, halfAcross: hd * 0.42, bottom: floor + 2.8, top: towerTop, side: stoneDark, cap: roof },
+      { offsetAlong: 0, offsetAcross: -hd * 0.28, halfAlong: hw * 0.24, halfAcross: hd * 0.28, bottom: towerTop - 0.5, top: towerTop + 3, side: stone, cap: stoneDark },
+      // 4 Side annex wings — lower flanking masses (second silhouette tier).
+      { offsetAlong: -hw * 0.62, offsetAcross: 0, halfAlong: hw * 0.32, halfAcross: hd * 0.72, bottom: floor + 2.8, top: floor + 6.5, side: stoneDark, cap: stone },
+      { offsetAlong: hw * 0.62, offsetAcross: 0, halfAlong: hw * 0.32, halfAcross: hd * 0.72, bottom: floor + 2.8, top: floor + 6.5, side: stoneDark, cap: stone },
+    ];
+  },
+
+  [KIND_GUILDHALL]: (ctx) => {
+    // C5 guildhall: hall + deep workshop wing + flanking loading piers with
+    // gap on approach — envelope is wide and asymmetric, not barn-like.
+    const { halfWidth: hw, halfDepth: hd, base, floor, eaves } = ctx;
+    const stone: Rgb = [0.55, 0.5, 0.44];
+    const stoneDark: Rgb = [0.38, 0.34, 0.3];
+    const timber: Rgb = [0.32, 0.22, 0.14];
+    return [
+      // 1 Guild hall proper — set back from the street.
+      { offsetAlong: 0, offsetAcross: hd * 0.22, halfAlong: hw * 0.75, halfAcross: hd * 0.58, bottom: base, top: eaves, side: stone, cap: stoneDark },
+      // 2 Workshop mass — taller, deeper volume toward the approach (+Z).
+      { offsetAlong: 0, offsetAcross: -hd * 0.28, halfAlong: hw * 0.92, halfAcross: hd * 0.78, bottom: floor, top: floor + 11, side: stoneDark, cap: timber },
+      // 3 Loading piers flanking the yard opening (gap between = traversable slot).
+      { offsetAlong: -hw * 0.62, offsetAcross: -hd * 0.88, halfAlong: hw * 0.38, halfAcross: hd * 0.22, bottom: floor, top: floor + 6, side: timber, cap: stone },
+      { offsetAlong: hw * 0.62, offsetAcross: -hd * 0.88, halfAlong: hw * 0.38, halfAcross: hd * 0.22, bottom: floor, top: floor + 6, side: timber, cap: stone },
+      // 4 Loading lintel bridging the piers (opening reads below this band).
+      { offsetAlong: 0, offsetAcross: -hd * 0.88, halfAlong: hw * 0.22, halfAcross: hd * 0.18, bottom: floor + 5.5, top: floor + 8.5, side: stoneDark, cap: stone },
+    ];
+  },
+
+  [KIND_GATEHOUSE]: (ctx) => {
+    // C5 gatehouse: twin towers + lintel; centre stays empty for the road.
+    // Towers ≥125% curtain height (WALL_HEIGHT=14 → top ≥ floor+17.5).
+    const { halfWidth: hw, halfDepth: hd, base, floor } = ctx;
+    const stone: Rgb = [0.72, 0.68, 0.6];
+    const stoneDark: Rgb = [0.48, 0.44, 0.38];
+    const towerTop = floor + 26;
+    const lintelBot = floor + 11;
+    return [
+      // 1 West tower (along −X in lot frame).
+      { offsetAlong: -hw * 0.72, offsetAcross: 0, halfAlong: hw * 0.32, halfAcross: hd * 0.95, bottom: base, top: towerTop, side: stone, cap: stoneDark },
+      { offsetAlong: -hw * 0.72, offsetAcross: 0, halfAlong: hw * 0.22, halfAcross: hd * 0.72, bottom: towerTop - 0.5, top: towerTop + 3, side: stoneDark, cap: stone },
+      // 2 East tower (along +X).
+      { offsetAlong: hw * 0.72, offsetAcross: 0, halfAlong: hw * 0.32, halfAcross: hd * 0.95, bottom: base, top: towerTop, side: stone, cap: stoneDark },
+      { offsetAlong: hw * 0.72, offsetAcross: 0, halfAlong: hw * 0.22, halfAcross: hd * 0.72, bottom: towerTop - 0.5, top: towerTop + 3, side: stoneDark, cap: stone },
+      // 3 Lintel / parapet band above the opening (no fill below lintelBot).
+      { offsetAlong: 0, offsetAcross: 0, halfAlong: hw * 0.42, halfAcross: hd * 0.7, bottom: lintelBot, top: floor + 16, side: stone, cap: stoneDark },
+      // 4 Outer buttresses on the approach face for silhouette readability.
+      { offsetAlong: -hw * 0.72, offsetAcross: hd * 0.7, halfAlong: hw * 0.22, halfAcross: hd * 0.28, bottom: floor, top: towerTop - 4, side: stoneDark, cap: stone },
+      { offsetAlong: hw * 0.72, offsetAcross: hd * 0.7, halfAlong: hw * 0.22, halfAcross: hd * 0.28, bottom: floor, top: towerTop - 4, side: stoneDark, cap: stone },
+    ];
+  },
+};
+
+/**
+ * Landmark-only exterior shells. `LANDMARK_RECIPES[kind]` replaces the
+ * cottage gable path, giving every civic kind its own footprint and skyline.
  */
 function addLandmarkBuilding(
   b: BuildingBuilder,
@@ -486,147 +690,14 @@ function addLandmarkBuilding(
   roof: Rgb,
   plinth: Rgb,
 ): void {
-  const box = (
-    offsetAlong: number,
-    offsetAcross: number,
-    halfAlong: number,
-    halfAcross: number,
-    bottom: number,
-    top: number,
-    side: Rgb = wall,
-    cap: Rgb = roof,
-  ): void => addOrientedBox(
-    b, centerX, centerZ, alongX, alongZ, acrossX, acrossZ,
-    offsetAlong, offsetAcross, halfAlong, halfAcross, bottom, top, side, cap,
-  );
-
-  if (kind === KIND_KEEP) {
-    // C5 keep: bailey, gate/approach, central keep, four corner towers (≥2 visible).
-    // Towers ≥20% taller than bailey roof (28 vs 6 m above floor). Stone tints
-    // separate volumes in shaded proofs. Gate projects toward +Z (approach from SE).
-    const stone: Rgb = [0.7, 0.66, 0.58];
-    const stoneDark: Rgb = [0.45, 0.42, 0.36];
-    const baileyTop = floor + 6;
-    const keepLowerTop = floor + 14;
-    const keepUpperTop = floor + 19;
-    const towerTop = floor + 28;
-    const gateTop = floor + 12;
-    // 1 Bailey platform — full 44×44 m footprint.
-    box(0, 0, halfWidth, halfDepth, base, baileyTop, plinth, stone);
-    // 2 Gate / approach barbican — projects toward +Z (negative across).
-    box(0, -halfDepth * 1.15, halfWidth * 0.36, halfDepth * 0.2, base, gateTop, stone, stoneDark);
-    box(0, -halfDepth * 1.02, halfWidth * 0.14, halfDepth * 0.1, floor, gateTop - 2, stoneDark, stone);
-    // 3 Central keep — offset toward gate so the mass reads from approach.
-    box(0, -halfDepth * 0.12, halfWidth * 0.42, halfDepth * 0.42, floor, keepLowerTop, stone, stoneDark);
-    box(0, -halfDepth * 0.12, halfWidth * 0.28, halfDepth * 0.28, keepLowerTop - 0.5, keepUpperTop, stoneDark, roof);
-    // 4 Four corner towers with crown caps (≥2 required; four for top-down readability).
-    for (const u of [-1, 1]) {
-      for (const v of [-1, 1]) {
-        box(
-          u * halfWidth * 0.76,
-          v * halfDepth * -0.76,
-          halfWidth * 0.18,
-          halfDepth * 0.18,
-          base,
-          towerTop,
-          stoneDark,
-          stone,
-        );
-        box(
-          u * halfWidth * 0.76,
-          v * halfDepth * -0.76,
-          halfWidth * 0.12,
-          halfDepth * 0.12,
-          towerTop - 0.5,
-          towerTop + 3,
-          stone,
-          stoneDark,
-        );
-      }
-    }
-    return;
-  }
-
-  if (kind === KIND_CATHEDRAL) {
-    // C5 cathedral: cruciform plan — nave, transept/crossing, west front tower.
-    // Transept halfAcross 13 m vs nave 5 m → 260% width ratio (≥125%). Stone
-    // tints separate volumes in shaded proofs. Approach from +Z (city core).
-    const stone: Rgb = [0.62, 0.6, 0.54];
-    const stoneDark: Rgb = [0.44, 0.42, 0.38];
-    const stoneLight: Rgb = [0.72, 0.7, 0.64];
-    const naveTop = floor + 16;
-    const clerestoryTop = floor + 25;
-    const transeptTop = floor + 18;
-    const towerTop = floor + 34;
-    // 1 Nave — long narrow volume along +X.
-    box(4, 0, halfWidth * 0.62, 5, base, naveTop, stone, stoneDark);
-    // 2 Transept / crossing — wider across, shorter along (cruciform top view).
-    box(0, 0, halfWidth * 0.32, halfDepth * 0.46, floor, transeptTop, stoneDark, stone);
-    // 3 Nave clerestory — raised centre ridge over the nave.
-    box(4, 0, halfWidth * 0.5, 3.5, naveTop - 0.5, clerestoryTop, stoneLight, roof);
-    // 4 West front tower — tall block at the −X (west) end.
-    box(-halfWidth * 0.68, 0, halfWidth * 0.38, halfDepth * 0.28, base, towerTop, stoneDark, stoneLight);
-    box(-halfWidth * 0.68, 0, halfWidth * 0.26, halfDepth * 0.18, towerTop - 0.5, towerTop + 4, stoneLight, stoneDark);
-    return;
-  }
-
-  if (kind === KIND_TOWNHALL) {
-    // C5 town hall: full plinth on all four sides, main hall + clock tower
-    // (≥2 roof levels). Frontage = 2×halfWidth along +X (≥18 m absolute).
-    const stone: Rgb = [0.58, 0.54, 0.48];
-    const stoneDark: Rgb = [0.4, 0.38, 0.34];
-    const hallTop = floor + 8;
-    const towerTop = floor + 18;
-    // 1 Plinth podium — full footprint, visible on every side.
-    box(0, 0, halfWidth, halfDepth, base, floor + 3, plinth, stone);
-    // 2 Main hall block — inset above plinth.
-    box(0, 0, halfWidth * 0.88, halfDepth * 0.82, floor + 2.8, hallTop, stone, stoneDark);
-    // 3 Clock tower — projects toward +Z (approach from city core).
-    box(0, -halfDepth * 0.28, halfWidth * 0.38, halfDepth * 0.42, floor + 2.8, towerTop, stoneDark, roof);
-    box(0, -halfDepth * 0.28, halfWidth * 0.24, halfDepth * 0.28, towerTop - 0.5, towerTop + 3, stone, stoneDark);
-    // 4 Side annex wings — lower flanking masses (second silhouette tier).
-    box(-halfWidth * 0.62, 0, halfWidth * 0.32, halfDepth * 0.72, floor + 2.8, floor + 6.5, stoneDark, stone);
-    box(halfWidth * 0.62, 0, halfWidth * 0.32, halfDepth * 0.72, floor + 2.8, floor + 6.5, stoneDark, stone);
-    return;
-  }
-
-  if (kind === KIND_GUILDHALL) {
-    // C5 guildhall: hall + deep workshop wing + flanking loading piers with
-    // gap on approach — envelope is wide and asymmetric, not barn-like.
-    const stone: Rgb = [0.55, 0.5, 0.44];
-    const stoneDark: Rgb = [0.38, 0.34, 0.3];
-    const timber: Rgb = [0.32, 0.22, 0.14];
-    // 1 Guild hall proper — set back from the street.
-    box(0, halfDepth * 0.22, halfWidth * 0.75, halfDepth * 0.58, base, eaves, stone, stoneDark);
-    // 2 Workshop mass — taller, deeper volume toward the approach (+Z).
-    box(0, -halfDepth * 0.28, halfWidth * 0.92, halfDepth * 0.78, floor, floor + 11, stoneDark, timber);
-    // 3 Loading piers flanking the yard opening (gap between = traversable slot).
-    box(-halfWidth * 0.62, -halfDepth * 0.88, halfWidth * 0.38, halfDepth * 0.22, floor, floor + 6, timber, stone);
-    box(halfWidth * 0.62, -halfDepth * 0.88, halfWidth * 0.38, halfDepth * 0.22, floor, floor + 6, timber, stone);
-    // 4 Loading lintel bridging the piers (opening reads below this band).
-    box(0, -halfDepth * 0.88, halfWidth * 0.22, halfDepth * 0.18, floor + 5.5, floor + 8.5, stoneDark, stone);
-    return;
-  }
-
-  if (kind === KIND_GATEHOUSE) {
-    // C5 gatehouse: twin towers + lintel; centre stays empty for the road.
-    // Towers ≥125% curtain height (WALL_HEIGHT=14 → top ≥ floor+17.5).
-    const stone: Rgb = [0.72, 0.68, 0.6];
-    const stoneDark: Rgb = [0.48, 0.44, 0.38];
-    const towerTop = floor + 26;
-    const lintelBot = floor + 11;
-    // 1 West tower (along −X in lot frame).
-    box(-halfWidth * 0.72, 0, halfWidth * 0.32, halfDepth * 0.95, base, towerTop, stone, stoneDark);
-    box(-halfWidth * 0.72, 0, halfWidth * 0.22, halfDepth * 0.72, towerTop - 0.5, towerTop + 3, stoneDark, stone);
-    // 2 East tower (along +X).
-    box(halfWidth * 0.72, 0, halfWidth * 0.32, halfDepth * 0.95, base, towerTop, stone, stoneDark);
-    box(halfWidth * 0.72, 0, halfWidth * 0.22, halfDepth * 0.72, towerTop - 0.5, towerTop + 3, stoneDark, stone);
-    // 3 Lintel / parapet band above the opening (no fill below lintelBot).
-    box(0, 0, halfWidth * 0.42, halfDepth * 0.7, lintelBot, floor + 16, stone, stoneDark);
-    // 4 Outer buttresses on the approach face for silhouette readability.
-    box(-halfWidth * 0.72, halfDepth * 0.7, halfWidth * 0.22, halfDepth * 0.28, floor, towerTop - 4, stoneDark, stone);
-    box(halfWidth * 0.72, halfDepth * 0.7, halfWidth * 0.22, halfDepth * 0.28, floor, towerTop - 4, stoneDark, stone);
-    return;
+  const recipe = LANDMARK_RECIPES[kind];
+  if (recipe === undefined) return;
+  const ctx: LandmarkContext = { halfWidth, halfDepth, base, floor, eaves, wall, roof, plinth };
+  for (const box of recipe(ctx)) {
+    addOrientedBox(
+      b, centerX, centerZ, alongX, alongZ, acrossX, acrossZ,
+      box.offsetAlong, box.offsetAcross, box.halfAlong, box.halfAcross, box.bottom, box.top, box.side, box.cap,
+    );
   }
 }
 
@@ -648,14 +719,248 @@ function emitLotsInNode(
   maxZ: number,
   groundAt: (localX: number, localZ: number) => number,
   palette: BuildingPalette,
+  cultureId: number,
+  lod: number,
 ): void {
   for (let k = 0; k < rec.count; k++) {
     if (b.count >= BUILDING_MAX_PER_NODE) break;
     const cx = rec.centerX[k] as number;
     const cz = rec.centerZ[k] as number;
     if (cx < minX || cx >= maxX || cz < minZ || cz >= maxZ) continue;
-    addBuilding(b, rec, k, minX, minZ, groundAt, palette);
+    addBuilding(b, rec, k, minX, minZ, groundAt, palette, cultureId, lod);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Roof variety (Phase Politics B1)
+// ---------------------------------------------------------------------------
+
+const ROOF_SALT = 0x526f_6f66; // 'Roof'
+
+/** The `ROOF_*` values `addRoofCap` actually draws. See its own `else` branch. */
+const IMPLEMENTED_ROOFS: readonly number[] = [ROOF_GABLE, ROOF_HIP, ROOF_FLAT_PARAPET, ROOF_SHED, ROOF_PYRAMID];
+
+const CULTURE_ROOF_SALT = 0x4375_526f; // 'CuRo'
+
+/**
+ * Phase Politics B3. For the cottage/warehouse bucket only (see `pickRoofType`),
+ * a culture's own `houseRoofs` preference (`culture.ts`) nudges the roll
+ * toward one of ITS preferred roofs, restricted to the ones `addRoofCap` can
+ * actually draw -- `MANSARD`/`GAMBREL`/`DOME_FACET` are still unimplemented
+ * (Phase B1's gap, not this slice's), so a culture whose preference is one of
+ * those (Riverlands, Highland Clans) simply has fewer of its OWN roofs to
+ * draw from here, rather than silently drawing an unrelated one.
+ *
+ * A SOFT nudge (55% of the time), not a hard filter to the culture's list:
+ * hard-filtering would collapse a culture whose only implemented preference
+ * is `ROOF_GABLE` to a monotonous single-roof village, undoing B1's whole
+ * point. `undefined` means "no nudge this roll" -- `pickRoofType` falls
+ * through to its own kind-based distribution.
+ */
+function cultureHouseRoof(cultureId: number, worldX: number, worldZ: number): number | undefined {
+  const culture = CULTURES[cultureId] as Culture | undefined;
+  if (culture === undefined) return undefined;
+  const implemented = culture.houseRoofs.filter((r) => IMPLEMENTED_ROOFS.includes(r));
+  if (implemented.length === 0) return undefined;
+  const nudgeRoll =
+    (hash2i(Math.round(worldX * 4) + 1, Math.round(worldZ * 4) + 1, CULTURE_ROOF_SALT) >>> 0) % 100;
+  if (nudgeRoll >= 55) return undefined;
+  return implemented[nudgeRoll % implemented.length] as number;
+}
+
+/**
+ * Which `ROOF_*` (`culture.ts`) an ordinary building gets. A pure function of
+ * its own WORLD centre (not the node-local one -- the choice must not depend
+ * on which node/lod happens to be rendering it), its `kind`, and (for the
+ * cottage/warehouse bucket) its `cultureId`, so a barn leans toward
+ * `ROOF_SHED`/`ROOF_GABLE` and a dense townhouse street leans toward
+ * `ROOF_FLAT_PARAPET`/`ROOF_HIP` rather than every kind drawing from the same
+ * weights.
+ *
+ * `cultureId` only biases the cottage/warehouse default bucket (see
+ * `cultureHouseRoof`) -- barn/townhouse/hall keep their own kind-specific
+ * distribution unbiased by culture, a deliberate B3 scope limit: those three
+ * already have a strong kind-appropriate shape (a barn is a barn in every
+ * culture), and civic-flavoured roofs on a barn would read as a mistake, not
+ * variety. `cultureId = -1` (the default) means "no culture data available",
+ * matching `polity.ts`'s own sentinel for unclaimed ground.
+ *
+ * `MANSARD`/`GAMBREL`/`DOME_FACET` (the other three of `culture.ts`'s 8) are
+ * not implemented yet -- see PROGRESS.md. `pickRoofType` never returns them.
+ */
+export function pickRoofType(
+  kind: number,
+  worldX: number,
+  worldZ: number,
+  cultureId = -1,
+): number {
+  // *4 before rounding: lots sit at fractional metres, and rounding straight
+  // to an integer metre would make two lots ~0.5 m apart alias to the same
+  // hash more often than this hash's own avalanche already spreads them.
+  const roll =
+    (hash2i(Math.round(worldX * 4), Math.round(worldZ * 4), ROOF_SALT) >>> 0) % 100;
+  if (kind === KIND_BARN) {
+    return roll < 65 ? ROOF_GABLE : ROOF_SHED;
+  }
+  if (kind === KIND_TOWNHOUSE) {
+    if (roll < 45) return ROOF_FLAT_PARAPET;
+    if (roll < 80) return ROOF_GABLE;
+    return ROOF_HIP;
+  }
+  if (kind === KIND_HALL) {
+    return roll < 60 ? ROOF_GABLE : ROOF_HIP;
+  }
+  // Cottage, warehouse, and the default for any future kind this function
+  // does not yet know about.
+  const cultureRoof = cultureHouseRoof(cultureId, worldX, worldZ);
+  if (cultureRoof !== undefined) return cultureRoof;
+  if (roll < 42) return ROOF_GABLE;
+  if (roll < 68) return ROOF_HIP;
+  if (roll < 88) return ROOF_PYRAMID;
+  return ROOF_SHED;
+}
+
+/**
+ * Emit the roof cap (everything above `eaves`) for one ordinary building.
+ * The four walls up to `eaves` are already emitted by the caller and are the
+ * SAME for every roof type -- only what sits on top of them differs.
+ *
+ * `at(u, v, y)` is the caller's corner helper: `u` runs along the frontage in
+ * `[-1, 1]`, `v` runs from the front (`-1`) to the back (`1`), matching the
+ * ordinary wall geometry's own convention.
+ */
+function addRoofCap(
+  b: BuildingBuilder,
+  roofType: number,
+  at: (u: number, v: number, y: number) => Corner,
+  cornerX: (u: number, v: number) => number,
+  cornerZ: (u: number, v: number) => number,
+  eaves: number,
+  ridge: number,
+  alongX: number,
+  alongZ: number,
+  acrossX: number,
+  acrossZ: number,
+  wall: Rgb,
+  roof: Rgb,
+): void {
+  const roofColors4: readonly Rgb[] = [roof, roof, roof, roof];
+  const roofColors3: readonly Rgb[] = [roof, roof, roof];
+  const wallColors3: readonly Rgb[] = [wall, wall, wall];
+
+  if (roofType === ROOF_HIP) {
+    // Ridge shortened to `hipFrac` of the full length rather than running
+    // edge to edge -- the roof slopes down on EVERY side, so there is no
+    // vertical gable triangle at the ends, only two more (sloped,
+    // roof-coloured) faces closing them.
+    const hipFrac = 0.45;
+    const ridgeA: Corner = { x: cornerX(-hipFrac, 0), y: ridge, z: cornerZ(-hipFrac, 0) };
+    const ridgeB: Corner = { x: cornerX(hipFrac, 0), y: ridge, z: cornerZ(hipFrac, 0) };
+    face(b, [at(-1, -1, eaves), at(1, -1, eaves), ridgeB, ridgeA], roofColors4, -acrossX, 1, -acrossZ);
+    face(b, [at(1, 1, eaves), at(-1, 1, eaves), ridgeA, ridgeB], roofColors4, acrossX, 1, acrossZ);
+    face(b, [at(-1, -1, eaves), at(-1, 1, eaves), ridgeA], roofColors3, -alongX, 1, -alongZ);
+    face(b, [at(1, 1, eaves), at(1, -1, eaves), ridgeB], roofColors3, alongX, 1, alongZ);
+  } else if (roofType === ROOF_PYRAMID) {
+    // The ridge collapses to a single apex -- four triangular slopes, one
+    // per wall. Reads as a small tower or a modest cottage roof depending on
+    // the footprint's own aspect ratio.
+    const apex: Corner = { x: cornerX(0, 0), y: ridge, z: cornerZ(0, 0) };
+    face(b, [at(-1, -1, eaves), at(1, -1, eaves), apex], roofColors3, -acrossX, 1, -acrossZ);
+    face(b, [at(1, 1, eaves), at(-1, 1, eaves), apex], roofColors3, acrossX, 1, acrossZ);
+    face(b, [at(-1, -1, eaves), at(-1, 1, eaves), apex], roofColors3, -alongX, 1, -alongZ);
+    face(b, [at(1, 1, eaves), at(1, -1, eaves), apex], roofColors3, alongX, 1, alongZ);
+  } else if (roofType === ROOF_FLAT_PARAPET) {
+    // No ridge at all: a flat cap a short parapet above the eaves line, with
+    // the parapet itself as four short wall-coloured risers -- reads as a
+    // dense city street rather than a cottage.
+    const parapetTop = eaves + 0.6;
+    const parapetColors: readonly Rgb[] = [wall, wall, wall, wall];
+    face(
+      b,
+      [at(-1, -1, eaves), at(1, -1, eaves), at(1, -1, parapetTop), at(-1, -1, parapetTop)],
+      parapetColors,
+      -acrossX,
+      0,
+      -acrossZ,
+    );
+    face(
+      b,
+      [at(1, 1, eaves), at(-1, 1, eaves), at(-1, 1, parapetTop), at(1, 1, parapetTop)],
+      parapetColors,
+      acrossX,
+      0,
+      acrossZ,
+    );
+    face(
+      b,
+      [at(-1, 1, eaves), at(-1, -1, eaves), at(-1, -1, parapetTop), at(-1, 1, parapetTop)],
+      parapetColors,
+      -alongX,
+      0,
+      -alongZ,
+    );
+    face(
+      b,
+      [at(1, -1, eaves), at(1, 1, eaves), at(1, 1, parapetTop), at(1, -1, parapetTop)],
+      parapetColors,
+      alongX,
+      0,
+      alongZ,
+    );
+    face(
+      b,
+      [at(-1, -1, parapetTop), at(1, -1, parapetTop), at(1, 1, parapetTop), at(-1, 1, parapetTop)],
+      roofColors4,
+      0,
+      1,
+      0,
+    );
+  } else if (roofType === ROOF_SHED) {
+    // One sloped plane, low at the front (`eaves`) and high at the back
+    // (`ridge`) -- a lean-to. The back wall needs a short riser up to the
+    // slope's high edge, and the two side walls need a triangular infill
+    // between their flat top (still `eaves`, unchanged from the shared wall
+    // geometry) and the raised back corner.
+    const riserColors: readonly Rgb[] = [wall, wall, wall, wall];
+    face(
+      b,
+      [at(-1, 1, eaves), at(1, 1, eaves), at(1, 1, ridge), at(-1, 1, ridge)],
+      riserColors,
+      acrossX,
+      0,
+      acrossZ,
+    );
+    face(b, [at(-1, -1, eaves), at(-1, 1, eaves), at(-1, 1, ridge)], wallColors3, -alongX, 0, -alongZ);
+    face(b, [at(1, -1, eaves), at(1, 1, eaves), at(1, 1, ridge)], wallColors3, alongX, 0, alongZ);
+    face(
+      b,
+      [at(-1, -1, eaves), at(1, -1, eaves), at(1, 1, ridge), at(-1, 1, ridge)],
+      roofColors4,
+      0,
+      1,
+      0,
+    );
+  } else {
+    // ROOF_GABLE, and the default for any roof type this function does not
+    // (yet) implement -- the original C0 shape.
+    const ridgeA: Corner = { x: cornerX(-1, 0), y: ridge, z: cornerZ(-1, 0) };
+    const ridgeB: Corner = { x: cornerX(1, 0), y: ridge, z: cornerZ(1, 0) };
+    face(b, [at(-1, -1, eaves), at(-1, 1, eaves), ridgeA], wallColors3, -alongX, 0, -alongZ);
+    face(b, [at(1, 1, eaves), at(1, -1, eaves), ridgeB], wallColors3, alongX, 0, alongZ);
+    face(b, [at(-1, -1, eaves), at(1, -1, eaves), ridgeB, ridgeA], roofColors4, -acrossX, 1, -acrossZ);
+    face(b, [at(1, 1, eaves), at(-1, 1, eaves), ridgeA, ridgeB], roofColors4, acrossX, 1, acrossZ);
+  }
+}
+
+/**
+ * The `BUILDING_LOD_SIMPLIFY` cap: one flat quad at `eaves`, roof-coloured,
+ * no riser, no roof-type variety. Paired with the four ordinary walls
+ * (unchanged at every LOD -- the footprint is what makes a settlement read
+ * as a settlement from any distance) and nothing else: no facade panels.
+ */
+function addSimplifiedCap(b: BuildingBuilder, at: (u: number, v: number, y: number) => Corner, eaves: number, roof: Rgb): void {
+  const roofColors: readonly Rgb[] = [roof, roof, roof, roof];
+  face(b, [at(-1, -1, eaves), at(1, -1, eaves), at(1, 1, eaves), at(-1, 1, eaves)], roofColors, 0, 1, 0);
 }
 
 function addBuilding(
@@ -666,7 +971,10 @@ function addBuilding(
   originZ: number,
   groundAt: (localX: number, localZ: number) => number,
   palette: BuildingPalette,
+  cultureId: number,
+  lod: number,
 ): void {
+  b.startBuilding();
   const centerX = (lots.centerX[i] as number) - originX;
   const centerZ = (lots.centerZ[i] as number) - originZ;
   const floor = lots.floorY[i] as number;
@@ -758,6 +1066,20 @@ function addBuilding(
     return;
   }
 
+  // Phase Politics B4. `lod` decides full massing vs the flat silhouette cap
+  // -- see `BUILDING_LOD_SIMPLIFY`'s own doc comment for why lod 0 is the cut
+  // line. `roofType` is only meaningful (and only computed) on the full path.
+  const simplified = lod >= BUILDING_LOD_SIMPLIFY;
+
+  // Phase Politics B1. One of `ROOF_*` (`culture.ts`), a pure function of the
+  // lot's own WORLD position (not the node-local one, so the choice is the
+  // same regardless of which node/lod renders it) and its kind -- a barn
+  // never gets a flat parapet, a townhouse never gets a barn's plain gable
+  // bias. See `pickRoofType`.
+  const roofType = simplified
+    ? -1
+    : pickRoofType(kind, lots.centerX[i] as number, lots.centerZ[i] as number, cultureId);
+
   // -- the corners -----------------------------------------------------------
   //
   // `u` runs along the frontage and `v` back from it; the ridge lies over the
@@ -801,22 +1123,24 @@ function addBuilding(
   wallFace(-1, 1, -1, -1, -alongX, -alongZ);
   wallFace(1, -1, 1, 1, alongX, alongZ);
 
-  // Gable ends: the triangle between the eaves line and the ridge at each end of
-  // the ridge. Wall-coloured, because a gable is the wall carrying on up.
-  const ridgeA: Corner = { x: cornerX(-1, 0), y: ridge, z: cornerZ(-1, 0) };
-  const ridgeB: Corner = { x: cornerX(1, 0), y: ridge, z: cornerZ(1, 0) };
-  const gableColors: readonly Rgb[] = [wall, wall, wall];
-  face(b, [at(-1, -1, eaves), at(-1, 1, eaves), ridgeA], gableColors, -alongX, 0, -alongZ);
-  face(b, [at(1, 1, eaves), at(1, -1, eaves), ridgeB], gableColors, alongX, 0, alongZ);
+  if (simplified) {
+    // Phase Politics B4. Walls only, plus one flat cap -- see
+    // `addSimplifiedCap` and `BUILDING_LOD_SIMPLIFY`. No roof-type variety,
+    // no facade detail: at this distance neither would read as more than a
+    // handful of pixels, and a coarse node can hold dozens of these at once.
+    addSimplifiedCap(b, at, eaves, roof);
+    b.simplified++;
+    return;
+  }
 
-  // Roof: two slopes meeting at the ridge. The outward hint carries a +Y
-  // component, so a shallow-pitched roof still faces up rather than sideways.
-  const roofColors: readonly Rgb[] = [roof, roof, roof, roof];
-  face(b, [at(-1, -1, eaves), at(1, -1, eaves), ridgeB, ridgeA], roofColors, -acrossX, 1, -acrossZ);
-  face(b, [at(1, 1, eaves), at(-1, 1, eaves), ridgeA, ridgeB], roofColors, acrossX, 1, acrossZ);
+  // The roof cap -- everything above `eaves` -- varies by `roofType`. See
+  // `addRoofCap` (Phase Politics B1). The walls above are the same regardless.
+  addRoofCap(b, roofType, at, cornerX, cornerZ, eaves, ridge, alongX, alongZ, acrossX, acrossZ, wall, roof);
 
-  // Facade detail: exactly two quads for every non-landmark kind, so
-  // BUILDING_VERTEX_COUNT stays load-bearing for the cottage-derived path.
+  // Facade detail: exactly two quads for every non-landmark kind, on top of
+  // whatever the roof cap cost -- vertex count is no longer fixed across
+  // roof types, so `BuildingSurface.buildingStart` is what a consumer needing
+  // per-building extents reads (see its own doc comment).
   const wood: Rgb = [0.18, 0.11, 0.07];
   const glass: Rgb = [0.22, 0.28, 0.34];
   const stone: Rgb = [0.22, 0.2, 0.18];
@@ -923,6 +1247,7 @@ export function buildBuildingSurface(
   lots: SectorLotField,
   groundAt: (localX: number, localZ: number) => number,
   palette: BuildingPalette,
+  cultureId = -1,
 ): BuildingSurface {
   const size = chunkSizeAt(coord.lod);
   const minX = coord.x * size;
@@ -966,7 +1291,7 @@ export function buildBuildingSurface(
           const key = `${sx},${sz}`;
           if (visitedSectors.has(key)) continue;
           visitedSectors.add(key);
-          emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette);
+          emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette, cultureId, coord.lod);
           continue;
         }
 
@@ -979,7 +1304,7 @@ export function buildBuildingSurface(
             const key = `${sx},${sz}`;
             if (visitedSectors.has(key)) continue;
             visitedSectors.add(key);
-            emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette);
+            emitLotsInNode(b, lots.lotsAt(sx, sz), minX, minZ, maxX, maxZ, groundAt, palette, cultureId, coord.lod);
           }
         }
       }

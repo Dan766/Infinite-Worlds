@@ -163,6 +163,9 @@ export interface ChunkStreamerStats {
   wallsSeen: number;
   /** City-touching nodes generated since construction. */
   citiesSeen: number;
+  /** Distinct polities/cultures seen on a generated node's centre since construction. See `politiesSeenSet`. */
+  politiesSeen: number;
+  culturesSeen: number;
   /**
    * Buildings generated since construction. CUMULATIVE, for the reason
    * `bridgeNodes` is: a village is a few hundred metres across in a 4 km region,
@@ -208,6 +211,12 @@ export interface ChunkStreamerStats {
   buildingsSeenCathedral: number;
   buildingsSeenTownhall: number;
   buildingsSeenGatehouse: number;
+  /**
+   * Of `buildingsSeen`, how many drew the `BUILDING_LOD_SIMPLIFY` silhouette
+   * instead of full massing. Phase Politics B4's anti-vacuity counter --
+   * CUMULATIVE for the same reason every other `buildingsSeen*` is.
+   */
+  buildingsSeenSimplified: number;
   /**
    * Props generated of each species / yard role. CUMULATIVE -- same reason as
    * `buildingsSeen*`: a pine-only world must fail soak, not pass on total count.
@@ -275,6 +284,15 @@ export class ChunkStreamer {
   private buildingsSeenCount = 0;
   private wallsSeenCount = 0;
   private citiesSeenCount = 0;
+  /**
+   * Distinct `polityId`/`cultureId` values ever seen on a generated node's
+   * centre, excluding the `-1` (unclaimed/none) sentinel. A SET, not a
+   * counter -- `politiesSeen` asks "how many different nations has the
+   * flight crossed", which a running sum cannot answer (the same nation
+   * touching a thousand nodes must still read as one).
+   */
+  private readonly politiesSeenSet = new Set<number>();
+  private readonly culturesSeenSet = new Set<number>();
   /** Props ever generated. Monotone, for `buildingsSeenCount`'s reason. */
   private propsSeenCount = 0;
   /** Chunks ever generated per village layout family. Monotone; see `stats`. */
@@ -289,6 +307,7 @@ export class ChunkStreamer {
   private buildingsSeenCathedralCount = 0;
   private buildingsSeenTownhallCount = 0;
   private buildingsSeenGatehouseCount = 0;
+  private buildingsSeenSimplifiedCount = 0;
   private propsSeenPineCount = 0;
   private propsSeenBroadleafCount = 0;
   private propsSeenBushRoundCount = 0;
@@ -419,6 +438,8 @@ export class ChunkStreamer {
       this.buildingsSeenCount += data.buildings;
       this.wallsSeenCount += data.walls;
       this.citiesSeenCount += data.cityTouch;
+      if (data.polityId >= 0) this.politiesSeenSet.add(data.polityId);
+      if (data.cultureId >= 0) this.culturesSeenSet.add(data.cultureId);
       this.buildingsSeenCottageCount += data.buildingsCottage;
       this.buildingsSeenBarnCount += data.buildingsBarn;
       this.buildingsSeenHallCount += data.buildingsHall;
@@ -429,6 +450,7 @@ export class ChunkStreamer {
       this.buildingsSeenCathedralCount += data.buildingsCathedral;
       this.buildingsSeenTownhallCount += data.buildingsTownhall;
       this.buildingsSeenGatehouseCount += data.buildingsGatehouse;
+      this.buildingsSeenSimplifiedCount += data.buildingsSimplified;
       this.propsSeenCount += data.props;
       this.propsSeenPineCount += data.propsPine;
       this.propsSeenBroadleafCount += data.propsBroadleaf;
@@ -761,6 +783,8 @@ export class ChunkStreamer {
       wallTriangles,
       wallsSeen: this.wallsSeenCount,
       citiesSeen: this.citiesSeenCount,
+      politiesSeen: this.politiesSeenSet.size,
+      culturesSeen: this.culturesSeenSet.size,
       propNodes,
       props,
       propsMeasured,
@@ -782,6 +806,7 @@ export class ChunkStreamer {
       buildingsSeenCathedral: this.buildingsSeenCathedralCount,
       buildingsSeenTownhall: this.buildingsSeenTownhallCount,
       buildingsSeenGatehouse: this.buildingsSeenGatehouseCount,
+      buildingsSeenSimplified: this.buildingsSeenSimplifiedCount,
       propsSeenPine: this.propsSeenPineCount,
       propsSeenBroadleaf: this.propsSeenBroadleafCount,
       propsSeenBushRound: this.propsSeenBushRoundCount,
@@ -1094,7 +1119,7 @@ export class ChunkStreamer {
       'buildings',
       () => {
         const s = this.stats();
-        return `${s.buildingNodes} nodes / ${s.buildings} live (${s.buildingsLevel} of ${s.buildingsMeasured} level) / ${s.buildingTriangles} tris / ${s.buildingsSeen} seen`;
+        return `${s.buildingNodes} nodes / ${s.buildings} live (${s.buildingsLevel} of ${s.buildingsMeasured} level) / ${s.buildingTriangles} tris / ${s.buildingsSeen} seen / ${s.buildingsSeenSimplified} simplified`;
       },
       HudOrder.world,
     );

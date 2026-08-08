@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  CULTURE_BUILDING_PALETTES,
   MAX_WATER_TRIANGLE_COUNT,
   MAX_WATER_VERTEX_COUNT,
   MIN_SKIRT_DEPTH,
@@ -32,15 +33,17 @@ import {
   WATER_ALPHA_MAX,
   waterColor,
 } from './chunk-gen';
-import { baseHeight, SEA_LEVEL, sampleHeight, worldRegionField } from './height-field';
+import { baseHeight, continentalness, habitability, SEA_LEVEL, sampleHeight, worldRegionField } from './height-field';
 import {
   CHUNK_DATA_VERSION,
   CHUNK_SIZE,
   chunkDataBytes,
   chunkDataTransferables,
   createTierContext,
+  worldToChunk,
   type ChunkCoord,
 } from './contracts';
+import { citiesInBox, type PolityClimate, type PolityTerrain } from './polity';
 
 const SEED = 0xc0ffee;
 /**
@@ -775,7 +778,14 @@ describe('generateChunk', () => {
   it('emits transferable typed arrays and a version stamp', () => {
     const data = generateChunk({ x: 0, z: 0, lod: 0 }, context());
     expect(data.version).toBe(CHUNK_DATA_VERSION);
-    expect(CHUNK_DATA_VERSION).toBe(14);
+    // Phase Politics S2 bumped this 14 -> 15 for the new polityId/cultureId
+    // scalars; Phase Politics B1 bumped it again, 15 -> 16, for
+    // `buildingStart` (roof-type variety means buildings no longer share a
+    // fixed vertex count); Phase Politics B4 bumped it again, 16 -> 17, for
+    // the new `buildingsSimplified` scalar (its own LOD anti-vacuity
+    // counter). Pinned here (rather than left to drift) so a future payload
+    // change is a deliberate edit to this number, not a silent one.
+    expect(CHUNK_DATA_VERSION).toBe(17);
     expect(data.positions).toBeInstanceOf(Float32Array);
     expect(data.indices).toBeInstanceOf(Uint32Array);
     expect(data.normals).toBeInstanceOf(Float32Array);
@@ -805,6 +815,132 @@ describe('generateChunk', () => {
     }
   });
 
+  it('polityId/cultureId: deterministic, and both claimed and unclaimed nodes exist', () => {
+    // Phase Politics S2. A node's polityId/cultureId are one query at its
+    // centre, not per-vertex data -- deterministic like everything else, and
+    // `-1` for sea or ground beyond every polity's frontier.
+    const a = generateChunk({ x: 40, z: 40, lod: 4 }, context());
+    const b = generateChunk({ x: 40, z: 40, lod: 4 }, context());
+    expect(a.polityId).toBe(b.polityId);
+    expect(a.cultureId).toBe(b.cultureId);
+    if (a.polityId === -1) expect(a.cultureId).toBe(-1);
+
+    // Anti-vacuity: a world where every node reports -1 (politics never
+    // wired in) and a world where every node reports the same claimed id
+    // would each pass a single spot check -- both regimes must be seen.
+    // `generateChunk` itself is expensive (full terrain/street/lot/building
+    // generation per call), so rather than a broad grid of full chunk
+    // generations, locate one claimed point and one sea point CHEAPLY with
+    // `polity.ts`/`baseHeight` directly first, then generate exactly the two
+    // chunks that matter.
+    const terrain: PolityTerrain = { seaLevel: SEA_LEVEL, height: baseHeight };
+    const climate: PolityClimate = { continentalness, habitability };
+    const sites = citiesInBox(-100_000, -100_000, 100_000, 100_000, terrain, climate, SEED);
+    expect(sites.length).toBeGreaterThan(0);
+    const city = sites[0] as (typeof sites)[number];
+
+    const claimedCoord = worldToChunk(city.x, city.z, 6);
+    const claimedData = generateChunk(claimedCoord, context());
+    expect(claimedData.polityId).toBeGreaterThanOrEqual(0);
+
+    let seaX = city.x;
+    for (let i = 0; i < 4_000 && baseHeight(seaX, city.z, SEED) >= SEA_LEVEL; i++) seaX += 500;
+    expect(baseHeight(seaX, city.z, SEED)).toBeLessThan(SEA_LEVEL);
+    const seaCoord = worldToChunk(seaX, city.z, 6);
+    const seaData = generateChunk(seaCoord, context());
+    expect(seaData.polityId).toBe(-1);
+    expect(seaData.cultureId).toBe(-1);
+  });
+
+  it('paints a claimed city\'s buildings from its own CULTURE_BUILDING_PALETTES entry', () => {
+    // Phase Politics B3. Every culture's own palette is measurably distinct
+    // from every other's (otherwise a "wrong culture id" bug could hide
+    // behind two coincidentally similar palettes)...
+    expect(CULTURE_BUILDING_PALETTES.length).toBe(6);
+    for (let i = 0; i < CULTURE_BUILDING_PALETTES.length; i++) {
+      for (let j = i + 1; j < CULTURE_BUILDING_PALETTES.length; j++) {
+        const a = CULTURE_BUILDING_PALETTES[i] as (typeof CULTURE_BUILDING_PALETTES)[number];
+        const b = CULTURE_BUILDING_PALETTES[j] as (typeof CULTURE_BUILDING_PALETTES)[number];
+        const dist = Math.abs(a.wallA[0] - b.wallA[0]) + Math.abs(a.wallA[1] - b.wallA[1]) + Math.abs(a.wallA[2] - b.wallA[2]);
+        expect(dist).toBeGreaterThan(0.01);
+      }
+    }
+
+    // ...and a real claimed VILLAGE's building vertex colours actually land
+    // inside ITS culture's own palette range, not some other one. `face()`
+    // never blends across two different palettes' colours -- every wall
+    // vertex is `wallA` LERP `wallB` (via `wallTint`) and every roof vertex
+    // is `roofA` LERP `roofB`, so every channel is bounded exactly by
+    // [min(A, B), max(A, B)] for THIS culture, with the plinth colour itself
+    // also always exactly `palette.plinth`. A VILLAGE, not the city itself,
+    // because a landmark's stone/timber colours (`building-mesh.ts`'s
+    // `LANDMARK_RECIPES`) are outside any culture palette by design -- B2
+    // didn't touch them -- and the city centre this test would otherwise
+    // pick almost always has at least one in frame.
+    const terrain: PolityTerrain = { seaLevel: SEA_LEVEL, height: baseHeight };
+    const climate: PolityClimate = { continentalness, habitability };
+    const sites = citiesInBox(-100_000, -100_000, 100_000, 100_000, terrain, climate, SEED);
+    expect(sites.length).toBeGreaterThan(0);
+    const city = sites[0] as (typeof sites)[number];
+
+    let claimedData: ReturnType<typeof generateChunk> | undefined;
+    for (let ring = 1; ring <= 8 && claimedData === undefined; ring++) {
+      for (const [dx, dz] of [
+        [ring, 0],
+        [-ring, 0],
+        [0, ring],
+        [0, -ring],
+      ] as const) {
+        const coord = worldToChunk(city.x + dx * 600, city.z + dz * 600, 0);
+        const data = generateChunk(coord, context());
+        const landmarks =
+          data.buildingsKeep + data.buildingsCathedral + data.buildingsTownhall + data.buildingsGuildhall + data.buildingsGatehouse;
+        if (data.cultureId >= 0 && data.buildings > 0 && landmarks === 0) {
+          claimedData = data;
+          break;
+        }
+      }
+    }
+    expect(claimedData).toBeDefined();
+    const found = claimedData as ReturnType<typeof generateChunk>;
+    const palette = CULTURE_BUILDING_PALETTES[found.cultureId] as (typeof CULTURE_BUILDING_PALETTES)[number];
+    // Facade detail (door/window/chimney) uses its own small set of
+    // culture-independent constants -- `building-mesh.ts`'s `wood`/`glass`/
+    // cottage `stone` -- not the palette. They're folded into the expected
+    // range here rather than the check being widened to "most vertices",
+    // since they're few, fixed, and already known exactly.
+    const wood: readonly number[] = [0.18, 0.11, 0.07];
+    const glass: readonly number[] = [0.22, 0.28, 0.34];
+    const facadeStone: readonly number[] = [0.22, 0.2, 0.18];
+    const EPS = 1e-4;
+    const lo = [0, 1, 2].map(
+      (c) =>
+        Math.min(
+          palette.wallA[c] as number, palette.wallB[c] as number, palette.roofA[c] as number,
+          palette.roofB[c] as number, palette.plinth[c] as number,
+          wood[c] as number, glass[c] as number, facadeStone[c] as number,
+        ) - EPS,
+    );
+    const hi = [0, 1, 2].map(
+      (c) =>
+        Math.max(
+          palette.wallA[c] as number, palette.wallB[c] as number, palette.roofA[c] as number,
+          palette.roofB[c] as number, palette.plinth[c] as number,
+          wood[c] as number, glass[c] as number, facadeStone[c] as number,
+        ) + EPS,
+    );
+    let checked = 0;
+    for (let v = 0; v < found.buildingColors.length; v += 3) {
+      for (let c = 0; c < 3; c++) {
+        const value = found.buildingColors[v + c] as number;
+        expect(value).toBeGreaterThanOrEqual(lo[c] as number);
+        expect(value).toBeLessThanOrEqual(hi[c] as number);
+      }
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+
   it('lists every bulk buffer as transferable', () => {
     // A buffer left off this list is not a missed optimisation: it gets
     // structured-cloned instead, copying the whole mesh twice per chunk.
@@ -825,6 +961,7 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.buildingNormals.buffer);
     expect(transferables).toContain(data.buildingColors.buffer);
     expect(transferables).toContain(data.buildingIndices.buffer);
+    expect(transferables).toContain(data.buildingStart.buffer);
     expect(transferables).toContain(data.wallPositions.buffer);
     expect(transferables).toContain(data.wallNormals.buffer);
     expect(transferables).toContain(data.wallColors.buffer);
@@ -833,7 +970,7 @@ describe('generateChunk', () => {
     expect(transferables).toContain(data.propNormals.buffer);
     expect(transferables).toContain(data.propColors.buffer);
     expect(transferables).toContain(data.propIndices.buffer);
-    expect(transferables).toHaveLength(23);
+    expect(transferables).toHaveLength(24);
     expect(chunkDataBytes(data)).toBe(
       data.positions.byteLength +
         data.indices.byteLength +
@@ -850,6 +987,7 @@ describe('generateChunk', () => {
         data.buildingNormals.byteLength +
         data.buildingColors.byteLength +
         data.buildingIndices.byteLength +
+        data.buildingStart.byteLength +
         data.wallPositions.byteLength +
         data.wallNormals.byteLength +
         data.wallColors.byteLength +
@@ -868,8 +1006,8 @@ describe('generateChunk', () => {
     const data = generateChunk(DRY_CHUNK, context(WATER_SEED));
     expect(data.waterIndices).toHaveLength(0);
     const transferables = chunkDataTransferables(data);
-    expect(transferables).toHaveLength(23);
-    expect(new Set(transferables).size).toBe(23);
+    expect(transferables).toHaveLength(24);
+    expect(new Set(transferables).size).toBe(24);
     expect(transferables).toContain(data.waterPositions.buffer);
     expect(transferables).toContain(data.deckPositions.buffer);
     expect(transferables).toContain(data.buildingPositions.buffer);
